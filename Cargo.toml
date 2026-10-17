@@ -1,0 +1,9 @@
+[package]
+name = "ezu"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Live spatial engine: an index over moving entities, spatial queries, geofencing events and recent tracks."
+publish = false
+
+[dependencies]
