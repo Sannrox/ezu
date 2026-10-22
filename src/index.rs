@@ -27,6 +27,7 @@ pub struct Quotas {
     pub max_collections: usize,
     pub max_vertices: usize,
     pub max_updates_per_second: u32,
+    pub max_fences: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -44,6 +45,9 @@ pub enum IndexError {
     },
     RateQuota {
         limit: u32,
+    },
+    FenceQuota {
+        limit: usize,
     },
     /// A query window outside WGS 84 or with `south > north`.
     InvalidWindow,
@@ -73,6 +77,9 @@ impl fmt::Display for IndexError {
             Self::RateQuota { limit } => {
                 write!(f, "namespace update rate exceeded ({limit} per second)")
             }
+            Self::FenceQuota { limit } => {
+                write!(f, "namespace fence quota reached ({limit} fences)")
+            }
             Self::InvalidWindow => f.write_str(
                 "query window needs finite lon in [-180, 180], lat in [-90, 90] and south <= north",
             ),
@@ -85,9 +92,9 @@ impl fmt::Display for IndexError {
 
 impl std::error::Error for IndexError {}
 
-type Node = GeomWithData<Rectangle<[f64; 2]>, String>;
+pub(crate) type Node = GeomWithData<Rectangle<[f64; 2]>, String>;
 
-fn node(bbox: &BoundingBox, id: &str) -> Node {
+pub(crate) fn node(bbox: &BoundingBox, id: &str) -> Node {
     GeomWithData::new(
         Rectangle::from_corners([bbox.min_lon, bbox.min_lat], [bbox.max_lon, bbox.max_lat]),
         id.to_string(),
@@ -727,7 +734,7 @@ fn existing(
 /// A tree holding `nodes`, built by insertion. The R-tree crate's own bulk
 /// loader can produce trees that a later insert panics on (seen with a few
 /// dozen to a few hundred nodes), so it is not used.
-fn build_tree(nodes: Vec<Node>) -> RTree<Node> {
+pub(crate) fn build_tree(nodes: Vec<Node>) -> RTree<Node> {
     let mut tree = RTree::new();
     for node in nodes {
         tree.insert(node);

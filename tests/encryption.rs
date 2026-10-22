@@ -101,6 +101,7 @@ fn config(dir: &Path, provider: &Arc<Switchable>, encrypted: &[&str]) -> Durabil
         segment_bytes: 4_096,
         snapshot_every_records: u64::MAX,
         snapshot_every_ms: i64::MAX,
+        events_retained: 1_000,
         keys: Some(KeyConfig {
             provider: provider.clone(),
             grants: encrypted
@@ -119,6 +120,7 @@ fn open(config: DurabilityConfig) -> DurableEngine {
             max_collections: 8,
             max_vertices: 64,
             max_updates_per_second: u32::MAX,
+            max_fences: 1_000,
         },
         None,
         0,
@@ -162,6 +164,20 @@ fn count(engine: &DurableEngine, namespace: &str) -> Result<usize, DurableError>
         .map(|page| page.entities.len())
 }
 
+fn fence(id: &str) -> ezu::fence::Fence {
+    ezu::fence::Fence {
+        id: id.into(),
+        shape: ezu::fence::Shape::Circle {
+            center: Position::new(1.0, 1.0),
+            meters: 1_000.0,
+        },
+        collections: Vec::new(),
+        filters: Vec::new(),
+        dwell_ms: None,
+        inside_per_second: None,
+    }
+}
+
 /// Whether any file under `dir` contains `needle`.
 fn on_disk(dir: &Path, needle: &str) -> bool {
     fs::read_dir(dir).unwrap().any(|entry| {
@@ -181,6 +197,10 @@ fn an_encrypted_namespace_never_reaches_disk_in_plaintext() {
     let dir = scratch("scan");
     let keys = provider();
     let engine = open(config(&dir, &keys, &["alpha"]));
+    // Fences and their memberships are the namespace's data too.
+    engine
+        .put_fence(&ns("alpha"), fence("alpha-fence-marker"), 0)
+        .unwrap();
     for i in 0..6 {
         engine.upsert(&ns("alpha"), entity("alpha", i), 0).unwrap();
         engine.upsert(&ns("beta"), entity("beta", i), 0).unwrap();
@@ -196,12 +216,19 @@ fn an_encrypted_namespace_never_reaches_disk_in_plaintext() {
     // The scan finds plaintext where it exists: the unencrypted namespace.
     assert!(on_disk(&dir, "beta-marker-1"));
     assert!(on_disk(&dir, "beta-marker-9"));
+    assert!(!on_disk(&dir, "alpha-fence-marker"));
     for i in 0..12 {
         assert!(!on_disk(&dir, &format!("alpha-marker-{i}")), "marker {i}");
         assert!(!on_disk(&dir, &format!("alpha-id-{i}")), "id {i}");
     }
     let engine = open(config(&dir, &keys, &["alpha"]));
     assert_eq!(count(&engine, "alpha").unwrap(), 11);
+    assert!(
+        engine
+            .get_fence(&ns("alpha"), "alpha-fence-marker")
+            .unwrap()
+            .is_some()
+    );
     assert_eq!(count(&engine, "beta").unwrap(), 12);
     drop(engine);
     let _ = fs::remove_dir_all(&dir);
@@ -212,6 +239,7 @@ fn a_withdrawn_key_seals_one_namespace_until_it_returns() {
     let dir = scratch("seal");
     let keys = provider();
     let engine = open(config(&dir, &keys, &["alpha", "gamma"]));
+    engine.put_fence(&ns("alpha"), fence("a"), 0).unwrap();
     for i in 0..5 {
         engine.upsert(&ns("alpha"), entity("alpha", i), 0).unwrap();
         engine.upsert(&ns("gamma"), entity("gamma", i), 0).unwrap();
@@ -252,6 +280,7 @@ fn a_withdrawn_key_seals_one_namespace_until_it_returns() {
     keys.denied.store(false, Ordering::Relaxed);
     let engine = open(config(&dir, &keys, &["alpha", "gamma"]));
     assert_eq!(count(&engine, "alpha").unwrap(), 5);
+    assert!(engine.get_fence(&ns("alpha"), "a").unwrap().is_some());
     assert_eq!(count(&engine, "gamma").unwrap(), 7);
     drop(engine);
     let _ = fs::remove_dir_all(&dir);

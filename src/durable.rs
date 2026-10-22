@@ -11,12 +11,13 @@
 //! life, so a second instance fails to open instead of writing alongside.
 
 use crate::entity::{Entity, Namespace};
+use crate::fence::{Fence, FenceEvent, Fences, Space};
 use crate::index::{Engine, IndexError, Quotas, Upsert};
 use crate::keys::sekai_keys::{Dek, KeyId};
 use crate::keys::{self, KeyConfig, Keyring};
 use crate::snapshot::{self, DataFile, Found, Part, SealInfo, SnapshotError};
 use crate::wal::{Entry, Op, Wal, WalError};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -32,14 +33,19 @@ pub struct DurabilityConfig {
     pub segment_bytes: u64,
     pub snapshot_every_records: u64,
     pub snapshot_every_ms: i64,
+    /// Fence events kept per namespace for readers; older ones are dropped.
+    pub events_retained: usize,
     /// Namespaces encrypted with keys from an external provider; `None`
     /// keeps every namespace in plaintext.
     pub keys: Option<KeyConfig>,
 }
 
-/// Where entities come from again when no usable snapshot exists.
+/// Where entities and fences come from again when no usable snapshot
+/// exists. The rebuilt state replaces everything, so a source must return
+/// the fences too (none when it keeps none).
 pub trait RebuildSource {
     fn entities(&self) -> Result<Vec<(Namespace, Entity)>, String>;
+    fn fences(&self) -> Result<Vec<(Namespace, Fence)>, String>;
 }
 
 #[derive(Debug)]
@@ -101,6 +107,7 @@ impl From<SnapshotError> for DurableError {
 }
 
 struct Writer {
+    fences: Fences,
     /// Sealed namespaces' data, as stored, carried into every snapshot
     /// until their keys return.
     carried: HashMap<String, Part>,
@@ -112,6 +119,8 @@ struct Writer {
 pub struct DurableEngine {
     engine: Engine,
     writer: Mutex<Writer>,
+    events: Mutex<HashMap<Namespace, VecDeque<FenceEvent>>>,
+    quotas: Quotas,
     config: DurabilityConfig,
     keyring: Keyring,
     failed: AtomicBool,
@@ -168,6 +177,7 @@ impl DurableEngine {
                 i64::try_from(since.as_millis()).unwrap_or(i64::MAX)
             });
         let mut loaded = None;
+        let mut fences = Fences::default();
         let (base_lsn, rebuilt) = match newest.map(|(_, found)| load_snapshot(&keyring, found)) {
             Some(Ok(snapshot)) => {
                 let lsn = snapshot.lsn;
@@ -179,7 +189,14 @@ impl DurableEngine {
                     Some(Err(error)) => Some(error.to_string()),
                     _ => None,
                 };
-                let rebuilt = Self::rebuild_if_needed(&engine, &keyring, &wal_dir, rebuild, why)?;
+                let rebuilt = Self::rebuild_if_needed(
+                    &engine,
+                    &mut fences,
+                    &keyring,
+                    &wal_dir,
+                    rebuild,
+                    why,
+                )?;
                 (0, rebuilt)
             }
         };
@@ -220,11 +237,19 @@ impl DurableEngine {
             }
         }
         let mut carried = HashMap::new();
+        // Replay raises the events it raised before, with the same ids,
+        // kept within the retention as it goes.
+        let mut events = HashMap::new();
+        let retained = config.events_retained;
         if let Some(mut loaded) = loaded {
             loaded.carry_sealed(&keyring)?;
             restore_all(&engine, loaded.entities)?;
+            for (namespace, space) in loaded.spaces {
+                fences.insert(Namespace::stored(namespace), space);
+            }
             for (lsn, entry) in loaded.tail {
-                apply_entry(&engine, &keyring, lsn, entry)?;
+                let raised = apply_entry(&engine, &mut fences, &keyring, lsn, entry)?;
+                keep(&mut events, raised, retained);
             }
             carried = loaded.carried;
         }
@@ -246,7 +271,8 @@ impl DurableEngine {
                     .push(record.payload);
                 continue;
             }
-            apply_entry(&engine, &keyring, record.lsn, record.entry)?;
+            let raised = apply_entry(&engine, &mut fences, &keyring, record.lsn, record.entry)?;
+            keep(&mut events, raised, retained);
             replayed += 1;
         }
 
@@ -254,11 +280,14 @@ impl DurableEngine {
             engine,
             // Replayed records still count toward the next snapshot.
             writer: Mutex::new(Writer {
+                fences,
                 carried,
                 wal,
                 since_snapshot: replayed,
                 snapshot_at_ms,
             }),
+            events: Mutex::new(events),
+            quotas,
             config,
             keyring,
             failed: AtomicBool::new(false),
@@ -278,6 +307,7 @@ impl DurableEngine {
     /// at the first record. Otherwise the rebuild source re-syncs.
     fn rebuild_if_needed(
         engine: &Engine,
+        fences: &mut Fences,
         keyring: &Keyring,
         wal_dir: &std::path::Path,
         rebuild: Option<&dyn RebuildSource>,
@@ -311,10 +341,17 @@ impl DurableEngine {
                 "namespaces {sealed:?} are sealed; restore their keys before a rebuild"
             )));
         }
-        restore_all(
-            engine,
-            source.entities().map_err(DurableError::NeedsRebuild)?,
-        )?;
+        let entities = source.entities().map_err(DurableError::NeedsRebuild)?;
+        for (ns, fence) in source.fences().map_err(DurableError::NeedsRebuild)? {
+            fences.space_mut(&ns).put(fence);
+        }
+        // Memberships are derived from where entities are now, without
+        // events: those were raised before the loss. Dwell timers restart
+        // at each entity's last observation.
+        for (ns, entity) in &entities {
+            fences.upserted(ns, entity, 0);
+        }
+        restore_all(engine, entities)?;
         Ok(true)
     }
 
@@ -383,7 +420,7 @@ impl DurableEngine {
         {
             return Err(DurableError::TooLarge);
         }
-        self.write(Some(ns), now_ms, |engine, ops| {
+        self.write(Some(ns), now_ms, |engine, _, ops| {
             entities
                 .into_iter()
                 .map(|entity| {
@@ -405,7 +442,7 @@ impl DurableEngine {
         id: &str,
         now_ms: i64,
     ) -> Result<bool, DurableError> {
-        self.write(Some(ns), now_ms, |engine, ops| {
+        self.write(Some(ns), now_ms, |engine, _, ops| {
             let removed = engine.delete(ns, collection, id);
             if matches!(removed, Ok(true)) {
                 ops.push(Op::Delete {
@@ -428,7 +465,7 @@ impl DurableEngine {
         &self,
         ns: Option<&Namespace>,
         now_ms: i64,
-        change: impl FnOnce(&Engine, &mut Vec<Op>) -> T,
+        change: impl FnOnce(&Engine, &Fences, &mut Vec<Op>) -> T,
     ) -> Result<T, DurableError> {
         let mut writer = self.writer.lock().map_err(|_| DurableError::Failed)?;
         // Under the lock: a writer that waited behind a failed append must
@@ -442,21 +479,32 @@ impl DurableEngine {
                 .map_err(|sealed| DurableError::Sealed(sealed.0))?;
         }
         let mut ops = Vec::new();
-        let result = change(&self.engine, &mut ops);
+        let result = change(&self.engine, &writer.fences, &mut ops);
         if !ops.is_empty() {
             let mut seal = |lsn: u64, op: &Op, plain: &[u8]| {
-                let ns = op_namespace(op);
+                let ns = op.namespace();
                 let Some((id, dek)) = self.keyring.current(ns.as_str()).map_err(|s| s.0)? else {
                     return Ok(None);
                 };
                 let aad = crate::wal::sealed_aad(lsn, ns.as_str(), id.as_str());
                 keys::seal(&dek, &aad, plain).map(|body| Some((id.as_str().to_string(), body)))
             };
-            if let Err(error) = writer.wal.append(&ops, &mut seal) {
-                self.failed.store(true, Ordering::Release);
-                return Err(error.into());
-            }
+            let last = match writer.wal.append(&ops, &mut seal) {
+                Ok(last) => last,
+                Err(error) => {
+                    self.failed.store(true, Ordering::Release);
+                    return Err(error.into());
+                }
+            };
             writer.since_snapshot += ops.len() as u64;
+            // Fences change, and raise events, only once the write is
+            // durable, in log order, as replay will do it again.
+            let first = last + 1 - ops.len() as u64;
+            let mut raised: Raised = Vec::new();
+            for (lsn, op) in (first..).zip(&ops) {
+                raised.extend(apply_fences(&mut writer.fences, op, lsn));
+            }
+            self.publish(raised)?;
         }
         if writer.since_snapshot >= self.config.snapshot_every_records
             || (writer.since_snapshot > 0
@@ -471,7 +519,7 @@ impl DurableEngine {
     /// logged as a delete, so replay keeps it in order with later writes (a
     /// later, older observation of the same key is then admitted again).
     pub fn sweep_expired(&self, now_ms: i64) -> Result<usize, DurableError> {
-        self.write(None, now_ms, |engine, ops| {
+        self.write(None, now_ms, |engine, _, ops| {
             let removed = engine.take_expired(now_ms)?;
             let count = removed.len();
             ops.extend(
@@ -508,31 +556,36 @@ impl DurableEngine {
                 .push((ns, entity));
         }
         let mut parts: Vec<Part> = writer.carried.values().cloned().collect();
-        for (ns, entities) in by_namespace {
-            let bytes = snapshot::encode_arrow(lsn, &entities)?;
-            let file = match self
+        let mut namespaces: Vec<Namespace> = by_namespace.keys().cloned().collect();
+        namespaces.extend(
+            writer
+                .fences
+                .iter()
+                .filter(|(ns, space)| !space.is_empty() && !by_namespace.contains_key(*ns))
+                .map(|(ns, _)| ns.clone()),
+        );
+        for ns in namespaces {
+            let key = self
                 .keyring
                 .current(ns.as_str())
-                .map_err(|sealed| DurableError::Sealed(sealed.0))?
-            {
-                Some((id, dek)) => {
-                    let aad = snapshot::sealed_aad(lsn, ns.as_str(), id.as_str());
-                    DataFile {
-                        bytes: keys::seal(&dek, &aad, &bytes).map_err(DurableError::Keys)?,
-                        sealed: Some(SealInfo {
-                            dek_id: id.as_str().to_string(),
-                            sealed_lsn: lsn,
-                        }),
-                    }
-                }
-                None => DataFile {
-                    sealed: None,
-                    bytes,
-                },
+                .map_err(|sealed| DurableError::Sealed(sealed.0))?;
+            let store =
+                |bytes: Vec<u8>, aad: Aad| stored_file(key.as_ref(), ns.as_str(), lsn, bytes, aad);
+            let file = match by_namespace.get(&ns) {
+                Some(entities) => Some(store(
+                    snapshot::encode_arrow(lsn, entities)?,
+                    snapshot::sealed_aad,
+                )?),
+                None => None,
+            };
+            let fences = match writer.fences.space(&ns).filter(|space| !space.is_empty()) {
+                Some(space) => Some(store(space.encode(), snapshot::fences_aad)?),
+                None => None,
             };
             parts.push(Part {
                 namespace: ns.as_str().to_string(),
-                file: Some(file),
+                file,
+                fences,
                 tail: Vec::new(),
             });
         }
@@ -579,7 +632,11 @@ impl DurableEngine {
             // carried parts, or the next snapshot would drop it with the log.
             // On failure writes and snapshots stop until a reopen recovers it
             // from disk.
-            match self.carry(&namespace, last, lsn) {
+            let space = writer.fences.take(&Namespace::stored(namespace.clone()));
+            if let Ok(mut events) = self.events.lock() {
+                events.remove(&Namespace::stored(namespace.clone()));
+            }
+            match self.carry(&namespace, space, last, lsn) {
                 Ok(Some(part)) => {
                     writer.carried.insert(namespace.clone(), part);
                 }
@@ -594,11 +651,13 @@ impl DurableEngine {
         Ok(sealed)
     }
 
-    /// Take `namespace` out of the index, sealed under `last`, its final
-    /// key, as a part to carry. `None` when it held nothing.
+    /// Take `namespace` out of the index and, with its fences, seal it
+    /// under `last`, its final key, as a part to carry. `None` when it held
+    /// nothing.
     fn carry(
         &self,
         namespace: &str,
+        space: Option<Space>,
         last: Option<(KeyId, Dek)>,
         lsn: u64,
     ) -> Result<Option<Part>, DurableError> {
@@ -609,27 +668,145 @@ impl DurableEngine {
             .into_iter()
             .map(|entity| (ns.clone(), entity))
             .collect();
-        if entities.is_empty() {
+        let space = space.filter(|space| !space.is_empty());
+        if entities.is_empty() && space.is_none() {
             return Ok(None);
         }
-        let Some((id, dek)) = last else {
+        let Some(key) = last else {
             return Err(DurableError::Keys(format!(
                 "{namespace}: no key to carry it under"
             )));
         };
-        let aad = snapshot::sealed_aad(lsn, namespace, id.as_str());
-        let bytes = snapshot::encode_arrow(lsn, &entities)?;
+        let store = |bytes: Vec<u8>, aad: Aad| stored_file(Some(&key), namespace, lsn, bytes, aad);
         Ok(Some(Part {
             namespace: namespace.to_string(),
-            file: Some(DataFile {
-                bytes: keys::seal(&dek, &aad, &bytes).map_err(DurableError::Keys)?,
-                sealed: Some(SealInfo {
-                    dek_id: id.as_str().to_string(),
-                    sealed_lsn: lsn,
-                }),
-            }),
+            file: match entities.is_empty() {
+                true => None,
+                false => Some(store(
+                    snapshot::encode_arrow(lsn, &entities)?,
+                    snapshot::sealed_aad,
+                )?),
+            },
+            fences: space
+                .map(|space| store(space.encode(), snapshot::fences_aad))
+                .transpose()?,
             tail: Vec::new(),
         }))
+    }
+
+    /// Keep `raised` for readers, oldest dropped past the retention.
+    fn publish(&self, raised: Raised) -> Result<(), DurableError> {
+        if raised.is_empty() {
+            return Ok(());
+        }
+        let mut events = self.events.lock().map_err(|_| DurableError::Failed)?;
+        keep(&mut events, raised, self.config.events_retained);
+        Ok(())
+    }
+
+    /// Fence events of `ns` after `after` (an event's `(lsn, index)`), oldest
+    /// first, at most `limit`. Only recent events are kept.
+    pub fn events(
+        &self,
+        ns: &Namespace,
+        after: Option<(u64, u32)>,
+        limit: usize,
+    ) -> Result<Vec<FenceEvent>, DurableError> {
+        self.open_namespace(ns)?;
+        let events = self.events.lock().map_err(|_| DurableError::Failed)?;
+        Ok(events
+            .get(ns)
+            .map(|kept| {
+                kept.iter()
+                    .filter(|event| after.is_none_or(|after| (event.lsn, event.index) > after))
+                    .take(limit)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// Add or replace a fence; true when it replaced one.
+    pub fn put_fence(
+        &self,
+        ns: &Namespace,
+        fence: Fence,
+        now_ms: i64,
+    ) -> Result<bool, DurableError> {
+        fence.validate(&self.quotas)?;
+        let id = fence.id.clone();
+        let op = Op::FencePut(ns.clone(), fence);
+        if !crate::wal::fits(&op) {
+            return Err(DurableError::TooLarge);
+        }
+        self.write(Some(ns), now_ms, |_, fences, ops| {
+            let existing = fences
+                .space(ns)
+                .is_some_and(|space| space.get(&id).is_some());
+            let count = fences.space(ns).map_or(0, Space::len);
+            if !existing && count >= self.quotas.max_fences {
+                return Err(IndexError::FenceQuota {
+                    limit: self.quotas.max_fences,
+                });
+            }
+            ops.push(op);
+            Ok(existing)
+        })?
+        .map_err(DurableError::Index)
+    }
+
+    /// Remove a fence; true when it existed. Its members raise no exits.
+    pub fn delete_fence(
+        &self,
+        ns: &Namespace,
+        id: &str,
+        now_ms: i64,
+    ) -> Result<bool, DurableError> {
+        self.write(Some(ns), now_ms, |_, fences, ops| {
+            let existing = fences
+                .space(ns)
+                .is_some_and(|space| space.get(id).is_some());
+            if existing {
+                ops.push(Op::FenceDelete {
+                    namespace: ns.clone(),
+                    id: id.to_string(),
+                });
+            }
+            existing
+        })
+    }
+
+    pub fn get_fence(&self, ns: &Namespace, id: &str) -> Result<Option<Fence>, DurableError> {
+        self.open_namespace(ns)?;
+        let writer = self.writer.lock().map_err(|_| DurableError::Failed)?;
+        Ok(writer
+            .fences
+            .space(ns)
+            .and_then(|space| space.get(id))
+            .cloned())
+    }
+
+    /// Fences of `ns` after the id `after`, in id order, at most `limit`.
+    pub fn list_fences(
+        &self,
+        ns: &Namespace,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Fence>, DurableError> {
+        self.open_namespace(ns)?;
+        let writer = self.writer.lock().map_err(|_| DurableError::Failed)?;
+        Ok(writer
+            .fences
+            .space(ns)
+            .map(|space| {
+                space
+                    .list()
+                    .filter(|fence| after.is_none_or(|after| fence.id.as_str() > after))
+                    .take(limit)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     /// Start a new current key for `ns`. New writes use it at once; the
@@ -649,12 +826,56 @@ impl DurableEngine {
     }
 }
 
-/// A loaded snapshot: entities to restore, records carried in its parts to
-/// apply after them, the parts of sealed namespaces as stored, and every
-/// part as stored, to carry a namespace the log turns out to seal.
+/// Fence events raised by writes, with their namespaces.
+type Raised = Vec<(Namespace, FenceEvent)>;
+
+/// Add `raised` to the kept events, dropping the oldest past `retained` per
+/// namespace.
+fn keep(events: &mut HashMap<Namespace, VecDeque<FenceEvent>>, raised: Raised, retained: usize) {
+    for (ns, event) in raised {
+        let kept = events.entry(ns).or_default();
+        kept.push_back(event);
+        while kept.len() > retained {
+            kept.pop_front();
+        }
+    }
+}
+
+/// Authenticated data for one kind of sealed snapshot file.
+type Aad = fn(u64, &str, &str) -> Vec<u8>;
+
+/// `bytes` of `namespace` as a snapshot stores them: sealed under `key`, or
+/// plaintext for a namespace without one.
+fn stored_file(
+    key: Option<&(KeyId, Dek)>,
+    namespace: &str,
+    lsn: u64,
+    bytes: Vec<u8>,
+    aad: Aad,
+) -> Result<DataFile, DurableError> {
+    let Some((id, dek)) = key else {
+        return Ok(DataFile {
+            sealed: None,
+            bytes,
+        });
+    };
+    Ok(DataFile {
+        bytes: keys::seal(dek, &aad(lsn, namespace, id.as_str()), &bytes)
+            .map_err(DurableError::Keys)?,
+        sealed: Some(SealInfo {
+            dek_id: id.as_str().to_string(),
+            sealed_lsn: lsn,
+        }),
+    })
+}
+
+/// A loaded snapshot: entities and fences to restore, records carried in its
+/// parts to apply after them, the parts of sealed namespaces as stored, and
+/// every part as stored, to carry a namespace the log turns out to seal.
 struct Loaded {
     lsn: u64,
     entities: Vec<(Namespace, Entity)>,
+    spaces: HashMap<String, Space>,
     tail: Vec<(u64, Entry)>,
     carried: HashMap<String, Part>,
     stored: HashMap<String, Part>,
@@ -677,6 +898,8 @@ impl Loaded {
         }
         self.tail
             .retain(|(_, entry)| keyring.check(entry.namespace().as_str()).is_ok());
+        self.spaces
+            .retain(|namespace, _| keyring.check(namespace).is_ok());
         for (namespace, part) in std::mem::take(&mut self.stored) {
             if keyring.check(&namespace).is_err() {
                 self.carried.entry(namespace).or_insert(part);
@@ -695,6 +918,7 @@ impl Loaded {
                             sealed: None,
                             bytes,
                         }),
+                        fences: None,
                         tail: Vec::new(),
                     },
                 );
@@ -729,6 +953,7 @@ fn load_snapshot(keyring: &Keyring, found: Found) -> Result<Loaded, DurableError
             let mut loaded = Loaded {
                 lsn,
                 entities,
+                spaces: HashMap::new(),
                 tail: Vec::new(),
                 carried: HashMap::new(),
                 stored: HashMap::new(),
@@ -741,6 +966,7 @@ fn load_snapshot(keyring: &Keyring, found: Found) -> Result<Loaded, DurableError
     let mut loaded = Loaded {
         lsn,
         entities: Vec::new(),
+        spaces: HashMap::new(),
         tail: Vec::new(),
         carried: HashMap::new(),
         stored: HashMap::new(),
@@ -758,25 +984,37 @@ fn load_snapshot(keyring: &Keyring, found: Found) -> Result<Loaded, DurableError
             }
             tail.push((lsn, entry));
         }
-        if let Some(info) = part.file.as_ref().and_then(|file| file.sealed.as_ref()) {
+        for info in [&part.file, &part.fences]
+            .into_iter()
+            .flatten()
+            .filter_map(|file| file.sealed.as_ref())
+        {
             seal_if_unreadable(keyring, &part.namespace, &info.dek_id)?;
         }
         if keyring.check(&part.namespace).is_err() {
             loaded.carried.insert(part.namespace.clone(), part);
             continue;
         }
+        // A file's plaintext, opened with its key when sealed.
+        let open = |file: &DataFile, aad: Aad| match &file.sealed {
+            None => Ok(file.bytes.clone()),
+            Some(info) => {
+                let dek = keyring
+                    .key(&part.namespace, &info.dek_id)
+                    .map_err(|sealed| damaged(sealed.0))?;
+                let aad = aad(info.sealed_lsn, &part.namespace, &info.dek_id);
+                keys::open(&dek, &aad, &file.bytes).map_err(damaged)
+            }
+        };
+        if let Some(file) = &part.fences {
+            let space = Space::decode(&open(file, snapshot::fences_aad)?)
+                .map_err(|error| damaged(error.to_string()))?;
+            loaded.spaces.insert(part.namespace.clone(), space);
+        }
         if let Some(file) = &part.file {
             let entities = match &file.sealed {
                 None => snapshot::plain_entities(file)?,
-                Some(info) => {
-                    let dek = keyring
-                        .key(&part.namespace, &info.dek_id)
-                        .map_err(|sealed| damaged(sealed.0))?;
-                    let aad = snapshot::sealed_aad(info.sealed_lsn, &part.namespace, &info.dek_id);
-                    snapshot::current_entities(
-                        keys::open(&dek, &aad, &file.bytes).map_err(damaged)?,
-                    )?
-                }
+                Some(_) => snapshot::current_entities(open(file, snapshot::sealed_aad)?)?,
             };
             // A part holds only its own namespace.
             if entities.iter().any(|(ns, _)| ns.as_str() != part.namespace) {
@@ -790,13 +1028,15 @@ fn load_snapshot(keyring: &Keyring, found: Found) -> Result<Loaded, DurableError
     Ok(loaded)
 }
 
-/// Apply one logged entry, opening a sealed one with its namespace's key.
+/// Apply one logged entry, opening a sealed one with its namespace's key,
+/// and return the fence events it raises.
 fn apply_entry(
     engine: &Engine,
+    fences: &mut Fences,
     keyring: &Keyring,
     lsn: u64,
     entry: Entry,
-) -> Result<(), DurableError> {
+) -> Result<Raised, DurableError> {
     let op = match entry {
         Entry::Op(op) => op,
         Entry::Sealed {
@@ -817,7 +1057,7 @@ fn apply_entry(
             let plain = keys::open(&dek, &aad, &body).map_err(corrupt)?;
             match crate::wal::decode_payload(&plain).map_err(|error| corrupt(error.to_string()))? {
                 (inner, Entry::Op(op))
-                    if inner == lsn && op_namespace(&op).as_str() == namespace.as_str() =>
+                    if inner == lsn && op.namespace().as_str() == namespace.as_str() =>
                 {
                     op
                 }
@@ -825,30 +1065,46 @@ fn apply_entry(
             }
         }
     };
-    apply(engine, op)
-}
-
-fn op_namespace(op: &Op) -> &Namespace {
-    match op {
-        Op::Upsert(ns, _) => ns,
-        Op::Delete { namespace, .. } => namespace,
-    }
-}
-
-fn apply(engine: &Engine, op: Op) -> Result<(), DurableError> {
-    match op {
+    match &op {
         Op::Upsert(ns, entity) => {
-            engine.restore(&ns, entity)?;
+            engine.restore(ns, entity.clone())?;
         }
         Op::Delete {
             namespace,
             collection,
             id,
         } => {
-            engine.delete(&namespace, &collection, &id)?;
+            engine.delete(namespace, collection, id)?;
         }
+        Op::FencePut(..) | Op::FenceDelete { .. } => {}
     }
-    Ok(())
+    Ok(apply_fences(fences, &op, lsn))
+}
+
+/// Apply a logged write at `lsn` to the fences: a fence change, or the
+/// events an entity write raises.
+fn apply_fences(fences: &mut Fences, op: &Op, lsn: u64) -> Raised {
+    let ns = op.namespace();
+    let events = match op {
+        Op::Upsert(ns, entity) => fences.upserted(ns, entity, lsn),
+        Op::Delete {
+            namespace,
+            collection,
+            id,
+        } => fences.deleted(namespace, collection, id, lsn),
+        Op::FencePut(ns, fence) => {
+            fences.space_mut(ns).put(fence.clone());
+            Vec::new()
+        }
+        Op::FenceDelete { namespace, id } => {
+            fences.space_mut(namespace).remove(id);
+            Vec::new()
+        }
+    };
+    events
+        .into_iter()
+        .map(|event| (ns.clone(), event))
+        .collect()
 }
 
 /// Load recovered entities per collection in one bulk pass each.

@@ -1,10 +1,10 @@
 //! Snapshots, as Arrow IPC with geometry as WKB.
 //!
 //! Version 2 (written now) is a set per LSN: the directory
-//! `snapshots/<lsn>/` holds one data file per namespace, plaintext or sealed
-//! under that namespace's key, an optional tail of raw log payloads carried
-//! for a sealed namespace, and a `MANIFEST.json` naming each file with its
-//! CRC32. The set is written under `<lsn>.tmp/`, synced, and published by
+//! `snapshots/<lsn>/` holds per namespace a data file and a fences file
+//! (fences and memberships), each plaintext or sealed under that
+//! namespace's key, an optional tail of raw log payloads carried for a
+//! sealed namespace, and a `MANIFEST.json` naming each file with its CRC32. The set is written under `<lsn>.tmp/`, synced, and published by
 //! renaming the directory, so a crash leaves the old set or the new one.
 //! Version 1 (one file per LSN with a CRC32 sidecar) is still read.
 
@@ -225,12 +225,14 @@ pub struct DataFile {
     pub bytes: Vec<u8>,
 }
 
-/// One namespace's part of a snapshot set: its data file, and for a sealed
-/// namespace the raw log payloads written after that file, carried unread.
+/// One namespace's part of a snapshot set: its data file, its fences and
+/// memberships, and for a sealed namespace the raw log payloads written
+/// after those, carried unread.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Part {
     pub namespace: String,
     pub file: Option<DataFile>,
+    pub fences: Option<DataFile>,
     pub tail: Vec<Vec<u8>>,
 }
 
@@ -245,6 +247,9 @@ struct Manifest {
 struct ManifestPart {
     namespace: String,
     file: Option<ManifestFile>,
+    /// Absent in sets written before fences.
+    #[serde(default)]
+    fences: Option<ManifestFile>,
     tail: Option<ManifestFile>,
 }
 
@@ -260,6 +265,17 @@ struct ManifestFile {
 pub fn sealed_aad(lsn: u64, namespace: &str, dek_id: &str) -> Vec<u8> {
     let mut out = crate::codec::Writer::default();
     out.str("ezu.snapshot");
+    out.u64(lsn);
+    out.str(namespace);
+    out.str(dek_id);
+    out.0
+}
+
+/// Authenticated data binding a sealed fences file to its LSN, namespace
+/// and key.
+pub fn fences_aad(lsn: u64, namespace: &str, dek_id: &str) -> Vec<u8> {
+    let mut out = crate::codec::Writer::default();
+    out.str("ezu.snapshot.fences");
     out.u64(lsn);
     out.str(namespace);
     out.str(dek_id);
@@ -317,8 +333,14 @@ pub fn write_set(dir: &Path, lsn: u64, parts: &[Part]) -> Result<bool, SnapshotE
         fs::remove_dir_all(&temp).map_err(err)?;
     }
     fs::create_dir(&temp).map_err(err)?;
+    // Version 3 marks a set with fences, so a binary from before them
+    // refuses it rather than dropping them; others stay readable by it.
     let mut manifest = Manifest {
-        version: 2,
+        version: if parts.iter().any(|part| part.fences.is_some()) {
+            3
+        } else {
+            2
+        },
         lsn,
         parts: Vec::new(),
     };
@@ -326,17 +348,19 @@ pub fn write_set(dir: &Path, lsn: u64, parts: &[Part]) -> Result<bool, SnapshotE
     // namespace fits.
     for (index, part) in parts.iter().enumerate() {
         let base = format!("{index:06}");
-        let file = match &part.file {
+        let write_file = |file: &Option<DataFile>, suffix: &str| match file {
             Some(file) => {
-                let name = format!("{base}.data");
-                Some(ManifestFile {
+                let name = format!("{base}.{suffix}");
+                Ok::<_, SnapshotError>(Some(ManifestFile {
                     crc32: write_synced(&temp.join(&name), &file.bytes)?,
                     name,
                     sealed: file.sealed.clone(),
-                })
+                }))
             }
-            None => None,
+            None => Ok(None),
         };
+        let file = write_file(&part.file, "data")?;
+        let fences = write_file(&part.fences, "fences")?;
         let tail = if part.tail.is_empty() {
             None
         } else {
@@ -355,6 +379,7 @@ pub fn write_set(dir: &Path, lsn: u64, parts: &[Part]) -> Result<bool, SnapshotE
         manifest.parts.push(ManifestPart {
             namespace: part.namespace.clone(),
             file,
+            fences,
             tail,
         });
     }
@@ -400,18 +425,20 @@ fn read_checked(dir: &Path, file: &ManifestFile) -> Result<Vec<u8>, SnapshotErro
 pub fn read_set(dir: &Path) -> Result<(u64, Vec<Part>), SnapshotError> {
     let manifest: Manifest =
         serde_json::from_slice(&fs::read(dir.join("MANIFEST.json")).map_err(err)?).map_err(err)?;
-    if manifest.version != 2 || set_lsn(dir) != Some(manifest.lsn) {
+    if !(2..=3).contains(&manifest.version) || set_lsn(dir) != Some(manifest.lsn) {
         return Err(SnapshotError("manifest does not match its set".into()));
     }
     let mut parts = Vec::new();
     for part in manifest.parts {
-        let file = match &part.file {
-            Some(file) => Some(DataFile {
+        let read_file = |file: &Option<ManifestFile>| match file {
+            Some(file) => Ok::<_, SnapshotError>(Some(DataFile {
                 sealed: file.sealed.clone(),
                 bytes: read_checked(dir, file)?,
-            }),
-            None => None,
+            })),
+            None => Ok(None),
         };
+        let file = read_file(&part.file)?;
+        let fences = read_file(&part.fences)?;
         let mut tail = Vec::new();
         if let Some(tail_file) = &part.tail {
             let bytes = read_checked(dir, tail_file)?;
@@ -431,6 +458,7 @@ pub fn read_set(dir: &Path) -> Result<(u64, Vec<Part>), SnapshotError> {
         parts.push(Part {
             namespace: part.namespace,
             file,
+            fences,
             tail,
         });
     }

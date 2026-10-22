@@ -13,6 +13,7 @@ fn engine() -> Engine {
         max_collections: 2,
         max_vertices: 6,
         max_updates_per_second: 5,
+        max_fences: 1_000,
     })
 }
 
@@ -252,6 +253,7 @@ fn writes_into_a_bulk_loaded_collection_never_break_the_index() {
             max_collections: 2,
             max_vertices: 6,
             max_updates_per_second: u32::MAX,
+            max_fences: 1_000,
         });
         let a = ns("bulk");
         let entities = (0..count)

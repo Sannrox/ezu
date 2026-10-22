@@ -31,6 +31,7 @@ fn config(dir: &Path, snapshot_every_records: u64) -> DurabilityConfig {
         segment_bytes: 4_096,
         snapshot_every_records,
         snapshot_every_ms: i64::MAX,
+        events_retained: 1_000,
         keys: None,
     }
 }
@@ -41,6 +42,7 @@ fn quotas() -> Quotas {
         max_collections: 8,
         max_vertices: 64,
         max_updates_per_second: u32::MAX,
+        max_fences: 1_000,
     }
 }
 
@@ -222,6 +224,10 @@ struct Source(Vec<Entity>);
 impl RebuildSource for Source {
     fn entities(&self) -> Result<Vec<(Namespace, Entity)>, String> {
         Ok(self.0.iter().map(|e| (ns(), e.clone())).collect())
+    }
+
+    fn fences(&self) -> Result<Vec<(Namespace, ezu::fence::Fence)>, String> {
+        Ok(Vec::new())
     }
 }
 
