@@ -4,7 +4,9 @@
 pub mod entity;
 pub mod geometry;
 pub mod index;
+pub mod query;
 
 pub use entity::{Entity, EntityError, FieldValue, Identity, Namespace};
 pub use geometry::{BoundingBox, Geometry, GeometryError, Position};
 pub use index::{Engine, IndexError, Quotas, Upsert};
+pub use query::{Filter, Query, QueryPage, QueryRequest, Relation};
