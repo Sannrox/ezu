@@ -241,3 +241,35 @@ fn antimeridian_and_polar_entities_are_found_where_they_are() {
         Err(IndexError::PartitionNotEmpty)
     );
 }
+
+#[test]
+fn writes_into_a_bulk_loaded_collection_never_break_the_index() {
+    // Collection sizes where an R-tree bulk loader produced trees that a
+    // later insert could not handle.
+    for count in [7usize, 25, 60, 100, 300] {
+        let engine = Engine::new(Quotas {
+            max_entities: 10_000,
+            max_collections: 2,
+            max_vertices: 6,
+            max_updates_per_second: u32::MAX,
+        });
+        let a = ns("bulk");
+        let entities = (0..count)
+            .map(|i| point(&format!("b{i:04}"), (i % 170) as f64, (i % 80) as f64, 1))
+            .collect();
+        engine.bulk_load(&a, "ships", entities).unwrap();
+        for i in 0..count {
+            engine
+                .upsert(
+                    &a,
+                    point(&format!("b{i:04}"), ((i + 7) % 170) as f64, 1.0, 2),
+                    1_000,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            engine.query_bbox(&a, "ships", WORLD, 1_000).unwrap().len(),
+            count
+        );
+    }
+}

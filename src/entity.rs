@@ -39,6 +39,12 @@ impl Namespace {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// A namespace read back from Ezu's own storage, which only ever held
+    /// namespaces taken from identities.
+    pub(crate) fn stored(name: String) -> Self {
+        Self(name)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

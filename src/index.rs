@@ -200,6 +200,121 @@ impl Engine {
         Ok(outcome)
     }
 
+    /// Re-apply a write that was already admitted, during recovery. It is
+    /// validated and keeps the newer-wins rule, but is not charged to
+    /// quotas: data accepted before a restart is never refused after it.
+    pub(crate) fn restore(&self, ns: &Namespace, entity: Entity) -> Result<Upsert, IndexError> {
+        entity.validate().map_err(IndexError::Invalid)?;
+        let state = self.namespace(ns)?;
+        let partition = match existing(&state, &entity.collection)? {
+            Some(partition) => partition,
+            None => state
+                .collections
+                .write()
+                .map_err(|_| IndexError::Poisoned)?
+                .entry(entity.collection.clone())
+                .or_default()
+                .clone(),
+        };
+        let mut partition = partition.write().map_err(|_| IndexError::Poisoned)?;
+        let outcome = match partition.entities.get(&entity.id) {
+            Some(stored) if stored.ts_ms > entity.ts_ms => return Ok(Upsert::Stale),
+            Some(_) => {
+                partition.remove(&entity.id);
+                Upsert::Updated
+            }
+            None => {
+                state.entities.fetch_add(1, Ordering::AcqRel);
+                Upsert::Inserted
+            }
+        };
+        partition.insert(entity);
+        Ok(outcome)
+    }
+
+    /// Load recovered entities into one collection in a single R-tree bulk
+    /// pass, outside quotas like [`Self::restore`]. A collection that
+    /// already holds entities takes them one by one instead.
+    pub(crate) fn bulk_restore(
+        &self,
+        ns: &Namespace,
+        collection: &str,
+        entities: Vec<Entity>,
+    ) -> Result<(), IndexError> {
+        let mut latest: HashMap<String, Entity> = HashMap::new();
+        for entity in entities {
+            entity.validate().map_err(IndexError::Invalid)?;
+            match latest.get(&entity.id) {
+                Some(stored) if stored.ts_ms > entity.ts_ms => {}
+                _ => {
+                    latest.insert(entity.id.clone(), entity);
+                }
+            }
+        }
+        let state = self.namespace(ns)?;
+        let partition = state
+            .collections
+            .write()
+            .map_err(|_| IndexError::Poisoned)?
+            .entry(collection.to_string())
+            .or_default()
+            .clone();
+        let mut partition = partition.write().map_err(|_| IndexError::Poisoned)?;
+        if !partition.entities.is_empty() {
+            drop(partition);
+            for entity in latest.into_values() {
+                self.restore(ns, entity)?;
+            }
+            return Ok(());
+        }
+        let nodes = latest
+            .values()
+            .flat_map(|entity| {
+                entity
+                    .geometry
+                    .boxes()
+                    .into_iter()
+                    .map(|bbox| node(&bbox, &entity.id))
+            })
+            .collect();
+        partition.tree = build_tree(nodes);
+        state.entities.fetch_add(latest.len(), Ordering::AcqRel);
+        partition.entities = latest;
+        Ok(())
+    }
+
+    /// Every stored entity with its namespace, expired ones included, for a
+    /// snapshot.
+    pub(crate) fn export(&self) -> Result<Vec<(Namespace, Entity)>, IndexError> {
+        let namespaces: Vec<(Namespace, Arc<NamespaceState>)> = self
+            .namespaces
+            .read()
+            .map_err(|_| IndexError::Poisoned)?
+            .iter()
+            .map(|(ns, state)| (ns.clone(), state.clone()))
+            .collect();
+        let mut all = Vec::new();
+        for (ns, state) in namespaces {
+            let partitions: Vec<Arc<RwLock<Partition>>> = state
+                .collections
+                .read()
+                .map_err(|_| IndexError::Poisoned)?
+                .values()
+                .cloned()
+                .collect();
+            for partition in partitions {
+                let partition = partition.read().map_err(|_| IndexError::Poisoned)?;
+                all.extend(
+                    partition
+                        .entities
+                        .values()
+                        .map(|entity| (ns.clone(), entity.clone())),
+                );
+            }
+        }
+        Ok(all)
+    }
+
     /// Remove an entity; true when it existed.
     pub fn delete(&self, ns: &Namespace, collection: &str, id: &str) -> Result<bool, IndexError> {
         let Some(partition) = self.existing_partition(ns, collection)? else {
@@ -273,7 +388,7 @@ impl Engine {
                     .map(|bbox| node(&bbox, &entity.id))
             })
             .collect();
-        partition.tree = RTree::bulk_load(nodes);
+        partition.tree = build_tree(nodes);
         let loaded = latest.len();
         partition.entities = latest;
         Ok(loaded)
@@ -409,23 +524,32 @@ impl Engine {
 
     /// Remove every expired entity; returns how many were removed.
     pub fn sweep_expired(&self, now_ms: i64) -> Result<usize, IndexError> {
-        let namespaces: Vec<Arc<NamespaceState>> = self
+        Ok(self.take_expired(now_ms)?.len())
+    }
+
+    /// Remove every expired entity and name each one removed, so a durable
+    /// caller can log the removals.
+    pub(crate) fn take_expired(
+        &self,
+        now_ms: i64,
+    ) -> Result<Vec<(Namespace, String, String)>, IndexError> {
+        let namespaces: Vec<(Namespace, Arc<NamespaceState>)> = self
             .namespaces
             .read()
             .map_err(|_| IndexError::Poisoned)?
-            .values()
-            .cloned()
+            .iter()
+            .map(|(ns, state)| (ns.clone(), state.clone()))
             .collect();
-        let mut removed = 0;
-        for state in namespaces {
-            let partitions: Vec<Arc<RwLock<Partition>>> = state
+        let mut removed = Vec::new();
+        for (ns, state) in namespaces {
+            let partitions: Vec<(String, Arc<RwLock<Partition>>)> = state
                 .collections
                 .read()
                 .map_err(|_| IndexError::Poisoned)?
-                .values()
-                .cloned()
+                .iter()
+                .map(|(name, partition)| (name.clone(), partition.clone()))
                 .collect();
-            for partition in partitions {
+            for (collection, partition) in partitions {
                 let mut partition = partition.write().map_err(|_| IndexError::Poisoned)?;
                 let expired: Vec<String> = partition
                     .entities
@@ -437,7 +561,11 @@ impl Engine {
                     partition.remove(id);
                 }
                 state.entities.fetch_sub(expired.len(), Ordering::AcqRel);
-                removed += expired.len();
+                removed.extend(
+                    expired
+                        .into_iter()
+                        .map(|id| (ns.clone(), collection.clone(), id)),
+                );
             }
         }
         Ok(removed)
@@ -567,6 +695,17 @@ fn existing(
         .map_err(|_| IndexError::Poisoned)?
         .get(collection)
         .cloned())
+}
+
+/// A tree holding `nodes`, built by insertion. The R-tree crate's own bulk
+/// loader can produce trees that a later insert panics on (seen with a few
+/// dozen to a few hundred nodes), so it is not used.
+fn build_tree(nodes: Vec<Node>) -> RTree<Node> {
+    let mut tree = RTree::new();
+    for node in nodes {
+        tree.insert(node);
+    }
+    tree
 }
 
 /// Entities whose boxes meet any window, each once.
