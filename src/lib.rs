@@ -4,6 +4,7 @@
 pub mod api;
 pub mod auth;
 mod codec;
+pub mod diagnostics;
 pub mod durable;
 pub mod entity;
 pub mod fence;
@@ -11,6 +12,7 @@ pub mod flight;
 pub mod geometry;
 pub mod index;
 pub mod keys;
+pub mod metrics;
 pub mod query;
 mod snapshot;
 mod wal;

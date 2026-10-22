@@ -606,6 +606,17 @@ impl Engine {
     }
 
     /// Live and expired-but-unswept entities counted against the quota.
+    /// Entities across every namespace.
+    pub fn total_entities(&self) -> Result<usize, IndexError> {
+        Ok(self
+            .namespaces
+            .read()
+            .map_err(|_| IndexError::Poisoned)?
+            .values()
+            .map(|state| state.entities.load(Ordering::Acquire))
+            .sum())
+    }
+
     pub fn entity_count(&self, ns: &Namespace) -> Result<usize, IndexError> {
         Ok(self.namespace(ns)?.entities.load(Ordering::Acquire))
     }
