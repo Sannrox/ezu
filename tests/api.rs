@@ -468,3 +468,24 @@ async fn a_subscriber_gets_events_live_and_resumes_after_its_last_id() {
     let next = resumed.message().await.unwrap().unwrap();
     assert_eq!(next.entity, "s2");
 }
+
+#[tokio::test]
+async fn health_and_metrics_need_no_token_and_name_no_tenant() {
+    let (address, _stop) = server().await;
+    let a = token("tenant-a");
+    let entity = r#"{"entities":[{"collection":"ships","id":"m1","geometry":{"shape":{"point":{"lon":1.0,"lat":2.0}}},"ts_ms":1}]}"#;
+    http(&address, "POST", "/v1/entities", Some(&a), entity).await;
+    let query = r#"{"collection":"ships","query":{"bbox":{"west":-180,"south":-90,"east":180,"north":90}},"limit":10}"#;
+    http(&address, "POST", "/v1/query", Some(&a), query).await;
+    let (code, body) = http(&address, "GET", "/healthz", None, "").await;
+    assert_eq!((code, body.as_str()), (200, "ok"));
+    let (code, body) = http(&address, "GET", "/metrics", None, "").await;
+    assert_eq!(code, 200);
+    assert!(body.contains("ezu_entities 1"), "{body}");
+    assert!(body.contains("ezu_writes_total 1"), "{body}");
+    assert!(
+        body.contains("ezu_query_duration_seconds_count 1"),
+        "{body}"
+    );
+    assert!(!body.contains("tenant-a"), "{body}");
+}

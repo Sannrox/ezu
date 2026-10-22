@@ -1,4 +1,6 @@
-//! Ezu server. Configuration comes from the environment:
+//! Ezu server. `ezu diagnostics` instead prints a support bundle for
+//! `EZU_DATA_DIR` (no secrets, no tenant data) and exits. Configuration
+//! comes from the environment:
 //!
 //! - `EZU_DATA_DIR` (required): WAL and snapshots.
 //! - `EZU_LISTEN`: address for gRPC and HTTP/JSON, default `127.0.0.1:7600`.
@@ -130,6 +132,11 @@ async fn run() -> Result<(), String> {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    if std::env::args().nth(1).as_deref() == Some("diagnostics") {
+        let dir = var("EZU_DATA_DIR").unwrap_or_default();
+        println!("{:#}", ezu::diagnostics::bundle(std::path::Path::new(&dir)));
+        return ExitCode::SUCCESS;
+    }
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {

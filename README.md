@@ -37,6 +37,29 @@ other authorization decision. Authentication is one of:
 mutual TLS. The server needs `EZU_DATA_DIR` and listens on `EZU_LISTEN`
 (default `127.0.0.1:7600`); it refuses to start without authentication.
 
+## Operations
+
+- `GET /healthz` answers 200 while the engine accepts writes and 503 after a
+  durability failure (reopen to recover).
+- `GET /metrics` serves Prometheus text:
+  - entity count, logged writes and fence events;
+  - query latency as a histogram;
+  - WAL bytes and records since the last snapshot (the WAL lag);
+  - snapshot age, sealed namespaces and an `ezu_up` gauge.
+
+  Every series is aggregated over namespaces, so neither endpoint takes a
+  token or reveals tenant data.
+- `ezu diagnostics` prints a JSON support bundle for `EZU_DATA_DIR`. It holds
+  WAL and snapshot counts, sizes, LSNs and format versions, and the names
+  (not values) of the `EZU_*` settings present. It never includes secrets or
+  namespace names, and it runs next to a live server.
+- `make static` builds a fully static Linux binary. The `Dockerfile` copies
+  it into an otherwise empty image, so there is no base image to pin. Ezu
+  makes no network calls of its own; CI starts the static binary with no
+  network but loopback and checks it serves.
+- `cargo deny` in CI refuses copyleft licenses in the default build (see
+  `deny.toml`).
+
 ## Bulk interchange (Arrow Flight)
 
 The API listener also serves Arrow Flight, with the same bearer-token

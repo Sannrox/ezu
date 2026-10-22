@@ -18,6 +18,7 @@ use crate::fence::{
 use crate::index::{Engine, IndexError, Quotas, Upsert};
 use crate::keys::sekai_keys::{Dek, KeyId};
 use crate::keys::{self, KeyConfig, Keyring};
+use crate::metrics::{Gauges, Metrics};
 use crate::snapshot::{self, DataFile, Found, Part, SealInfo, SnapshotError};
 use crate::wal::{Entry, Op, Wal, WalError};
 use std::collections::HashMap;
@@ -126,6 +127,9 @@ struct Writer {
     wal: Wal,
     since_snapshot: u64,
     snapshot_at_ms: i64,
+    /// The LSN the newest snapshot covers; every record after it is read
+    /// again on recovery.
+    snapshot_lsn: u64,
 }
 
 pub struct DurableEngine {
@@ -140,6 +144,7 @@ pub struct DurableEngine {
     config: DurabilityConfig,
     keyring: Keyring,
     failed: AtomicBool,
+    metrics: Metrics,
     _lock: File,
 }
 
@@ -312,6 +317,7 @@ impl DurableEngine {
                 wal,
                 since_snapshot: replayed,
                 snapshot_at_ms,
+                snapshot_lsn: base_lsn,
             }),
             events: Mutex::new(events),
             published: tokio::sync::watch::Sender::new(0),
@@ -320,6 +326,7 @@ impl DurableEngine {
             config,
             keyring,
             failed: AtomicBool::new(false),
+            metrics: Metrics::default(),
             _lock: lock,
         };
         // Entities that expired while the engine was down release their
@@ -417,7 +424,10 @@ impl DurableEngine {
         now_ms: i64,
     ) -> Result<crate::query::QueryPage, DurableError> {
         self.open_namespace(ns)?;
-        Ok(self.engine.query(ns, request, now_ms)?)
+        let started = std::time::Instant::now();
+        let page = self.engine.query(ns, request, now_ms)?;
+        self.metrics.queried(started.elapsed());
+        Ok(page)
     }
 
     pub fn upsert(
@@ -526,6 +536,11 @@ impl DurableEngine {
                 }
             };
             writer.since_snapshot += ops.len() as u64;
+            self.metrics.wrote(
+                ops.iter()
+                    .filter(|op| matches!(op, Op::Upsert(..) | Op::Delete { .. }))
+                    .count(),
+            );
             // Fences change, and raise events, only once the write is
             // durable, in log order, as replay will do it again.
             let first = last + 1 - ops.len() as u64;
@@ -673,6 +688,7 @@ impl DurableEngine {
         }
         writer.since_snapshot = 0;
         writer.snapshot_at_ms = now_ms;
+        writer.snapshot_lsn = lsn;
         Ok(lsn)
     }
 
@@ -773,6 +789,7 @@ impl DurableEngine {
         if raised.is_empty() {
             return Ok(());
         }
+        self.metrics.raised(raised.len());
         let mut events = self.events.lock().map_err(|_| DurableError::Failed)?;
         keep(&mut events, raised, self.config.events_retained);
         drop(events);
@@ -918,6 +935,33 @@ impl DurableEngine {
     pub fn wal_bytes(&self) -> Result<u64, DurableError> {
         let writer = self.writer.lock().map_err(|_| DurableError::Failed)?;
         Ok(writer.wal.size()?)
+    }
+
+    /// Whether the engine can still take writes: no durability failure
+    /// since it opened.
+    pub fn healthy(&self) -> bool {
+        !self.failed.load(Ordering::Acquire) && !self.writer.is_poisoned()
+    }
+
+    /// Metrics in the Prometheus text format, aggregated over namespaces.
+    pub fn render_metrics(&self, now_ms: i64) -> Result<String, DurableError> {
+        let (wal_bytes, since_snapshot, snapshot_at_ms) = {
+            let writer = self.writer.lock().map_err(|_| DurableError::Failed)?;
+            (
+                writer.wal.size()?,
+                // Sealed namespaces' records count too: recovery reads them.
+                writer.wal.last_lsn().saturating_sub(writer.snapshot_lsn),
+                writer.snapshot_at_ms,
+            )
+        };
+        Ok(self.metrics.render(&Gauges {
+            entities: self.engine.total_entities()? as u64,
+            wal_bytes,
+            wal_records_since_snapshot: since_snapshot,
+            snapshot_age_seconds: now_ms.saturating_sub(snapshot_at_ms).max(0) as f64 / 1000.0,
+            sealed_namespaces: self.keyring.sealed().len() as u64,
+            healthy: self.healthy(),
+        }))
     }
 }
 

@@ -10,7 +10,9 @@
 //! as `{"variant": {...}}`):
 //! `POST /v1/entities`, `GET|DELETE /v1/entities/{collection}/{id}`,
 //! `POST /v1/query`, `GET /v1/status`, `GET /v1/fences`,
-//! `PUT|GET|DELETE /v1/fences/{id}` and `GET /v1/events`.
+//! `PUT|GET|DELETE /v1/fences/{id}` and `GET /v1/events`. `GET /healthz`
+//! and `GET /metrics` (Prometheus text, aggregated over namespaces) take no
+//! token.
 
 use crate::auth::{AuthError, Authenticator, bearer};
 use crate::durable::{DurableEngine, DurableError};
@@ -905,6 +907,32 @@ pub fn http_router(api: Api) -> axum::Router {
             "/v1/status",
             get(|State(api): State<Api>, headers: HeaderMap| async move {
                 api.status(header_auth(&headers)).await.map(Json)
+            }),
+        )
+        // Probes and scrapes carry no token; neither reveals tenant data.
+        .route(
+            "/healthz",
+            get(|State(api): State<Api>| async move {
+                match api.engine.healthy() {
+                    true => (StatusCode::OK, "ok"),
+                    false => (StatusCode::SERVICE_UNAVAILABLE, "durability lost; reopen"),
+                }
+            }),
+        )
+        .route(
+            "/metrics",
+            get(|State(api): State<Api>| async move {
+                api.blocking(|engine| Ok(engine.render_metrics(now_ms())?))
+                    .await
+                    .map(|text| {
+                        (
+                            [(
+                                axum::http::header::CONTENT_TYPE,
+                                "text/plain; version=0.0.4",
+                            )],
+                            text,
+                        )
+                    })
             }),
         )
         .with_state(api)
