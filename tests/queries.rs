@@ -102,6 +102,7 @@ fn fixture(rng: &mut Rng) -> (Engine, Namespace, Vec<Entity>) {
                 ),
                 ("size".into(), FieldValue::Int((i % 7) as i64)),
             ]),
+            labels: Default::default(),
         })
         .collect();
     engine.bulk_load(&ns, "c", entities.clone()).unwrap();
@@ -135,6 +136,7 @@ fn paged(engine: &Engine, ns: &Namespace, query: &Query, filters: &[Filter]) -> 
                     filters: filters.to_vec(),
                     limit: 37,
                     cursor,
+                    readable: None,
                 },
                 NOW,
             )
@@ -229,6 +231,7 @@ fn nearest_matches_a_brute_force_ranking() {
                     filters: filters.clone(),
                     limit: 100,
                     cursor: None,
+                    readable: None,
                 },
                 NOW,
             )
@@ -260,6 +263,7 @@ fn bad_queries_are_refused() {
         filters: Vec::new(),
         limit,
         cursor: None,
+        readable: None,
     };
     let center = Position::new(0.0, 0.0);
     for (query, limit) in [

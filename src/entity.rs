@@ -1,13 +1,39 @@
 //! The entities Ezu indexes and the identity that scopes them.
 
 use crate::geometry::{Geometry, GeometryError};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 /// Most typed filter fields one entity carries.
 pub const MAX_FIELDS: usize = 8;
 const MAX_NAME_BYTES: usize = 64;
 const MAX_TEXT_BYTES: usize = 64;
+/// Most labels one entity or fence carries.
+pub const MAX_LABELS: usize = 16;
+
+/// Opaque marking labels. Ezu never interprets them: it stores them, and a
+/// caller that names the labels it may read sees only what carries no
+/// other label.
+pub type Labels = BTreeSet<String>;
+
+/// Whether something carrying `labels` is visible to a reader allowed
+/// `readable`; `None` means the reader gave no filter and sees everything.
+pub fn visible(labels: &Labels, readable: Option<&Labels>) -> bool {
+    readable.is_none_or(|readable| labels.is_subset(readable))
+}
+
+/// A label: 1-64 bytes, no control characters, no commas and no leading or
+/// trailing whitespace, so a comma-separated HTTP header lists labels
+/// losslessly.
+pub(crate) fn valid_labels(labels: &Labels) -> bool {
+    labels.len() <= MAX_LABELS
+        && labels.iter().all(|label| {
+            !label.is_empty()
+                && label.len() <= MAX_NAME_BYTES
+                && label.trim() == label
+                && !label.chars().any(|c| c.is_control() || c == ',')
+        })
+}
 
 /// The identity an authentication hook established for a caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +98,8 @@ pub struct Entity {
     /// The entity expires `ttl_ms` after `ts_ms`; `None` never expires.
     pub ttl_ms: Option<i64>,
     pub fields: BTreeMap<String, FieldValue>,
+    /// Opaque marking labels, for callers that filter by them.
+    pub labels: Labels,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -83,6 +111,7 @@ pub enum EntityError {
     Ttl,
     TooManyFields,
     Field,
+    Labels,
 }
 
 impl fmt::Display for EntityError {
@@ -97,6 +126,11 @@ impl fmt::Display for EntityError {
             Self::Heading => f.write_str("heading must be in [0, 360)"),
             Self::Ttl => f.write_str("ttl must be positive"),
             Self::TooManyFields => write!(f, "an entity carries at most {MAX_FIELDS} fields"),
+            Self::Labels => write!(
+                f,
+                "at most {MAX_LABELS} labels of 1-{MAX_NAME_BYTES} bytes, without control \
+                 characters, commas or surrounding whitespace"
+            ),
             Self::Field => write!(
                 f,
                 "field names are 1-{MAX_NAME_BYTES} bytes; text values at most \
@@ -142,6 +176,9 @@ impl Entity {
         };
         if !self.fields.iter().all(field_ok) {
             return Err(EntityError::Field);
+        }
+        if !valid_labels(&self.labels) {
+            return Err(EntityError::Labels);
         }
         Ok(())
     }

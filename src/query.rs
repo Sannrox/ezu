@@ -64,6 +64,8 @@ pub struct QueryRequest {
     pub limit: usize,
     /// The `next_cursor` of the previous page.
     pub cursor: Option<String>,
+    /// The labels the caller may read; `None` reads everything.
+    pub readable: Option<crate::entity::Labels>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1072,6 +1074,7 @@ mod tests {
             heading: None,
             ttl_ms: None,
             fields: [("n".to_string(), FieldValue::Int(9_007_199_254_740_993))].into(),
+            labels: Default::default(),
         };
         let range = |min, max| Filter::Range {
             field: "n".into(),

@@ -13,10 +13,12 @@
 //! spec 0.2, CRS `OGC:CRS84`), so Arrow query engines read exports directly.
 //! Fields are a JSON object: integers are written without a fraction and
 //! floats with one, so `Int(1)` and `Float(1.0)` survive a round trip.
+//! Labels are a JSON array of strings. A ticket's `label_filter` limits the
+//! export as it limits a query, and governed mode requires one.
 
 use crate::api::{Api, ApiError, metadata_auth, proto, query_request};
 use crate::codec::{geometry_from_wkb, geometry_to_wkb};
-use crate::entity::{Entity, FieldValue};
+use crate::entity::{Entity, FieldValue, Labels};
 use crate::index::Upsert;
 use crate::query::MAX_LIMIT;
 use arrow_array::builder::{BinaryBuilder, Float64Builder, Int64Builder, StringBuilder};
@@ -64,6 +66,7 @@ pub fn schema() -> Schema {
         Field::new("heading", DataType::Float64, true),
         Field::new("ttl_ms", DataType::Int64, true),
         Field::new("fields", DataType::Utf8, false),
+        Field::new("labels", DataType::Utf8, false),
     ])
 }
 
@@ -118,6 +121,7 @@ pub fn to_batch(entities: &[Entity]) -> Result<RecordBatch, ArrowError> {
     let mut heading = Float64Builder::new();
     let mut ttl = Int64Builder::new();
     let mut fields = StringBuilder::new();
+    let mut labels = StringBuilder::new();
     for entity in entities {
         collection.append_value(&entity.collection);
         id.append_value(&entity.id);
@@ -127,6 +131,8 @@ pub fn to_batch(entities: &[Entity]) -> Result<RecordBatch, ArrowError> {
         heading.append_option(entity.heading);
         ttl.append_option(entity.ttl_ms);
         fields.append_value(fields_json(&entity.fields));
+        labels
+            .append_value(serde_json::Value::from_iter(entity.labels.iter().cloned()).to_string());
     }
     let columns: Vec<ArrayRef> = vec![
         Arc::new(collection.finish()),
@@ -137,6 +143,7 @@ pub fn to_batch(entities: &[Entity]) -> Result<RecordBatch, ArrowError> {
         Arc::new(heading.finish()),
         Arc::new(ttl.finish()),
         Arc::new(fields.finish()),
+        Arc::new(labels.finish()),
     ];
     RecordBatch::try_new(Arc::new(schema()), columns)
 }
@@ -158,8 +165,8 @@ fn required<'a, T: 'static>(batch: &'a RecordBatch, name: &str) -> Result<&'a T,
 
 /// The rows of a batch as entities, each converted on its own: a row that
 /// does not convert is refused alone. Columns are found by name; `speed`,
-/// `heading`, `ttl_ms` and `fields` may be absent, and geometry may be
-/// `Binary` or `LargeBinary` WKB.
+/// `heading`, `ttl_ms`, `fields` and `labels` may be absent, and geometry
+/// may be `Binary` or `LargeBinary` WKB.
 pub fn from_batch(batch: &RecordBatch) -> Result<Vec<Result<Entity, String>>, String> {
     let collection: &StringArray = required(batch, "collection")?;
     let id: &StringArray = required(batch, "id")?;
@@ -168,6 +175,7 @@ pub fn from_batch(batch: &RecordBatch) -> Result<Vec<Result<Entity, String>>, St
     let heading: Option<&Float64Array> = column(batch, "heading")?;
     let ttl: Option<&Int64Array> = column(batch, "ttl_ms")?;
     let fields: Option<&StringArray> = column(batch, "fields")?;
+    let labels: Option<&StringArray> = column(batch, "labels")?;
     let narrow: Option<&BinaryArray> = column(batch, "geometry").unwrap_or(None);
     let wide: Option<&LargeBinaryArray> = column(batch, "geometry").unwrap_or(None);
     if narrow.is_none() && wide.is_none() {
@@ -197,6 +205,11 @@ pub fn from_batch(batch: &RecordBatch) -> Result<Vec<Result<Entity, String>>, St
                 fields: match fields {
                     Some(a) if !a.is_null(row) => fields_from_json(a.value(row))?,
                     _ => BTreeMap::new(),
+                },
+                labels: match labels {
+                    Some(a) if !a.is_null(row) => serde_json::from_str(a.value(row))
+                        .map_err(|error| format!("labels: {error}"))?,
+                    _ => Labels::new(),
                 },
             })
         })
@@ -320,7 +333,9 @@ impl FlightService for Api {
         let ns = self.namespace(metadata_auth(&request).as_deref())?;
         let ticket: proto::QueryRequest = serde_json::from_slice(&request.into_inner().ticket)
             .map_err(|error| tonic::Status::invalid_argument(format!("ticket: {error}")))?;
+        let readable = self.readable(ticket.label_filter.clone())?;
         let mut query = query_request(ticket).map_err(tonic::Status::from)?;
+        query.readable = readable;
         match query.query {
             // A nearest query is one page of `k`; a larger `k` would end
             // the export early, so it is refused instead.
@@ -448,6 +463,7 @@ mod tests {
                     ("b".into(), FieldValue::Bool(true)),
                     ("t".into(), FieldValue::Text("x\"y".into())),
                 ]),
+                labels: ["eu".to_string(), "secret".to_string()].into(),
             },
             Entity {
                 collection: "c".into(),
@@ -458,6 +474,7 @@ mod tests {
                 heading: Some(90.0),
                 ttl_ms: None,
                 fields: BTreeMap::new(),
+                labels: Default::default(),
             },
         ];
         let batch = to_batch(&entities).unwrap();
@@ -488,6 +505,7 @@ mod tests {
             heading: None,
             ttl_ms: None,
             fields: BTreeMap::new(),
+            labels: Default::default(),
         }];
         entities.push(Entity {
             id: "b".into(),

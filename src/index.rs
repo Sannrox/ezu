@@ -508,7 +508,9 @@ impl Engine {
         };
         let partition = partition.read().map_err(|_| IndexError::Poisoned)?;
         let keep = |entity: &&Entity| {
-            !entity.expired(now_ms) && request.filters.iter().all(|f| f.matches(entity))
+            !entity.expired(now_ms)
+                && crate::entity::visible(&entity.labels, request.readable.as_ref())
+                && request.filters.iter().all(|f| f.matches(entity))
         };
         if let Query::Nearest { center, k } = &request.query {
             let take = request.limit.min(*k);

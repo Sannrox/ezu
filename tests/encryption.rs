@@ -145,6 +145,7 @@ fn entity(namespace: &str, i: u64) -> Entity {
             "secret".into(),
             FieldValue::Text(format!("{namespace}-marker-{i}")),
         )]),
+        labels: Default::default(),
     }
 }
 
@@ -158,6 +159,7 @@ fn count(engine: &DurableEngine, namespace: &str) -> Result<usize, DurableError>
                 filters: Vec::new(),
                 limit: 10_000,
                 cursor: None,
+                readable: None,
             },
             0,
         )
@@ -175,6 +177,7 @@ fn fence(id: &str) -> ezu::fence::Fence {
         filters: Vec::new(),
         dwell_ms: None,
         inside_per_second: None,
+        labels: Default::default(),
     }
 }
 
@@ -225,7 +228,7 @@ fn an_encrypted_namespace_never_reaches_disk_in_plaintext() {
     assert_eq!(count(&engine, "alpha").unwrap(), 11);
     assert!(
         engine
-            .get_fence(&ns("alpha"), "alpha-fence-marker")
+            .get_fence(&ns("alpha"), "alpha-fence-marker", None)
             .unwrap()
             .is_some()
     );
@@ -256,7 +259,7 @@ fn a_withdrawn_key_seals_one_namespace_until_it_returns() {
         Err(DurableError::Sealed(_))
     ));
     assert!(matches!(
-        engine.get(&ns("alpha"), "c", "alpha-id-1", 0),
+        engine.get(&ns("alpha"), "c", "alpha-id-1", None, 0),
         Err(DurableError::Sealed(_))
     ));
     engine.upsert(&ns("gamma"), entity("gamma", 5), 0).unwrap();
@@ -280,7 +283,7 @@ fn a_withdrawn_key_seals_one_namespace_until_it_returns() {
     keys.denied.store(false, Ordering::Relaxed);
     let engine = open(config(&dir, &keys, &["alpha", "gamma"]));
     assert_eq!(count(&engine, "alpha").unwrap(), 5);
-    assert!(engine.get_fence(&ns("alpha"), "a").unwrap().is_some());
+    assert!(engine.get_fence(&ns("alpha"), "a", None).unwrap().is_some());
     assert_eq!(count(&engine, "gamma").unwrap(), 7);
     drop(engine);
     let _ = fs::remove_dir_all(&dir);

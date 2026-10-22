@@ -105,6 +105,7 @@ fn entity(i: u64, round: i64) -> Entity {
         heading: Some(90.0),
         ttl_ms: None,
         fields: BTreeMap::from([("fleet".into(), FieldValue::Int((i % 16) as i64))]),
+        labels: Default::default(),
     }
 }
 
@@ -146,6 +147,7 @@ fn query_latency(engine: &DurableEngine, query: impl Fn(u64) -> Query) -> Result
             filters: Vec::new(),
             limit: 1_000,
             cursor: None,
+            readable: None,
         };
         let started = Instant::now();
         engine
@@ -226,6 +228,7 @@ fn measure(options: &Options, dir: &Path) -> Result<Value, String> {
             filters: Vec::new(),
             dwell_ms: Some(60_000),
             inside_per_second: None,
+            labels: Default::default(),
         };
         engine
             .put_fence(&ns(), fence, 0)

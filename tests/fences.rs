@@ -68,6 +68,7 @@ fn circle(id: &str, lon: f64, lat: f64, meters: f64) -> Fence {
         filters: Vec::new(),
         dwell_ms: None,
         inside_per_second: None,
+        labels: Default::default(),
     }
 }
 
@@ -81,13 +82,14 @@ fn truck(id: &str, lon: f64, ts_ms: i64) -> Entity {
         heading: None,
         ttl_ms: None,
         fields: BTreeMap::from([("fleet".into(), FieldValue::Text("north".into()))]),
+        labels: Default::default(),
     }
 }
 
 /// Every kept event as (fence, entity, kind, ts).
 fn log(engine: &DurableEngine) -> Vec<(String, String, EventKind, i64)> {
     engine
-        .events(&ns(), None, &[], 1_000)
+        .events(&ns(), None, &[], None, 1_000)
         .unwrap()
         .events
         .into_iter()
@@ -126,7 +128,7 @@ fn scripted_moves_raise_exact_events_across_snapshots_and_restarts() {
     engine.upsert(&ns(), truck("t1", 12.0, 2_500), 0).unwrap();
     engine.snapshot(0).unwrap();
     engine.upsert(&ns(), truck("t1", 10.0, 4_500), 0).unwrap();
-    let before = engine.events(&ns(), None, &[], 100).unwrap().events;
+    let before = engine.events(&ns(), None, &[], None, 100).unwrap().events;
     assert_eq!(
         log(&engine),
         [
@@ -138,14 +140,14 @@ fn scripted_moves_raise_exact_events_across_snapshots_and_restarts() {
     // is raised again by replay with the same id, and nothing enters twice.
     drop(engine);
     let engine = open(&dir, true, 100);
-    let replayed = engine.events(&ns(), None, &[], 100).unwrap().events;
+    let replayed = engine.events(&ns(), None, &[], None, 100).unwrap().events;
     assert_eq!(replayed, before);
     engine.upsert(&ns(), truck("t1", 10.0, 5_000), 0).unwrap();
     engine.upsert(&ns(), truck("t1", 10.06, 6_000), 0).unwrap();
     // Resuming after the last seen id returns only what came later.
     let last = replayed.last().map(|e| (e.lsn, e.index));
     let later: Vec<_> = engine
-        .events(&ns(), last, &[], 100)
+        .events(&ns(), last, &[], None, 100)
         .unwrap()
         .events
         .into_iter()
@@ -165,12 +167,12 @@ fn scripted_moves_raise_exact_events_across_snapshots_and_restarts() {
             ev("depot", "t2", Exit, 7_000)
         ]
     );
-    assert_eq!(engine.list_fences(&ns(), None, 10).unwrap().len(), 1);
+    assert_eq!(engine.list_fences(&ns(), None, None, 10).unwrap().len(), 1);
     drop(engine);
     // Fences come back from the log alone too.
     let engine = open(&dir, true, 100);
-    assert!(engine.get_fence(&ns(), "depot").unwrap().is_some());
-    assert!(engine.get_fence(&ns(), "yard").unwrap().is_none());
+    assert!(engine.get_fence(&ns(), "depot", None).unwrap().is_some());
+    assert!(engine.get_fence(&ns(), "yard", None).unwrap().is_none());
     drop(engine);
     let _ = fs::remove_dir_all(&dir);
 }
@@ -283,11 +285,11 @@ fn a_rebuild_restores_fences_and_memberships_without_events() {
         0,
     )
     .unwrap();
-    assert!(engine.get_fence(&ns(), "depot").unwrap().is_some());
+    assert!(engine.get_fence(&ns(), "depot", None).unwrap().is_some());
     assert!(log(&engine).is_empty());
     // Event history before the rebuild is gone, and a reader there is told.
     assert!(matches!(
-        engine.events(&ns(), Some((1, 0)), &[], 10),
+        engine.events(&ns(), Some((1, 0)), &[], None, 10),
         Err(DurableError::Expired(_))
     ));
     // Still inside: no second enter, then a clean exit.
@@ -314,19 +316,19 @@ fn a_reader_resumes_without_gaps_across_restarts_and_an_expired_point_is_refused
     };
     step(&engine, 10.0);
     step(&engine, 12.0);
-    let read = engine.events(&ns(), None, &[], 100).unwrap().events;
+    let read = engine.events(&ns(), None, &[], None, 100).unwrap().events;
     let seen = read.last().map(|e| (e.lsn, e.index));
     engine.snapshot(0).unwrap();
     step(&engine, 10.0);
     step(&engine, 12.0);
-    let expected = engine.events(&ns(), seen, &[], 100).unwrap().events;
+    let expected = engine.events(&ns(), seen, &[], None, 100).unwrap().events;
     assert_eq!(expected.len(), 2);
     // A crash after the snapshot: the kept events come back from it and
     // from replay, with the same ids, so the reader continues gap-free.
     drop(engine);
     let engine = open_keeping(&dir, true, 10, 4);
     assert_eq!(
-        engine.events(&ns(), seen, &[], 100).unwrap().events,
+        engine.events(&ns(), seen, &[], None, 100).unwrap().events,
         expected
     );
     // Past the retention, a reader at the first event has missed some and
@@ -335,20 +337,24 @@ fn a_reader_resumes_without_gaps_across_restarts_and_an_expired_point_is_refused
     step(&engine, 12.0);
     let first = read.first().map(|e| (e.lsn, e.index));
     assert!(matches!(
-        engine.events(&ns(), first, &[], 100),
+        engine.events(&ns(), first, &[], None, 100),
         Err(DurableError::Expired(_))
     ));
     assert_eq!(
-        engine.events(&ns(), None, &[], 100).unwrap().events.len(),
+        engine
+            .events(&ns(), None, &[], None, 100)
+            .unwrap()
+            .events
+            .len(),
         4
     );
     drop(engine);
     let engine = open_keeping(&dir, true, 10, 4);
     assert!(matches!(
-        engine.events(&ns(), first, &[], 100),
+        engine.events(&ns(), first, &[], None, 100),
         Err(DurableError::Expired(_))
     ));
-    assert!(engine.events(&ns(), seen, &[], 100).is_ok());
+    assert!(engine.events(&ns(), seen, &[], None, 100).is_ok());
     drop(engine);
     let _ = fs::remove_dir_all(&dir);
 }

@@ -104,6 +104,7 @@ fn ship(id: &str) -> proto::Entity {
         heading: None,
         ttl_ms: None,
         fields: Default::default(),
+        labels: Default::default(),
     }
 }
 
@@ -119,6 +120,7 @@ fn world() -> proto::QueryRequest {
         filters: Vec::new(),
         limit: 100,
         cursor: String::new(),
+        label_filter: None,
     }
 }
 
@@ -147,6 +149,7 @@ async fn a_tenant_token_reaches_only_its_own_namespace_over_grpc() {
             proto::GetRequest {
                 collection: "ships".into(),
                 id: "s1".into(),
+                label_filter: None,
             },
             token,
         )
@@ -459,6 +462,7 @@ async fn a_subscriber_gets_events_live_and_resumes_after_its_last_id() {
                 after_lsn: Some(entered.lsn),
                 after_index: entered.index,
                 fences: vec!["harbour".into()],
+                label_filter: None,
             },
             &a,
         ))

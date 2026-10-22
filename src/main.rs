@@ -10,6 +10,7 @@
 //!   - `EZU_JWKS_FILE` and `EZU_JWT_AUDIENCE`, optionally `EZU_JWT_ISSUER`
 //!     and `EZU_TENANT_CLAIM` (default `tenant`): JWTs whose tenant claim is
 //!     the namespace.
+//! - `EZU_GOVERNED=1`: every read must carry a label filter.
 //! - `EZU_TLS_CERT` and `EZU_TLS_KEY` (PEM) serve over TLS; adding
 //!   `EZU_TLS_CLIENT_CA` requires client certificates (mTLS).
 
@@ -125,9 +126,15 @@ async fn run() -> Result<(), String> {
     let shutdown = async {
         let _ = tokio::signal::ctrl_c().await;
     };
-    serve(Api::new(engine, auth), listener, tls, shutdown)
-        .await
-        .map_err(|error| error.to_string())
+    let governed = matches!(var("EZU_GOVERNED").as_deref(), Some("1" | "true"));
+    serve(
+        Api::new(engine, auth).governed(governed),
+        listener,
+        tls,
+        shutdown,
+    )
+    .await
+    .map_err(|error| error.to_string())
 }
 
 #[tokio::main]

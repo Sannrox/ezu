@@ -11,7 +11,9 @@
 //! batch. Segments a snapshot fully covers are skipped, and segment names
 //! must continue one another, so a lost segment is a refused gap.
 
-use crate::codec::{CodecError, Reader, Writer, decode_entity, encode_entity};
+use crate::codec::{
+    CodecError, Reader, Writer, decode_entity, decode_labels, encode_entity, encode_labels,
+};
 use crate::entity::{Entity, Namespace};
 use crate::fence::{Fence, decode_fence, encode_fence};
 use std::fs::{self, File, OpenOptions};
@@ -140,6 +142,10 @@ fn encode(lsn: u64, op: &Op) -> Vec<u8> {
             out.u8(FENCE_PUT);
             out.str(ns.as_str());
             encode_fence(&mut out, fence);
+            // Last and only when present, as for entities.
+            if !fence.labels.is_empty() {
+                encode_labels(&mut out, &fence.labels);
+            }
         }
         Op::FenceDelete { namespace, id } => {
             out.u8(FENCE_DELETE);
@@ -158,7 +164,7 @@ const FENCE_PUT: u8 = 4;
 const FENCE_DELETE: u8 = 5;
 
 enum Frame {
-    Record(u64, Entry),
+    Record(u64, Box<Entry>),
     /// The batch ending at this LSN is complete and acknowledged.
     Commit(u64),
 }
@@ -182,7 +188,7 @@ fn frame(payload: &[u8], into: &mut Vec<u8>) {
 /// sealed; plaintext ones decode fully.
 pub fn decode_payload(payload: &[u8]) -> Result<(u64, Entry), CodecError> {
     match decode(payload)? {
-        Frame::Record(lsn, entry) => Ok((lsn, entry)),
+        Frame::Record(lsn, entry) => Ok((lsn, *entry)),
         Frame::Commit(_) => Err(CodecError("a commit is not a record")),
     }
 }
@@ -202,7 +208,7 @@ fn decode(payload: &[u8]) -> Result<Frame, CodecError> {
                 body: input.bytes()?.to_vec(),
             };
             input.done()?;
-            return Ok(Frame::Record(lsn, entry));
+            return Ok(Frame::Record(lsn, Box::new(entry)));
         }
         1 => {
             let ns = Namespace::stored(input.str()?);
@@ -215,7 +221,11 @@ fn decode(payload: &[u8]) -> Result<Frame, CodecError> {
         },
         FENCE_PUT => {
             let ns = Namespace::stored(input.str()?);
-            Op::FencePut(ns, decode_fence(&mut input)?)
+            let mut fence = decode_fence(&mut input)?;
+            if !input.0.is_empty() {
+                fence.labels = decode_labels(&mut input)?;
+            }
+            Op::FencePut(ns, fence)
         }
         FENCE_DELETE => Op::FenceDelete {
             namespace: Namespace::stored(input.str()?),
@@ -224,7 +234,7 @@ fn decode(payload: &[u8]) -> Result<Frame, CodecError> {
         _ => return Err(CodecError("op")),
     };
     input.done()?;
-    Ok(Frame::Record(lsn, Entry::Op(op)))
+    Ok(Frame::Record(lsn, Box::new(Entry::Op(op))))
 }
 
 /// Whether `op` encodes within the record size recovery accepts, with room
@@ -530,7 +540,7 @@ fn read_segment(path: &Path, last: bool, records: &mut Vec<Record>) -> Result<()
                 }
                 pending.push(Record {
                     lsn,
-                    entry,
+                    entry: *entry,
                     payload: bytes[offset + 12..next].to_vec(),
                 });
             }

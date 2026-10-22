@@ -25,8 +25,13 @@
 //! resume from its last id across restarts. A reader whose id is older than
 //! the newest dropped event has missed events and is told so.
 
-use crate::codec::{CodecError, Reader, Writer, decode_fields, encode_fields};
-use crate::entity::{Entity, EntityError, FieldValue, MAX_FIELDS, Namespace, valid_name};
+use crate::codec::{
+    CodecError, Reader, Writer, decode_fields, decode_labels, encode_fields, encode_labels,
+};
+use crate::entity::{
+    Entity, EntityError, FieldValue, Labels, MAX_FIELDS, Namespace, valid_labels, valid_name,
+    visible,
+};
 use crate::geometry::{BoundingBox, Geometry, Position};
 use crate::index::{IndexError, Node, Quotas, build_tree, node};
 use crate::query::{EARTH_RADIUS_M, Filter, Query, Relation, invalid, matches, windows};
@@ -54,6 +59,8 @@ pub struct Fence {
     pub dwell_ms: Option<i64>,
     /// `Inside` events per second for this fence; `None` raises none.
     pub inside_per_second: Option<u32>,
+    /// Opaque marking labels, carried into the fence's events.
+    pub labels: Labels,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +84,17 @@ pub struct FenceEvent {
     /// The entity's observation time.
     pub ts_ms: i64,
     pub position: Position,
+    /// Both label sets, so a reader can filter or drop the event.
+    pub entity_labels: Labels,
+    pub fence_labels: Labels,
+}
+
+impl FenceEvent {
+    /// Whether a reader allowed `readable` may see the event: it carries the
+    /// labels of both the entity and the fence.
+    pub fn visible(&self, readable: Option<&Labels>) -> bool {
+        visible(&self.entity_labels, readable) && visible(&self.fence_labels, readable)
+    }
 }
 
 impl Fence {
@@ -97,6 +115,9 @@ impl Fence {
     pub fn validate(&self, quotas: &Quotas) -> Result<(), IndexError> {
         if !valid_name(&self.id) || !self.collections.iter().all(|c| valid_name(c)) {
             return Err(IndexError::Invalid(EntityError::Name));
+        }
+        if !valid_labels(&self.labels) {
+            return Err(IndexError::Invalid(EntityError::Labels));
         }
         match &self.shape {
             Shape::Circle { center, meters } => {
@@ -148,6 +169,8 @@ impl Fence {
 struct Tracked {
     ts_ms: i64,
     position: Position,
+    /// The entity's labels as last seen, for the exits of its delete.
+    labels: Labels,
     /// Fence id to entry time and whether its dwell was raised.
     inside: BTreeMap<String, (i64, bool)>,
 }
@@ -261,12 +284,20 @@ impl Space {
         let mut tracked = self.members.remove(&key).unwrap_or(Tracked {
             ts_ms: entity.ts_ms,
             position: at,
+            labels: Labels::new(),
             inside: BTreeMap::new(),
         });
         tracked.ts_ms = entity.ts_ms;
         tracked.position = at;
+        tracked.labels = entity.labels.clone();
         let mut events = Vec::new();
-        let mut raise = |fence: &str, kind| {
+        let fence_labels = |fences: &BTreeMap<String, Placed>, id: &str| {
+            fences
+                .get(id)
+                .map(|placed| placed.fence.labels.clone())
+                .unwrap_or_default()
+        };
+        let mut raise = |fence: &str, labels: Labels, kind| {
             events.push(FenceEvent {
                 lsn,
                 index: 0,
@@ -276,6 +307,8 @@ impl Space {
                 kind,
                 ts_ms: entity.ts_ms,
                 position: at,
+                entity_labels: entity.labels.clone(),
+                fence_labels: labels,
             });
         };
         let ids: BTreeSet<String> = tracked
@@ -287,7 +320,7 @@ impl Space {
         for id in ids {
             if !now_inside.contains(&id) {
                 tracked.inside.remove(&id);
-                raise(&id, EventKind::Exit);
+                raise(&id, fence_labels(&self.fences, &id), EventKind::Exit);
                 continue;
             }
             let Some(placed) = self.fences.get(&id) else {
@@ -298,8 +331,9 @@ impl Space {
                 .inside
                 .entry(id.clone())
                 .or_insert((entity.ts_ms, false));
+            let labels = placed.fence.labels.clone();
             if entered {
-                raise(&id, EventKind::Enter);
+                raise(&id, labels.clone(), EventKind::Enter);
             } else if let Some(per_second) = placed.fence.inside_per_second {
                 let second = entity.ts_ms.div_euclid(1000);
                 let window = self.rates.entry(id.clone()).or_insert((second, 0));
@@ -308,7 +342,7 @@ impl Space {
                 }
                 if window.1 < per_second {
                     window.1 += 1;
-                    raise(&id, EventKind::Inside);
+                    raise(&id, labels.clone(), EventKind::Inside);
                 }
             }
             if let Some(dwell) = placed.fence.dwell_ms
@@ -316,7 +350,7 @@ impl Space {
                 && entity.ts_ms.saturating_sub(*since) >= dwell
             {
                 *dwelled = true;
-                raise(&id, EventKind::Dwell);
+                raise(&id, labels, EventKind::Dwell);
             }
         }
         if !tracked.inside.is_empty() {
@@ -341,12 +375,18 @@ impl Space {
                 .map(|fence| FenceEvent {
                     lsn,
                     index: 0,
+                    fence_labels: self
+                        .fences
+                        .get(&fence)
+                        .map(|placed| placed.fence.labels.clone())
+                        .unwrap_or_default(),
                     fence,
                     collection: collection.to_string(),
                     entity: id.to_string(),
                     kind: EventKind::Exit,
                     ts_ms: tracked.ts_ms,
                     position: tracked.position,
+                    entity_labels: tracked.labels.clone(),
                 })
                 .collect(),
         )
@@ -417,6 +457,7 @@ impl Space {
                 Tracked {
                     ts_ms,
                     position,
+                    labels: Labels::new(),
                     inside,
                 },
             );
@@ -477,12 +518,13 @@ impl Recent {
     }
 
     /// Events after `after` (from the oldest kept when `None`) of the given
-    /// fences (all when empty), at most `limit`. Refused when events after
-    /// `after` were already dropped.
+    /// fences (all when empty) that `readable` may see, at most `limit`.
+    /// Refused when events after `after` were already dropped.
     pub(crate) fn after(
         &self,
         after: Option<EventId>,
         fences: &[String],
+        readable: Option<&Labels>,
         limit: usize,
     ) -> Result<EventPage, Expired> {
         // From the oldest kept: just after the newest dropped.
@@ -506,7 +548,7 @@ impl Recent {
                 break;
             }
             page.through = id;
-            if fences.is_empty() || fences.contains(&event.fence) {
+            if (fences.is_empty() || fences.contains(&event.fence)) && event.visible(readable) {
                 page.events.push(event.clone());
             }
         }
@@ -563,6 +605,8 @@ impl Recent {
                 },
                 ts_ms: input.i64()?,
                 position: decode_position(input)?,
+                entity_labels: Labels::new(),
+                fence_labels: Labels::new(),
             });
         }
         Ok(Self { kept, dropped })
@@ -570,10 +614,49 @@ impl Recent {
 }
 
 /// A namespace's fence state as a snapshot stores it: fences, memberships
-/// and rate windows, then its recent events.
+/// and rate windows, then its recent events, then, only when anything
+/// carries labels, the labels of fences, members and events. A binary from
+/// before labels then refuses the file instead of dropping them.
 pub(crate) fn encode_state(space: &Space, recent: &Recent) -> Vec<u8> {
     let mut out = Writer(space.encode());
     recent.encode(&mut out);
+    let fences: Vec<_> = space
+        .fences
+        .values()
+        .filter(|placed| !placed.fence.labels.is_empty())
+        .collect();
+    let mut members: Vec<_> = space
+        .members
+        .iter()
+        .filter(|(_, tracked)| !tracked.labels.is_empty())
+        .collect();
+    members.sort_by(|a, b| a.0.cmp(b.0));
+    let events: Vec<_> = recent
+        .kept
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| !event.entity_labels.is_empty() || !event.fence_labels.is_empty())
+        .collect();
+    if fences.is_empty() && members.is_empty() && events.is_empty() {
+        return out.0;
+    }
+    out.u32(fences.len() as u32);
+    for placed in fences {
+        out.str(&placed.fence.id);
+        encode_labels(&mut out, &placed.fence.labels);
+    }
+    out.u32(members.len() as u32);
+    for ((collection, id), tracked) in members {
+        out.str(collection);
+        out.str(id);
+        encode_labels(&mut out, &tracked.labels);
+    }
+    out.u32(events.len() as u32);
+    for (at, event) in events {
+        out.u32(at as u32);
+        encode_labels(&mut out, &event.entity_labels);
+        encode_labels(&mut out, &event.fence_labels);
+    }
     out.0
 }
 
@@ -582,10 +665,41 @@ pub(crate) fn encode_state(space: &Space, recent: &Recent) -> Vec<u8> {
 pub(crate) fn decode_state(bytes: &[u8], with_events: bool) -> Result<(Space, Recent), CodecError> {
     let mut input = Reader(bytes);
     let space = Space::decode_from(&mut input)?;
-    let recent = match with_events {
+    let mut space = space;
+    let mut recent = match with_events {
         true => Recent::decode_from(&mut input)?,
         false => Recent::default(),
     };
+    if with_events && !input.0.is_empty() {
+        for _ in 0..input.u32()? {
+            let id = input.str()?;
+            let labels = decode_labels(&mut input)?;
+            let placed = space
+                .fences
+                .get_mut(&id)
+                .ok_or(CodecError("labels of no fence"))?;
+            placed.fence.labels = labels;
+        }
+        for _ in 0..input.u32()? {
+            let key = (input.str()?, input.str()?);
+            let labels = decode_labels(&mut input)?;
+            let tracked = space
+                .members
+                .get_mut(&key)
+                .ok_or(CodecError("labels of no member"))?;
+            tracked.labels = labels;
+        }
+        for _ in 0..input.u32()? {
+            let at = input.u32()? as usize;
+            let (entity, fence) = (decode_labels(&mut input)?, decode_labels(&mut input)?);
+            let event = recent
+                .kept
+                .get_mut(at)
+                .ok_or(CodecError("labels of no event"))?;
+            event.entity_labels = entity;
+            event.fence_labels = fence;
+        }
+    }
     input.done()?;
     Ok((space, recent))
 }
@@ -792,6 +906,7 @@ pub(crate) fn decode_fence(input: &mut Reader<'_>) -> Result<Fence, CodecError> 
         inside_per_second: decode_option_i64(input)?
             .map(|v| u32::try_from(v).map_err(|_| CodecError("inside rate")))
             .transpose()?,
+        labels: Default::default(),
     })
 }
 
@@ -810,6 +925,7 @@ mod tests {
             filters: vec![Filter::Eq("kind".into(), FieldValue::Text("bus".into()))],
             dwell_ms: Some(5_000),
             inside_per_second: Some(2),
+            labels: Default::default(),
         }
     }
 
@@ -823,6 +939,7 @@ mod tests {
             heading: None,
             ttl_ms: None,
             fields: BTreeMap::from([("kind".into(), FieldValue::Text("bus".into()))]),
+            labels: Default::default(),
         }
     }
 
@@ -929,14 +1046,20 @@ mod tests {
         assert_eq!(restored.list().count(), 2);
         // The ring kept the newest two and remembers what it dropped.
         assert_eq!(kept, recent);
-        assert_eq!(kept.after(None, &[], 10).unwrap().events.len(), 2);
-        assert_eq!(kept.after(Some((1, 0)), &[], 10).unwrap().events.len(), 2);
+        assert_eq!(kept.after(None, &[], None, 10).unwrap().events.len(), 2);
         assert_eq!(
-            kept.after(Some((0, 0)), &[], 10),
+            kept.after(Some((1, 0)), &[], None, 10)
+                .unwrap()
+                .events
+                .len(),
+            2
+        );
+        assert_eq!(
+            kept.after(Some((0, 0)), &[], None, 10),
             Err(Expired { dropped: (1, 0) })
         );
         // A filter that matches nothing still moves the reader along.
-        let skipped = kept.after(None, &["p".into()], 10).unwrap();
+        let skipped = kept.after(None, &["p".into()], None, 10).unwrap();
         assert_eq!((skipped.events.len(), skipped.through), (0, (3, 0)));
         // A fences file from before events were kept still reads.
         let (old, none) = decode_state(&restored.encode(), false).unwrap();
