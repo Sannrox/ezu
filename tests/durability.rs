@@ -31,6 +31,7 @@ fn config(dir: &Path, snapshot_every_records: u64) -> DurabilityConfig {
         segment_bytes: 4_096,
         snapshot_every_records,
         snapshot_every_ms: i64::MAX,
+        keys: None,
     }
 }
 
@@ -239,9 +240,7 @@ fn a_lost_snapshot_is_rebuilt_from_the_source_and_one_process_owns_the_directory
             .unwrap();
     }
     drop(engine);
-    for snapshot in fs::read_dir(dir.join("snapshots")).unwrap() {
-        fs::remove_file(snapshot.unwrap().path()).unwrap();
-    }
+    fs::remove_dir_all(dir.join("snapshots")).unwrap();
     // The log no longer starts at the beginning, so it alone is not enough.
     assert!(matches!(
         DurableEngine::open(config(&dir, 10), quotas(), None, 0),
@@ -335,10 +334,16 @@ fn a_flipped_snapshot_or_final_record_fails_closed_and_expiry_is_swept_on_open()
             .unwrap();
     }
     drop(engine);
-    let snapshot = fs::read_dir(dir.join("snapshots"))
+    // The namespace's data file inside the newest snapshot set.
+    let set = fs::read_dir(dir.join("snapshots"))
         .unwrap()
         .map(|e| e.unwrap().path())
-        .find(|p| p.extension().is_some_and(|x| x == "arrow"))
+        .find(|p| p.is_dir())
+        .unwrap();
+    let snapshot = fs::read_dir(set)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|x| x == "data"))
         .unwrap();
     let mut bytes = fs::read(&snapshot).unwrap();
     let middle = bytes.len() / 2;

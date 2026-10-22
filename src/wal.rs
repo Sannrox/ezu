@@ -18,10 +18,52 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 4] = b"EZUW";
-const VERSION: u32 = 1;
+/// Version 2 adds sealed records; version 1 segments are still read.
+const VERSION: u32 = 2;
 const HEADER: u64 = 8;
 /// Largest record payload; a frame claiming more is damage, not data.
 const MAX_RECORD: u32 = 64 << 20;
+
+/// What one logged record holds: an operation, or an encrypted namespace's
+/// operation still sealed under its key.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Entry {
+    Op(Op),
+    Sealed {
+        namespace: Namespace,
+        dek_id: String,
+        /// Nonce and ciphertext of the record's plaintext payload.
+        body: Vec<u8>,
+    },
+}
+
+impl Entry {
+    pub fn namespace(&self) -> &Namespace {
+        match self {
+            Self::Op(Op::Upsert(ns, _)) => ns,
+            Self::Op(Op::Delete { namespace, .. }) | Self::Sealed { namespace, .. } => namespace,
+        }
+    }
+}
+
+/// One committed record with its exact payload bytes, which a sealed
+/// namespace's data is carried forward as.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Record {
+    pub lsn: u64,
+    pub entry: Entry,
+    pub payload: Vec<u8>,
+}
+
+/// Authenticated data binding a sealed record to its LSN, namespace and key.
+pub fn sealed_aad(lsn: u64, namespace: &str, dek_id: &str) -> Vec<u8> {
+    let mut out = Writer::default();
+    out.str("ezu.wal");
+    out.u64(lsn);
+    out.str(namespace);
+    out.str(dek_id);
+    out.0
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Op {
@@ -38,6 +80,8 @@ pub enum WalError {
     Io(io::Error),
     /// A complete segment is damaged; recovery would lose acknowledged data.
     Corrupt(String),
+    /// A record could not be sealed under its namespace's key.
+    Seal(String),
 }
 
 impl std::fmt::Display for WalError {
@@ -45,6 +89,7 @@ impl std::fmt::Display for WalError {
         match self {
             Self::Io(error) => write!(f, "wal io: {error}"),
             Self::Corrupt(what) => write!(f, "wal corrupt: {what}"),
+            Self::Seal(why) => write!(f, "wal seal: {why}"),
         }
     }
 }
@@ -79,9 +124,10 @@ fn encode(lsn: u64, op: &Op) -> Vec<u8> {
 }
 
 const COMMIT: u8 = 0xC0;
+const SEALED: u8 = 3;
 
 enum Frame {
-    Record(u64, Op),
+    Record(u64, Entry),
     /// The batch ending at this LSN is complete and acknowledged.
     Commit(u64),
 }
@@ -101,6 +147,15 @@ fn frame(payload: &[u8], into: &mut Vec<u8>) {
     into.extend_from_slice(payload);
 }
 
+/// A record payload as written: its LSN and entry. Sealed entries stay
+/// sealed; plaintext ones decode fully.
+pub fn decode_payload(payload: &[u8]) -> Result<(u64, Entry), CodecError> {
+    match decode(payload)? {
+        Frame::Record(lsn, entry) => Ok((lsn, entry)),
+        Frame::Commit(_) => Err(CodecError("a commit is not a record")),
+    }
+}
+
 fn decode(payload: &[u8]) -> Result<Frame, CodecError> {
     let mut input = Reader(payload);
     let lsn = input.u64()?;
@@ -108,6 +163,15 @@ fn decode(payload: &[u8]) -> Result<Frame, CodecError> {
         COMMIT => {
             input.done()?;
             return Ok(Frame::Commit(lsn));
+        }
+        SEALED => {
+            let entry = Entry::Sealed {
+                namespace: Namespace::stored(input.str()?),
+                dek_id: input.str()?,
+                body: input.bytes()?.to_vec(),
+            };
+            input.done()?;
+            return Ok(Frame::Record(lsn, entry));
         }
         1 => {
             let ns = Namespace::stored(input.str()?);
@@ -121,13 +185,29 @@ fn decode(payload: &[u8]) -> Result<Frame, CodecError> {
         _ => return Err(CodecError("op")),
     };
     input.done()?;
-    Ok(Frame::Record(lsn, op))
+    Ok(Frame::Record(lsn, Entry::Op(op)))
 }
 
-/// Whether `op` encodes within the record size recovery accepts.
+/// Whether `op` encodes within the record size recovery accepts, with room
+/// for sealing (namespace, key id, nonce and tag).
 pub fn fits(op: &Op) -> bool {
-    encode(0, op).len() <= MAX_RECORD as usize
+    encode(0, op).len() + 1024 <= MAX_RECORD as usize
 }
+
+/// The payload of a sealed record.
+fn sealed_payload(lsn: u64, namespace: &str, dek_id: &str, body: &[u8]) -> Vec<u8> {
+    let mut out = Writer::default();
+    out.u64(lsn);
+    out.u8(SEALED);
+    out.str(namespace);
+    out.str(dek_id);
+    out.bytes(body);
+    out.0
+}
+
+/// Seals one operation, given its LSN and plaintext payload: the key id and
+/// sealed body, or `None` to log it in plaintext.
+pub type Sealer<'a> = dyn FnMut(u64, &Op, &[u8]) -> Result<Option<(String, Vec<u8>)>, String> + 'a;
 
 /// Sync a directory so a created, renamed or removed entry is durable.
 pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
@@ -181,7 +261,7 @@ impl Wal {
         segment_bytes: u64,
         fsync: bool,
         read: bool,
-    ) -> Result<(Self, Vec<(u64, Op)>), WalError> {
+    ) -> Result<(Self, Vec<Record>), WalError> {
         fs::create_dir_all(dir)?;
         let found = segments(dir)?;
         if !read {
@@ -229,8 +309,8 @@ impl Wal {
             }
             let before = records.len();
             read_segment(path, index == last, &mut records)?;
-            if let Some((lsn, _)) = records.get(before)
-                && lsn != first
+            if let Some(record) = records.get(before)
+                && record.lsn != *first
             {
                 return Err(WalError::Corrupt(format!(
                     "{}: first record is not the segment's",
@@ -240,13 +320,13 @@ impl Wal {
             expected = Some(
                 records
                     .last()
-                    .map_or(*first, |(lsn, _)| lsn + 1)
+                    .map_or(*first, |record| record.lsn + 1)
                     .max(*first),
             );
         }
         let next_lsn = records
             .last()
-            .map_or(0, |(lsn, _)| *lsn)
+            .map_or(0, |record| record.lsn)
             .max(floor)
             .saturating_add(1);
         let (file, written) = new_segment(dir, next_lsn)?;
@@ -269,15 +349,30 @@ impl Wal {
     }
 
     /// Append a batch and sync it once; returns the batch's last LSN.
-    pub fn append(&mut self, ops: &[Op]) -> Result<u64, WalError> {
+    pub fn append(&mut self, ops: &[Op], seal: &mut Sealer<'_>) -> Result<u64, WalError> {
         if self.written >= self.segment_bytes {
             self.rotate()?;
         }
         let mut frames = Vec::new();
+        let mut lsn = self.next_lsn;
         for op in ops {
-            frame(&encode(self.next_lsn, op), &mut frames);
-            self.next_lsn += 1;
+            let plain = encode(lsn, op);
+            let payload = match seal(lsn, op, &plain).map_err(WalError::Seal)? {
+                Some((dek_id, body)) => {
+                    let namespace = match op {
+                        Op::Upsert(ns, _) => ns,
+                        Op::Delete { namespace, .. } => namespace,
+                    };
+                    sealed_payload(lsn, namespace.as_str(), &dek_id, &body)
+                }
+                None => plain,
+            };
+            frame(&payload, &mut frames);
+            lsn += 1;
         }
+        // Sealing happened before any byte was written, so a refusal leaves
+        // the log and its LSNs untouched.
+        self.next_lsn = lsn;
         self.file.write_all(&frames)?;
         if self.fsync {
             self.file.sync_data()?;
@@ -342,7 +437,7 @@ fn new_segment(dir: &Path, first_lsn: u64) -> Result<(File, u64), WalError> {
     Ok((file, HEADER))
 }
 
-fn read_segment(path: &Path, last: bool, records: &mut Vec<(u64, Op)>) -> Result<(), WalError> {
+fn read_segment(path: &Path, last: bool, records: &mut Vec<Record>) -> Result<(), WalError> {
     let mut bytes = Vec::new();
     File::open(path)?.read_to_end(&mut bytes)?;
     if bytes.len() < HEADER as usize {
@@ -362,14 +457,14 @@ fn read_segment(path: &Path, last: bool, records: &mut Vec<(u64, Op)>) -> Result
         )));
     }
     let version = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-    if version != VERSION {
+    if version != 1 && version != VERSION {
         return Err(WalError::Corrupt(format!(
             "{}: format version {version}",
             path.display()
         )));
     }
     // Records of the batch being read; they count once its commit is seen.
-    let mut pending: Vec<(u64, Op)> = Vec::new();
+    let mut pending: Vec<Record> = Vec::new();
     let mut committed_end = HEADER as usize;
     let mut offset = HEADER as usize;
     while offset < bytes.len() {
@@ -386,16 +481,20 @@ fn read_segment(path: &Path, last: bool, records: &mut Vec<(u64, Op)>) -> Result
             return truncate(path, committed_end);
         };
         match frame {
-            Frame::Record(lsn, op) => {
-                let previous = pending.last().or(records.last()).map(|(lsn, _)| *lsn);
+            Frame::Record(lsn, entry) => {
+                let previous = pending.last().or(records.last()).map(|record| record.lsn);
                 // LSNs are contiguous; a gap is a lost segment, not a skip.
                 if previous.is_some_and(|previous| lsn != previous + 1) {
                     return Err(WalError::Corrupt(format!("{}: lsn gap", path.display())));
                 }
-                pending.push((lsn, op));
+                pending.push(Record {
+                    lsn,
+                    entry,
+                    payload: bytes[offset + 12..next].to_vec(),
+                });
             }
             Frame::Commit(lsn) => {
-                if pending.last().map(|(last, _)| *last) != Some(lsn) {
+                if pending.last().map(|record| record.lsn) != Some(lsn) {
                     return Err(WalError::Corrupt(format!(
                         "{}: commit does not close its batch",
                         path.display()

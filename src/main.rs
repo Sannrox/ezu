@@ -80,6 +80,7 @@ async fn run() -> Result<(), String> {
             segment_bytes: 64 << 20,
             snapshot_every_records: 1_000_000,
             snapshot_every_ms: 10 * 60 * 1000,
+            keys: None,
         },
         Quotas {
             max_entities: 10_000_000,
@@ -98,14 +99,19 @@ async fn run() -> Result<(), String> {
     eprintln!("ezu {} listening on {listen}", env!("CARGO_PKG_VERSION"));
     let engine = Arc::new(engine);
     // Expired entities are hidden at once but hold memory and quota until
-    // swept; sweep them in the background, off the async workers.
+    // swept; sweep them in the background, off the async workers. The same
+    // pass rechecks namespace keys, so a revoked key seals its namespace.
     let sweeper = engine.clone();
     tokio::spawn(async move {
         let mut every = tokio::time::interval(std::time::Duration::from_secs(10));
         loop {
             every.tick().await;
             let engine = sweeper.clone();
-            match tokio::task::spawn_blocking(move || engine.sweep_expired(now_ms())).await {
+            let swept = move || {
+                engine.refresh_keys()?;
+                engine.sweep_expired(now_ms())
+            };
+            match tokio::task::spawn_blocking(swept).await {
                 Ok(Ok(_)) => {}
                 Ok(Err(error)) => eprintln!("ezu: expiry sweep failed: {error}"),
                 Err(error) => eprintln!("ezu: expiry sweep task failed: {error}"),
