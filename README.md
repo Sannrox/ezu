@@ -120,6 +120,20 @@ disconnects and Ezu restarts without gaps. A resume point older than the
 newest dropped event fails with `OUT_OF_RANGE` (HTTP 410) instead of
 silently skipping events.
 
+## Offline map packages
+
+`POST /v1/packages` with `{"region": [west, south, east, north],
+"min_zoom": z0, "max_zoom": z1, "label_filter": {...}}` renders the
+namespace's entities and fences in that region as vector tiles in a
+PMTiles archive, for devices without a network.
+
+- The archive is the response body. Its manifest is in the
+  `x-ezu-package-manifest` header: region, zooms, creation time, the LSN
+  the data is at least as new as, size and SHA-256.
+- The label filter applies as for queries, and governed mode requires it.
+- Zooms go up to 16, with at most 100,000 tiles per package.
+- Basemaps are a separate input.
+
 ## Labels and governed mode
 
 Entities and fences carry up to 16 opaque labels: 1 to 64 bytes each, with

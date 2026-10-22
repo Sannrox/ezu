@@ -15,6 +15,7 @@ pub mod keys;
 pub mod metrics;
 pub mod query;
 mod snapshot;
+pub mod tiles;
 mod wal;
 
 pub use durable::{DurabilityConfig, DurableEngine, DurableError, RebuildSource};

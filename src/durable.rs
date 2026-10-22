@@ -72,6 +72,8 @@ pub enum DurableError {
     Keys(String),
     /// A reader resumed from before events that are no longer kept.
     Expired(Expired),
+    /// A map package could not be written.
+    Package(String),
     /// A write could not be made durable after it reached the index; the
     /// engine refuses further writes until it is reopened.
     Failed,
@@ -87,6 +89,7 @@ impl std::fmt::Display for DurableError {
             Self::TooLarge => f.write_str("the write is larger than one log record"),
             Self::Sealed(why) => write!(f, "namespace unavailable: {why}"),
             Self::Keys(why) => write!(f, "key store: {why}"),
+            Self::Package(why) => write!(f, "package: {why}"),
             Self::Expired(Expired {
                 dropped: (lsn, index),
             }) => write!(
@@ -408,6 +411,35 @@ impl DurableEngine {
             .engine
             .get(ns, collection, id, now_ms)?
             .filter(|entity| visible(&entity.labels, readable)))
+    }
+
+    /// The collections of `ns`, in name order.
+    pub fn collections(&self, ns: &Namespace) -> Result<Vec<String>, DurableError> {
+        self.open_namespace(ns)?;
+        Ok(self.engine.collections(ns)?)
+    }
+
+    /// Visit the live entities of `collection` in `window` that `readable`
+    /// may see; see [`Engine::visit_region`].
+    pub fn visit_region(
+        &self,
+        ns: &Namespace,
+        collection: &str,
+        window: [f64; 4],
+        readable: Option<&Labels>,
+        now_ms: i64,
+        visit: &mut dyn FnMut(&Entity) -> bool,
+    ) -> Result<bool, DurableError> {
+        self.open_namespace(ns)?;
+        Ok(self
+            .engine
+            .visit_region(ns, collection, window, readable, now_ms, visit)?)
+    }
+
+    /// The LSN the last logged write took.
+    pub fn last_lsn(&self) -> Result<u64, DurableError> {
+        let writer = self.writer.lock().map_err(|_| DurableError::Failed)?;
+        Ok(writer.wal.last_lsn())
     }
 
     /// Entities counted against `ns`'s quota.
