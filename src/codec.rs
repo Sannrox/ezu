@@ -131,23 +131,43 @@ pub fn geometry_to_wkb(geometry: &Geometry) -> Vec<u8> {
     out.0
 }
 
+/// Read WKB in either byte order; [`geometry_to_wkb`] writes little-endian.
 pub fn geometry_from_wkb(bytes: &[u8]) -> Result<Geometry, CodecError> {
     let mut input = Reader(bytes);
-    if input.u8()? != 1 {
-        return Err(CodecError("wkb is not little-endian"));
-    }
+    let big = match input.u8()? {
+        0 => true,
+        1 => false,
+        _ => return Err(CodecError("wkb byte order")),
+    };
+    let u32 = |input: &mut Reader<'_>| -> Result<u32, CodecError> {
+        let raw = input.array()?;
+        Ok(if big {
+            u32::from_be_bytes(raw)
+        } else {
+            u32::from_le_bytes(raw)
+        })
+    };
+    let position = |input: &mut Reader<'_>| -> Result<Position, CodecError> {
+        let mut f64 = || -> Result<f64, CodecError> {
+            let raw = input.array()?;
+            Ok(if big {
+                f64::from_be_bytes(raw)
+            } else {
+                f64::from_le_bytes(raw)
+            })
+        };
+        Ok(Position::new(f64()?, f64()?))
+    };
     let count = |input: &mut Reader<'_>| -> Result<u32, CodecError> {
-        let n = input.u32()?;
+        let n = u32(input)?;
         (n <= MAX_COUNT).then_some(n).ok_or(CodecError("wkb count"))
     };
     let positions = |input: &mut Reader<'_>| -> Result<Vec<Position>, CodecError> {
         let n = count(input)?;
-        (0..n)
-            .map(|_| Ok(Position::new(input.f64()?, input.f64()?)))
-            .collect()
+        (0..n).map(|_| position(input)).collect()
     };
-    let geometry = match input.u32()? {
-        WKB_POINT => Geometry::Point(Position::new(input.f64()?, input.f64()?)),
+    let geometry = match u32(&mut input)? {
+        WKB_POINT => Geometry::Point(position(&mut input)?),
         WKB_LINE => Geometry::Line(positions(&mut input)?),
         WKB_POLYGON => {
             let n = count(&mut input)?;
@@ -267,6 +287,22 @@ pub fn decode_entity(input: &mut Reader<'_>) -> Result<Entity, CodecError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn big_endian_wkb_reads_like_little_endian() {
+        // LINESTRING (1 2, 3 4) in big-endian WKB.
+        let mut big = vec![0u8];
+        big.extend(WKB_LINE.to_be_bytes());
+        big.extend(2u32.to_be_bytes());
+        for v in [1.0f64, 2.0, 3.0, 4.0] {
+            big.extend(v.to_be_bytes());
+        }
+        let line = Geometry::Line(vec![Position::new(1.0, 2.0), Position::new(3.0, 4.0)]);
+        assert_eq!(geometry_from_wkb(&big).unwrap(), line);
+        assert_eq!(geometry_from_wkb(&geometry_to_wkb(&line)).unwrap(), line);
+        big[0] = 7;
+        assert!(geometry_from_wkb(&big).is_err());
+    }
 
     #[test]
     fn entities_round_trip_and_corrupt_bytes_are_refused() {
