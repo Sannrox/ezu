@@ -19,6 +19,10 @@ service Ezu {
   rpc ListFences(ListFencesRequest) returns (ListFencesResponse);
   // Recent fence events, oldest first.
   rpc ListEvents(ListEventsRequest) returns (ListEventsResponse);
+  // Fence events from a resume point, then live as they are raised. Fails
+  // with OUT_OF_RANGE when events after the resume point are no longer
+  // kept. Delivery is at least once: the event id is the idempotency key.
+  rpc Subscribe(SubscribeRequest) returns (stream FenceEvent);
 }
 
 // Longitude and latitude in WGS 84 degrees.
@@ -251,8 +255,22 @@ message ListEventsRequest {
   optional uint64 after_lsn = 1;
   uint32 after_index = 2;
   uint32 limit = 3;
+  // Only these fences' events; all when empty.
+  repeated string fences = 4;
+}
+
+message SubscribeRequest {
+  // Events after this id; from the oldest kept when absent.
+  optional uint64 after_lsn = 1;
+  uint32 after_index = 2;
+  // Only these fences' events; all when empty.
+  repeated string fences = 3;
 }
 
 message ListEventsResponse {
   repeated FenceEvent events = 1;
+  // The id read through, past events a fence filter skipped: the next
+  // request's resume point.
+  optional uint64 through_lsn = 2;
+  uint32 through_index = 3;
 }

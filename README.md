@@ -47,8 +47,16 @@ and, for fences that ask, `inside` capped at `inside_per_second` per fence.
 An event's id is the LSN of the write that raised it plus its index in that
 write. Memberships are logged state and part of snapshots, so a restart
 neither re-enters nor resets dwell timers, and replay raises the same events
-with the same ids. Recent events are kept in memory per namespace
-(`events_retained`) and read with `ListEvents` from a last-seen id.
+with the same ids.
+
+The newest `events_retained` events of each namespace are kept in memory
+and in snapshots. `Subscribe` (a gRPC server stream) sends them from a
+last-seen id, then live, optionally for chosen fences; `ListEvents` (also
+`GET /v1/events`) reads them in pages. Delivery is at least once and the
+event id is the idempotency key: a reader resumes from its last id across
+disconnects and Ezu restarts without gaps. A resume point older than the
+newest dropped event fails with `OUT_OF_RANGE` (HTTP 410) instead of
+silently skipping events.
 
 ## Encryption at rest
 

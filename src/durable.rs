@@ -11,13 +11,16 @@
 //! life, so a second instance fails to open instead of writing alongside.
 
 use crate::entity::{Entity, Namespace};
-use crate::fence::{Fence, FenceEvent, Fences, Space};
+use crate::fence::{
+    EventId, EventPage, Expired, Fence, FenceEvent, Fences, Recent, Space, decode_state,
+    encode_state,
+};
 use crate::index::{Engine, IndexError, Quotas, Upsert};
 use crate::keys::sekai_keys::{Dek, KeyId};
 use crate::keys::{self, KeyConfig, Keyring};
 use crate::snapshot::{self, DataFile, Found, Part, SealInfo, SnapshotError};
 use crate::wal::{Entry, Op, Wal, WalError};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -33,7 +36,8 @@ pub struct DurabilityConfig {
     pub segment_bytes: u64,
     pub snapshot_every_records: u64,
     pub snapshot_every_ms: i64,
-    /// Fence events kept per namespace for readers; older ones are dropped.
+    /// Fence events kept per namespace, in memory and in snapshots, for
+    /// readers to resume from; older ones are dropped.
     pub events_retained: usize,
     /// Namespaces encrypted with keys from an external provider; `None`
     /// keeps every namespace in plaintext.
@@ -65,6 +69,8 @@ pub enum DurableError {
     Sealed(String),
     /// The key store could not be read or written.
     Keys(String),
+    /// A reader resumed from before events that are no longer kept.
+    Expired(Expired),
     /// A write could not be made durable after it reached the index; the
     /// engine refuses further writes until it is reopened.
     Failed,
@@ -80,6 +86,12 @@ impl std::fmt::Display for DurableError {
             Self::TooLarge => f.write_str("the write is larger than one log record"),
             Self::Sealed(why) => write!(f, "namespace unavailable: {why}"),
             Self::Keys(why) => write!(f, "key store: {why}"),
+            Self::Expired(Expired {
+                dropped: (lsn, index),
+            }) => write!(
+                f,
+                "events up to {lsn}/{index} are no longer kept; resume from a later id"
+            ),
             Self::NeedsRebuild(why) => write!(f, "recovery needs a rebuild source: {why}"),
             Self::Failed => {
                 f.write_str("durability was lost after a failed write; reopen to recover")
@@ -119,7 +131,11 @@ struct Writer {
 pub struct DurableEngine {
     engine: Engine,
     writer: Mutex<Writer>,
-    events: Mutex<HashMap<Namespace, VecDeque<FenceEvent>>>,
+    events: Mutex<HashMap<Namespace, Recent>>,
+    /// Event ids below this are unknown to every namespace; fixed at open.
+    events_floor: Option<EventId>,
+    /// Counts publishes, so a subscriber waits for new events.
+    published: tokio::sync::watch::Sender<u64>,
     quotas: Quotas,
     config: DurabilityConfig,
     keyring: Keyring,
@@ -178,9 +194,12 @@ impl DurableEngine {
             });
         let mut loaded = None;
         let mut fences = Fences::default();
+        // Event ids below this are unknown: history the store did not keep.
+        let mut events_floor = None;
         let (base_lsn, rebuilt) = match newest.map(|(_, found)| load_snapshot(&keyring, found)) {
             Some(Ok(snapshot)) => {
                 let lsn = snapshot.lsn;
+                events_floor = snapshot.events_floor;
                 loaded = Some(snapshot);
                 (lsn, false)
             }
@@ -214,6 +233,11 @@ impl DurableEngine {
             config.fsync,
             !rebuilt,
         )?;
+        if rebuilt {
+            // Every event before the rebuild is gone; new writes take LSNs
+            // past every discarded record, so every id before them is.
+            events_floor = Some((wal.last_lsn(), u32::MAX));
+        }
         // Records the snapshot already holds are skipped; the rest replay in
         // order with the same newer-wins rule as live writes. The first one
         // must follow the snapshot directly, or writes in between are lost.
@@ -244,8 +268,11 @@ impl DurableEngine {
         if let Some(mut loaded) = loaded {
             loaded.carry_sealed(&keyring)?;
             restore_all(&engine, loaded.entities)?;
-            for (namespace, space) in loaded.spaces {
-                fences.insert(Namespace::stored(namespace), space);
+            for (namespace, (space, mut recent)) in loaded.spaces {
+                fences.insert(Namespace::stored(namespace.clone()), space);
+                // The retention may have been lowered since the snapshot.
+                recent.trim(retained);
+                events.insert(Namespace::stored(namespace), recent);
             }
             for (lsn, entry) in loaded.tail {
                 let raised = apply_entry(&engine, &mut fences, &keyring, lsn, entry)?;
@@ -287,6 +314,8 @@ impl DurableEngine {
                 snapshot_at_ms,
             }),
             events: Mutex::new(events),
+            published: tokio::sync::watch::Sender::new(0),
+            events_floor,
             quotas,
             config,
             keyring,
@@ -557,12 +586,32 @@ impl DurableEngine {
         }
         let mut parts: Vec<Part> = writer.carried.values().cloned().collect();
         let mut namespaces: Vec<Namespace> = by_namespace.keys().cloned().collect();
+        // A copy, so readers are not held up by the snapshot's disk work.
+        // Events only change under the writer lock, which this holds.
+        let events = self
+            .events
+            .lock()
+            .map_err(|_| DurableError::Failed)?
+            .clone();
+        let mut with_state: Vec<Namespace> = writer
+            .fences
+            .iter()
+            .filter(|(_, space)| !space.is_empty())
+            .map(|(ns, _)| ns.clone())
+            .chain(
+                events
+                    .iter()
+                    .filter(|(_, recent)| !recent.is_empty())
+                    .map(|(ns, _)| ns.clone()),
+            )
+            .collect();
+        with_state.sort();
+        with_state.dedup();
         namespaces.extend(
-            writer
-                .fences
+            with_state
                 .iter()
-                .filter(|(ns, space)| !space.is_empty() && !by_namespace.contains_key(*ns))
-                .map(|(ns, _)| ns.clone()),
+                .filter(|ns| !by_namespace.contains_key(*ns))
+                .cloned(),
         );
         for ns in namespaces {
             let key = self
@@ -578,18 +627,30 @@ impl DurableEngine {
                 )?),
                 None => None,
             };
-            let fences = match writer.fences.space(&ns).filter(|space| !space.is_empty()) {
-                Some(space) => Some(store(space.encode(), snapshot::fences_aad)?),
-                None => None,
+            let fences = match with_state.binary_search(&ns) {
+                Ok(_) => Some(store(
+                    encode_state(
+                        writer.fences.space(&ns).unwrap_or(&Space::default()),
+                        events.get(&ns).unwrap_or(&Recent::default()),
+                    ),
+                    snapshot::fences_aad,
+                )?),
+                Err(_) => None,
             };
             parts.push(Part {
                 namespace: ns.as_str().to_string(),
                 file,
+                fences_with_events: fences.is_some(),
                 fences,
                 tail: Vec::new(),
             });
         }
-        let published = snapshot::write_set(&self.config.dir.join("snapshots"), lsn, &parts)?;
+        let published = snapshot::write_set(
+            &self.config.dir.join("snapshots"),
+            lsn,
+            &parts,
+            self.events_floor,
+        )?;
         // Only after the snapshot is durable may the log it covers go. A
         // failure here leaves the segment layout unknown, so writes stop.
         if let Err(error) = writer
@@ -632,11 +693,16 @@ impl DurableEngine {
             // carried parts, or the next snapshot would drop it with the log.
             // On failure writes and snapshots stop until a reopen recovers it
             // from disk.
-            let space = writer.fences.take(&Namespace::stored(namespace.clone()));
-            if let Ok(mut events) = self.events.lock() {
-                events.remove(&Namespace::stored(namespace.clone()));
-            }
-            match self.carry(&namespace, space, last, lsn) {
+            let ns = Namespace::stored(namespace.clone());
+            let space = writer.fences.take(&ns).unwrap_or_default();
+            let recent = match self.events.lock() {
+                Ok(mut events) => events.remove(&ns).unwrap_or_default(),
+                Err(_) => {
+                    self.failed.store(true, Ordering::Release);
+                    return Err(DurableError::Failed);
+                }
+            };
+            match self.carry(&namespace, space, recent, last, lsn) {
                 Ok(Some(part)) => {
                     writer.carried.insert(namespace.clone(), part);
                 }
@@ -648,16 +714,22 @@ impl DurableEngine {
             }
             sealed.push(namespace);
         }
+        // Wake subscribers, so those of a sealed namespace end now.
+        if !sealed.is_empty() {
+            self.published
+                .send_modify(|count| *count = count.wrapping_add(1));
+        }
         Ok(sealed)
     }
 
-    /// Take `namespace` out of the index and, with its fences, seal it
-    /// under `last`, its final key, as a part to carry. `None` when it held
-    /// nothing.
+    /// Take `namespace` out of the index and, with its fences and recent
+    /// events, seal it under `last`, its final key, as a part to carry.
+    /// `None` when it held nothing.
     fn carry(
         &self,
         namespace: &str,
-        space: Option<Space>,
+        space: Space,
+        recent: Recent,
         last: Option<(KeyId, Dek)>,
         lsn: u64,
     ) -> Result<Option<Part>, DurableError> {
@@ -668,8 +740,8 @@ impl DurableEngine {
             .into_iter()
             .map(|entity| (ns.clone(), entity))
             .collect();
-        let space = space.filter(|space| !space.is_empty());
-        if entities.is_empty() && space.is_none() {
+        let state = !(space.is_empty() && recent.is_empty());
+        if entities.is_empty() && !state {
             return Ok(None);
         }
         let Some(key) = last else {
@@ -680,6 +752,7 @@ impl DurableEngine {
         let store = |bytes: Vec<u8>, aad: Aad| stored_file(Some(&key), namespace, lsn, bytes, aad);
         Ok(Some(Part {
             namespace: namespace.to_string(),
+            fences_with_events: state,
             file: match entities.is_empty() {
                 true => None,
                 false => Some(store(
@@ -687,9 +760,10 @@ impl DurableEngine {
                     snapshot::sealed_aad,
                 )?),
             },
-            fences: space
-                .map(|space| store(space.encode(), snapshot::fences_aad))
-                .transpose()?,
+            fences: match state {
+                true => Some(store(encode_state(&space, &recent), snapshot::fences_aad)?),
+                false => None,
+            },
             tail: Vec::new(),
         }))
     }
@@ -701,29 +775,50 @@ impl DurableEngine {
         }
         let mut events = self.events.lock().map_err(|_| DurableError::Failed)?;
         keep(&mut events, raised, self.config.events_retained);
+        drop(events);
+        self.published
+            .send_modify(|count| *count = count.wrapping_add(1));
         Ok(())
     }
 
-    /// Fence events of `ns` after `after` (an event's `(lsn, index)`), oldest
-    /// first, at most `limit`. Only recent events are kept.
+    /// Fence events of `ns` after `after` (from the oldest kept when
+    /// `None`), of the given fences (all when empty), oldest first, at most
+    /// `limit`, and the id read through. A reader whose `after` is older
+    /// than the newest dropped event, or than history the store kept, gets
+    /// [`DurableError::Expired`]: it has missed events.
     pub fn events(
         &self,
         ns: &Namespace,
-        after: Option<(u64, u32)>,
+        after: Option<EventId>,
+        fences: &[String],
         limit: usize,
-    ) -> Result<Vec<FenceEvent>, DurableError> {
+    ) -> Result<EventPage, DurableError> {
         self.open_namespace(ns)?;
+        let floor = self.events_floor.unwrap_or((0, 0));
+        if let Some(after) = after
+            && after < floor
+        {
+            return Err(DurableError::Expired(Expired { dropped: floor }));
+        }
         let events = self.events.lock().map_err(|_| DurableError::Failed)?;
-        Ok(events
-            .get(ns)
-            .map(|kept| {
-                kept.iter()
-                    .filter(|event| after.is_none_or(|after| (event.lsn, event.index) > after))
-                    .take(limit)
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default())
+        let mut page = match events.get(ns) {
+            Some(recent) => recent
+                .after(after, fences, limit)
+                .map_err(DurableError::Expired)?,
+            None => EventPage {
+                events: Vec::new(),
+                through: after.unwrap_or((0, 0)),
+            },
+        };
+        // A reader that started from the oldest kept resumes past the floor.
+        page.through = page.through.max(floor);
+        Ok(page)
+    }
+
+    /// Changes whenever events are published; a subscriber marks it seen,
+    /// reads [`Self::events`], and waits on it when there were none.
+    pub fn watch_events(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.published.subscribe()
     }
 
     /// Add or replace a fence; true when it replaced one.
@@ -831,13 +926,9 @@ type Raised = Vec<(Namespace, FenceEvent)>;
 
 /// Add `raised` to the kept events, dropping the oldest past `retained` per
 /// namespace.
-fn keep(events: &mut HashMap<Namespace, VecDeque<FenceEvent>>, raised: Raised, retained: usize) {
+fn keep(events: &mut HashMap<Namespace, Recent>, raised: Raised, retained: usize) {
     for (ns, event) in raised {
-        let kept = events.entry(ns).or_default();
-        kept.push_back(event);
-        while kept.len() > retained {
-            kept.pop_front();
-        }
+        events.entry(ns).or_default().push(event, retained);
     }
 }
 
@@ -874,8 +965,9 @@ fn stored_file(
 /// every part as stored, to carry a namespace the log turns out to seal.
 struct Loaded {
     lsn: u64,
+    events_floor: Option<EventId>,
     entities: Vec<(Namespace, Entity)>,
-    spaces: HashMap<String, Space>,
+    spaces: HashMap<String, (Space, Recent)>,
     tail: Vec<(u64, Entry)>,
     carried: HashMap<String, Part>,
     stored: HashMap<String, Part>,
@@ -919,6 +1011,7 @@ impl Loaded {
                             bytes,
                         }),
                         fences: None,
+                        fences_with_events: false,
                         tail: Vec::new(),
                     },
                 );
@@ -947,11 +1040,13 @@ fn seal_if_unreadable(
 /// Any unreadable part makes the whole snapshot damaged.
 fn load_snapshot(keyring: &Keyring, found: Found) -> Result<Loaded, DurableError> {
     let damaged = |why: String| DurableError::Snapshot(SnapshotError(why));
-    let (lsn, parts) = match found {
+    let set = match found {
         Found::V1(path) => {
             let (lsn, entities) = snapshot::read_v1(&path)?;
             let mut loaded = Loaded {
                 lsn,
+                // Version 1 kept no events.
+                events_floor: Some((lsn, u32::MAX)),
                 entities,
                 spaces: HashMap::new(),
                 tail: Vec::new(),
@@ -964,14 +1059,15 @@ fn load_snapshot(keyring: &Keyring, found: Found) -> Result<Loaded, DurableError
         Found::V2(dir) => snapshot::read_set(&dir)?,
     };
     let mut loaded = Loaded {
-        lsn,
+        lsn: set.lsn,
+        events_floor: set.events_floor,
         entities: Vec::new(),
         spaces: HashMap::new(),
         tail: Vec::new(),
         carried: HashMap::new(),
         stored: HashMap::new(),
     };
-    for part in parts {
+    for part in set.parts {
         let mut tail = Vec::new();
         for payload in &part.tail {
             let (lsn, entry) =
@@ -1007,9 +1103,9 @@ fn load_snapshot(keyring: &Keyring, found: Found) -> Result<Loaded, DurableError
             }
         };
         if let Some(file) = &part.fences {
-            let space = Space::decode(&open(file, snapshot::fences_aad)?)
+            let state = decode_state(&open(file, snapshot::fences_aad)?, part.fences_with_events)
                 .map_err(|error| damaged(error.to_string()))?;
-            loaded.spaces.insert(part.namespace.clone(), space);
+            loaded.spaces.insert(part.namespace.clone(), state);
         }
         if let Some(file) = &part.file {
             let entities = match &file.sealed {

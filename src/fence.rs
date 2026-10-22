@@ -18,7 +18,12 @@
 //! derived from logged writes in log order, replayed on recovery and kept in
 //! snapshots, so a restart raises no spurious `Enter` and dwell timers carry
 //! on. An event is identified by the LSN of the write that raised it and its
-//! index among that write's events.
+//! index among that write's events; ids only grow.
+//!
+//! The newest events of each namespace are kept in a bounded ring
+//! ([`Recent`]) that snapshots hold with the fence state, so a reader can
+//! resume from its last id across restarts. A reader whose id is older than
+//! the newest dropped event has missed events and is told so.
 
 use crate::codec::{CodecError, Reader, Writer, decode_fields, encode_fields};
 use crate::entity::{Entity, EntityError, FieldValue, MAX_FIELDS, Namespace, valid_name};
@@ -26,7 +31,7 @@ use crate::geometry::{BoundingBox, Geometry, Position};
 use crate::index::{IndexError, Node, Quotas, build_tree, node};
 use crate::query::{EARTH_RADIUS_M, Filter, Query, Relation, invalid, matches, windows};
 use rstar::{AABB, RTree};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Shape {
@@ -379,12 +384,11 @@ impl Space {
         out.0
     }
 
-    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
-        let mut input = Reader(bytes);
+    fn decode_from(input: &mut Reader<'_>) -> Result<Self, CodecError> {
         let mut space = Self::default();
         let mut nodes = Vec::new();
         for _ in 0..input.u32()? {
-            let fence = decode_fence(&mut input)?;
+            let fence = decode_fence(input)?;
             let query = fence.query();
             let boxes = windows(&query);
             nodes.extend(boxes.iter().map(|bbox| node(bbox, &fence.id)));
@@ -422,9 +426,168 @@ impl Space {
             let window = (input.i64()?, input.u32()?);
             space.rates.insert(fence, window);
         }
-        input.done()?;
         Ok(space)
     }
+}
+
+/// An event id: the raising write's LSN and the event's index in it.
+pub type EventId = (u64, u32);
+
+/// Events read, and the id read through: a reader resumes after `through`,
+/// past events its fence filter skipped. `(0, 0)` lies before every event.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventPage {
+    pub events: Vec<FenceEvent>,
+    pub through: EventId,
+}
+
+/// A reader asked to resume from before events that are no longer kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Expired {
+    /// The newest event dropped from the ring.
+    pub dropped: EventId,
+}
+
+/// One namespace's newest events, oldest first, and the id of the newest
+/// one dropped for space.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct Recent {
+    kept: VecDeque<FenceEvent>,
+    dropped: Option<EventId>,
+}
+
+impl Recent {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.kept.is_empty() && self.dropped.is_none()
+    }
+
+    /// Keep `event`, dropping the oldest past `retained`.
+    pub(crate) fn push(&mut self, event: FenceEvent, retained: usize) {
+        self.kept.push_back(event);
+        self.trim(retained);
+    }
+
+    /// Drop the oldest events past `retained`.
+    pub(crate) fn trim(&mut self, retained: usize) {
+        while self.kept.len() > retained {
+            if let Some(old) = self.kept.pop_front() {
+                self.dropped = Some((old.lsn, old.index));
+            }
+        }
+    }
+
+    /// Events after `after` (from the oldest kept when `None`) of the given
+    /// fences (all when empty), at most `limit`. Refused when events after
+    /// `after` were already dropped.
+    pub(crate) fn after(
+        &self,
+        after: Option<EventId>,
+        fences: &[String],
+        limit: usize,
+    ) -> Result<EventPage, Expired> {
+        // From the oldest kept: just after the newest dropped.
+        let start = match after {
+            Some(after) => match self.dropped {
+                Some(dropped) if after < dropped => return Err(Expired { dropped }),
+                _ => after,
+            },
+            None => self.dropped.unwrap_or((0, 0)),
+        };
+        let mut page = EventPage {
+            events: Vec::new(),
+            through: start,
+        };
+        for event in &self.kept {
+            let id = (event.lsn, event.index);
+            if id <= start {
+                continue;
+            }
+            if page.events.len() == limit {
+                break;
+            }
+            page.through = id;
+            if fences.is_empty() || fences.contains(&event.fence) {
+                page.events.push(event.clone());
+            }
+        }
+        Ok(page)
+    }
+
+    fn encode(&self, out: &mut Writer) {
+        match self.dropped {
+            Some((lsn, index)) => {
+                out.u8(1);
+                out.u64(lsn);
+                out.u32(index);
+            }
+            None => out.u8(0),
+        }
+        out.u32(self.kept.len() as u32);
+        for event in &self.kept {
+            out.u64(event.lsn);
+            out.u32(event.index);
+            out.str(&event.fence);
+            out.str(&event.collection);
+            out.str(&event.entity);
+            out.u8(match event.kind {
+                EventKind::Enter => 0,
+                EventKind::Exit => 1,
+                EventKind::Inside => 2,
+                EventKind::Dwell => 3,
+            });
+            out.i64(event.ts_ms);
+            encode_position(out, event.position);
+        }
+    }
+
+    fn decode_from(input: &mut Reader<'_>) -> Result<Self, CodecError> {
+        let dropped = match input.u8()? {
+            0 => None,
+            1 => Some((input.u64()?, input.u32()?)),
+            _ => return Err(CodecError("option tag")),
+        };
+        let mut kept = VecDeque::new();
+        for _ in 0..input.u32()? {
+            kept.push_back(FenceEvent {
+                lsn: input.u64()?,
+                index: input.u32()?,
+                fence: input.str()?,
+                collection: input.str()?,
+                entity: input.str()?,
+                kind: match input.u8()? {
+                    0 => EventKind::Enter,
+                    1 => EventKind::Exit,
+                    2 => EventKind::Inside,
+                    3 => EventKind::Dwell,
+                    _ => return Err(CodecError("event kind")),
+                },
+                ts_ms: input.i64()?,
+                position: decode_position(input)?,
+            });
+        }
+        Ok(Self { kept, dropped })
+    }
+}
+
+/// A namespace's fence state as a snapshot stores it: fences, memberships
+/// and rate windows, then its recent events.
+pub(crate) fn encode_state(space: &Space, recent: &Recent) -> Vec<u8> {
+    let mut out = Writer(space.encode());
+    recent.encode(&mut out);
+    out.0
+}
+
+/// Read [`encode_state`], or with `with_events` false a file from before
+/// events were kept, which holds the fence state alone.
+pub(crate) fn decode_state(bytes: &[u8], with_events: bool) -> Result<(Space, Recent), CodecError> {
+    let mut input = Reader(bytes);
+    let space = Space::decode_from(&mut input)?;
+    let recent = match with_events {
+        true => Recent::decode_from(&mut input)?,
+        false => Recent::default(),
+    };
+    input.done()?;
+    Ok((space, recent))
 }
 
 /// Number a write's events in order.
@@ -754,13 +917,30 @@ mod tests {
         }];
         ring_fence.inside_per_second = None;
         space.put(ring_fence);
-        space.upserted(&at(0.0, 1_000), 1);
-        space.upserted(&at(0.0, 1_100), 2);
-        space.upserted(&at(0.0, 1_200), 3);
-        let bytes = space.encode();
-        let mut restored = Space::decode(&bytes).unwrap();
-        assert_eq!(restored.encode(), bytes);
+        let mut recent = Recent::default();
+        for (lsn, ts) in [(1, 1_000), (2, 1_100), (3, 1_200)] {
+            for event in space.upserted(&at(0.0, ts), lsn) {
+                recent.push(event, 2);
+            }
+        }
+        let bytes = encode_state(&space, &recent);
+        let (mut restored, kept) = decode_state(&bytes, true).unwrap();
+        assert_eq!(encode_state(&restored, &kept), bytes);
         assert_eq!(restored.list().count(), 2);
+        // The ring kept the newest two and remembers what it dropped.
+        assert_eq!(kept, recent);
+        assert_eq!(kept.after(None, &[], 10).unwrap().events.len(), 2);
+        assert_eq!(kept.after(Some((1, 0)), &[], 10).unwrap().events.len(), 2);
+        assert_eq!(
+            kept.after(Some((0, 0)), &[], 10),
+            Err(Expired { dropped: (1, 0) })
+        );
+        // A filter that matches nothing still moves the reader along.
+        let skipped = kept.after(None, &["p".into()], 10).unwrap();
+        assert_eq!((skipped.events.len(), skipped.through), (0, (3, 0)));
+        // A fences file from before events were kept still reads.
+        let (old, none) = decode_state(&restored.encode(), false).unwrap();
+        assert_eq!((old.list().count(), none), (2, Recent::default()));
         // The inside allowance of that second stays spent.
         assert!(restored.upserted(&at(0.0, 1_300), 4).is_empty());
         // Still inside after the round trip: no second enter, and the dwell
@@ -774,7 +954,7 @@ mod tests {
             ]
         );
         for cut in 0..bytes.len() {
-            assert!(Space::decode(&bytes[..cut]).is_err(), "cut {cut}");
+            assert!(decode_state(&bytes[..cut], true).is_err(), "cut {cut}");
         }
     }
 }
