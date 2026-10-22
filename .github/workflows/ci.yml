@@ -60,3 +60,11 @@ jobs:
       # Run it with no network but loopback, and check it serves.
       - name: It runs with networking disabled
         run: bash scripts/offline-check.sh target/x86_64-unknown-linux-musl/release/ezu
+  bench:
+    name: Benchmark smoke (10^6)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked --bin ezu-bench
+      - run: ./target/release/ezu-bench --entities 1000000
