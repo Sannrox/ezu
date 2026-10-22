@@ -1,0 +1,37 @@
+name: Nightly benchmark
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  bench:
+    name: Benchmark 10^6 against the last nightly
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked --bin ezu-bench
+      # The baseline is the result of the last successful nightly on main;
+      # the first run has none and only records one.
+      - name: Fetch the baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run=$(gh run list --workflow nightly.yml --branch main --status success --limit 1 \
+            --json databaseId --jq '.[0].databaseId // empty')
+          if [ -n "$run" ]; then
+            gh run download "$run" --name bench --dir baseline || echo "no baseline artifact"
+          fi
+      - name: Measure, failing on a regression of more than 10%
+        run: |
+          args=()
+          if [ -f baseline/bench.json ]; then args=(--baseline baseline/bench.json); fi
+          ./target/release/ezu-bench --entities 1000000 "${args[@]}" > bench.json
+          cat bench.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench
+          path: bench.json

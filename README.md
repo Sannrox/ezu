@@ -59,6 +59,9 @@ mutual TLS. The server needs `EZU_DATA_DIR` and listens on `EZU_LISTEN`
   network but loopback and checks it serves.
 - `cargo deny` in CI refuses copyleft licenses in the default build (see
   `deny.toml`).
+- `ezu-bench` measures throughput, query and fence latency, memory and
+  recovery; see [docs/benchmarks.md](docs/benchmarks.md) for how it runs in
+  CI and the latest results.
 
 ## Bulk interchange (Arrow Flight)
 
