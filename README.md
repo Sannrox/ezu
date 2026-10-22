@@ -37,6 +37,42 @@ other authorization decision. Authentication is one of:
 mutual TLS. The server needs `EZU_DATA_DIR` and listens on `EZU_LISTEN`
 (default `127.0.0.1:7600`); it refuses to start without authentication.
 
+## Bulk interchange (Arrow Flight)
+
+The API listener also serves Arrow Flight, with the same bearer-token
+authentication and namespace rule.
+
+- `DoPut` upserts each Arrow batch and answers it with JSON outcome counts.
+- `DoGet` takes a ticket holding a JSON query (the `POST /v1/query` body)
+  and streams every entity it selects; a world bounding box exports a whole
+  collection.
+
+Batches have the columns `collection`, `id`, `geometry`, `ts_ms`, `speed`,
+`heading`, `ttl_ms` and `fields`. `geometry` is WKB carrying the GeoArrow
+extension type `geoarrow.wkb` (GeoArrow spec 0.2, CRS `OGC:CRS84`), so Arrow
+query engines read exports directly. `fields` is a JSON object; integers are
+written without a fraction and floats with one, so values round-trip.
+
+### GeoParquet layout
+
+An export written to Parquet is a GeoParquet 1.1 file when it keeps the
+columns above unchanged, one row per entity, and carries this file metadata
+under the key `geo`:
+
+```json
+{
+  "version": "1.1.0",
+  "primary_column": "geometry",
+  "columns": {
+    "geometry": {"encoding": "WKB", "geometry_types": []}
+  }
+}
+```
+
+The `crs` member is left out on purpose: absent, it means longitude and
+latitude on WGS 84 (`OGC:CRS84`), whereas `null` would mean unknown. Such a
+file loads back through `DoPut` as it is.
+
 ## Geofences
 
 A fence is a circle or polygon with a selector (collections, field

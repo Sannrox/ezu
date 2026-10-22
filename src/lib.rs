@@ -7,6 +7,7 @@ mod codec;
 pub mod durable;
 pub mod entity;
 pub mod fence;
+pub mod flight;
 pub mod geometry;
 pub mod index;
 pub mod keys;

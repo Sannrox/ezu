@@ -3,6 +3,9 @@
 //! authenticated by the configured [`Authenticator`]; the namespace comes
 //! from the resulting identity and from nowhere else.
 //!
+//! Arrow Flight bulk interchange (`DoPut`, `DoGet`) is served on the same
+//! listener; see [`crate::flight`].
+//!
 //! HTTP routes (JSON bodies are the protobuf messages in snake_case, oneofs
 //! as `{"variant": {...}}`):
 //! `POST /v1/entities`, `GET|DELETE /v1/entities/{collection}/{id}`,
@@ -107,7 +110,7 @@ impl IntoResponse for ApiError {
     }
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| {
@@ -220,7 +223,7 @@ fn to_entity(entity: Entity) -> proto::Entity {
     }
 }
 
-fn query_request(request: proto::QueryRequest) -> Result<QueryRequest, ApiError> {
+pub(crate) fn query_request(request: proto::QueryRequest) -> Result<QueryRequest, ApiError> {
     use proto::query_request::Query as Kind;
     let query = match request.query {
         Some(Kind::Bbox(b)) => Query::Bbox([b.west, b.south, b.east, b.north]),
@@ -375,14 +378,14 @@ impl Api {
         Self { engine, auth }
     }
 
-    fn namespace(&self, authorization: Option<&str>) -> Result<Namespace, ApiError> {
+    pub(crate) fn namespace(&self, authorization: Option<&str>) -> Result<Namespace, ApiError> {
         Ok(Namespace::of(
             &self.auth.authenticate(bearer(authorization))?,
         ))
     }
 
     /// Run engine work off the async workers: writes wait on disk syncs.
-    async fn blocking<T: Send + 'static>(
+    pub(crate) async fn blocking<T: Send + 'static>(
         &self,
         work: impl FnOnce(&DurableEngine) -> Result<T, ApiError> + Send + 'static,
     ) -> Result<T, ApiError> {
@@ -638,7 +641,7 @@ impl Api {
     }
 }
 
-fn metadata_auth<T>(request: &tonic::Request<T>) -> Option<String> {
+pub(crate) fn metadata_auth<T>(request: &tonic::Request<T>) -> Option<String> {
     request
         .metadata()
         .get("authorization")
@@ -962,8 +965,12 @@ pub async fn serve(
     tls: Option<Arc<rustls::ServerConfig>>,
     shutdown: impl std::future::Future<Output = ()> + Send,
 ) -> Result<(), tonic::transport::Error> {
-    let routes =
-        tonic::service::Routes::from(http_router(api.clone())).add_service(EzuServer::new(api));
+    // Flight batches are larger than API messages.
+    let flight = arrow_flight::flight_service_server::FlightServiceServer::new(api.clone())
+        .max_decoding_message_size(64 << 20);
+    let routes = tonic::service::Routes::from(http_router(api.clone()))
+        .add_service(EzuServer::new(api))
+        .add_service(flight);
     let server = tonic::transport::Server::builder()
         .accept_http1(true)
         .add_routes(routes);
