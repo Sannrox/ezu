@@ -12,8 +12,10 @@
 
 use crate::entity::{Entity, Namespace};
 use crate::index::{Engine, IndexError, Quotas, Upsert};
-use crate::snapshot::{self, SnapshotError};
-use crate::wal::{Op, Wal, WalError};
+use crate::keys::sekai_keys::{Dek, KeyId};
+use crate::keys::{self, KeyConfig, Keyring};
+use crate::snapshot::{self, DataFile, Found, Part, SealInfo, SnapshotError};
+use crate::wal::{Entry, Op, Wal, WalError};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::path::PathBuf;
@@ -30,6 +32,9 @@ pub struct DurabilityConfig {
     pub segment_bytes: u64,
     pub snapshot_every_records: u64,
     pub snapshot_every_ms: i64,
+    /// Namespaces encrypted with keys from an external provider; `None`
+    /// keeps every namespace in plaintext.
+    pub keys: Option<KeyConfig>,
 }
 
 /// Where entities come from again when no usable snapshot exists.
@@ -49,6 +54,11 @@ pub enum DurableError {
     NeedsRebuild(String),
     /// A write would not fit in one WAL record.
     TooLarge,
+    /// The namespace's key is revoked or missing; it refuses reads and
+    /// writes until the key returns. Other namespaces are unaffected.
+    Sealed(String),
+    /// The key store could not be read or written.
+    Keys(String),
     /// A write could not be made durable after it reached the index; the
     /// engine refuses further writes until it is reopened.
     Failed,
@@ -62,6 +72,8 @@ impl std::fmt::Display for DurableError {
             Self::Snapshot(error) => write!(f, "{error}"),
             Self::Locked => f.write_str("the data directory is held by another process"),
             Self::TooLarge => f.write_str("the write is larger than one log record"),
+            Self::Sealed(why) => write!(f, "namespace unavailable: {why}"),
+            Self::Keys(why) => write!(f, "key store: {why}"),
             Self::NeedsRebuild(why) => write!(f, "recovery needs a rebuild source: {why}"),
             Self::Failed => {
                 f.write_str("durability was lost after a failed write; reopen to recover")
@@ -89,6 +101,9 @@ impl From<SnapshotError> for DurableError {
 }
 
 struct Writer {
+    /// Sealed namespaces' data, as stored, carried into every snapshot
+    /// until their keys return.
+    carried: HashMap<String, Part>,
     wal: Wal,
     since_snapshot: u64,
     snapshot_at_ms: i64,
@@ -98,6 +113,7 @@ pub struct DurableEngine {
     engine: Engine,
     writer: Mutex<Writer>,
     config: DurabilityConfig,
+    keyring: Keyring,
     failed: AtomicBool,
     _lock: File,
 }
@@ -121,21 +137,41 @@ impl DurableEngine {
             .map_err(WalError::Io)?;
         lock.try_lock().map_err(|_| DurableError::Locked)?;
 
+        create_dir_durably(&config.dir.join("keys")).map_err(WalError::Io)?;
+        let keyring = Keyring::open(&config.dir.join("keys"), config.keys.clone())
+            .map_err(DurableError::Keys)?;
+        // Every granted namespace has its key before anything is restored or
+        // written: sealing a logged change then never has to mint (and
+        // possibly fail) after the index changed. One that cannot get a key
+        // opens sealed, alone, and its stored data is carried.
+        for namespace in keyring.granted() {
+            if keyring.check(&namespace).is_ok()
+                && let Err(sealed) = keyring.current(&namespace)
+            {
+                keyring
+                    .seal_namespace(&namespace, &sealed.0)
+                    .map_err(DurableError::Keys)?;
+            }
+        }
         let engine = Engine::new(quotas);
-        let newest = snapshot::list(&snapshot_dir)?.into_iter().next();
+        let newest = snapshot::newest(&snapshot_dir)?;
         let highest_snapshot = newest.as_ref().map_or(0, |(lsn, _)| *lsn);
         // When the newest snapshot was taken, so the time trigger carries on
         // across restarts instead of starting over.
         let snapshot_at_ms = newest
             .as_ref()
-            .and_then(|(_, path)| fs::metadata(path).ok()?.modified().ok())
+            .and_then(|(_, Found::V1(path) | Found::V2(path))| {
+                fs::metadata(path).ok()?.modified().ok()
+            })
             .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
             .map_or(0, |since| {
                 i64::try_from(since.as_millis()).unwrap_or(i64::MAX)
             });
-        let (base_lsn, rebuilt) = match newest.map(|(_, path)| snapshot::read(&path)) {
-            Some(Ok((lsn, entities))) => {
-                restore_all(&engine, entities)?;
+        let mut loaded = None;
+        let (base_lsn, rebuilt) = match newest.map(|(_, found)| load_snapshot(&keyring, found)) {
+            Some(Ok(snapshot)) => {
+                let lsn = snapshot.lsn;
+                loaded = Some(snapshot);
                 (lsn, false)
             }
             damaged_or_missing => {
@@ -143,7 +179,8 @@ impl DurableEngine {
                     Some(Err(error)) => Some(error.to_string()),
                     _ => None,
                 };
-                (0, Self::rebuild_if_needed(&engine, &wal_dir, rebuild, why)?)
+                let rebuilt = Self::rebuild_if_needed(&engine, &keyring, &wal_dir, rebuild, why)?;
+                (0, rebuilt)
             }
         };
         // A rebuilt state is published above every existing snapshot, so a
@@ -164,30 +201,66 @@ impl DurableEngine {
         // order with the same newer-wins rule as live writes. The first one
         // must follow the snapshot directly, or writes in between are lost.
         if !rebuilt
-            && let Some((first, _)) = records.iter().find(|(lsn, _)| *lsn > base_lsn)
-            && *first != base_lsn + 1
+            && let Some(first) = records.iter().find(|record| record.lsn > base_lsn)
+            && first.lsn != base_lsn + 1
         {
             return Err(DurableError::Wal(WalError::Corrupt(format!(
-                "log resumes at {first}, after snapshot {base_lsn}"
+                "log resumes at {}, after snapshot {base_lsn}",
+                first.lsn
             ))));
         }
-        let mut replayed = 0;
-        for (lsn, op) in records {
-            if lsn > base_lsn {
-                apply(&engine, op)?;
-                replayed += 1;
+        // Every namespace the log shows to be unreadable is sealed before
+        // anything of it is restored.
+        for record in records.iter().filter(|record| record.lsn > base_lsn) {
+            if let Entry::Sealed {
+                namespace, dek_id, ..
+            } = &record.entry
+            {
+                seal_if_unreadable(&keyring, namespace.as_str(), dek_id)?;
             }
+        }
+        let mut carried = HashMap::new();
+        if let Some(mut loaded) = loaded {
+            loaded.carry_sealed(&keyring)?;
+            restore_all(&engine, loaded.entities)?;
+            for (lsn, entry) in loaded.tail {
+                apply_entry(&engine, &keyring, lsn, entry)?;
+            }
+            carried = loaded.carried;
+        }
+        let mut replayed = 0;
+        for record in records {
+            if record.lsn <= base_lsn {
+                continue;
+            }
+            let namespace = record.entry.namespace().as_str();
+            // A sealed namespace's records are carried as written.
+            if keyring.check(namespace).is_err() {
+                carried
+                    .entry(namespace.to_string())
+                    .or_insert_with(|| Part {
+                        namespace: namespace.to_string(),
+                        ..Part::default()
+                    })
+                    .tail
+                    .push(record.payload);
+                continue;
+            }
+            apply_entry(&engine, &keyring, record.lsn, record.entry)?;
+            replayed += 1;
         }
 
         let durable = Self {
             engine,
             // Replayed records still count toward the next snapshot.
             writer: Mutex::new(Writer {
+                carried,
                 wal,
                 since_snapshot: replayed,
                 snapshot_at_ms,
             }),
             config,
+            keyring,
             failed: AtomicBool::new(false),
             _lock: lock,
         };
@@ -205,6 +278,7 @@ impl DurableEngine {
     /// at the first record. Otherwise the rebuild source re-syncs.
     fn rebuild_if_needed(
         engine: &Engine,
+        keyring: &Keyring,
         wal_dir: &std::path::Path,
         rebuild: Option<&dyn RebuildSource>,
         damaged: Option<String>,
@@ -229,6 +303,14 @@ impl DurableEngine {
                 damaged.unwrap_or_else(|| "the snapshot is missing".into()),
             ));
         };
+        // The rebuilt snapshot replaces everything; a sealed namespace's
+        // data could not be stored in it and would be lost.
+        let sealed = keyring.sealed();
+        if !sealed.is_empty() {
+            return Err(DurableError::NeedsRebuild(format!(
+                "namespaces {sealed:?} are sealed; restore their keys before a rebuild"
+            )));
+        }
         restore_all(
             engine,
             source.entities().map_err(DurableError::NeedsRebuild)?,
@@ -244,13 +326,22 @@ impl DurableEngine {
         collection: &str,
         id: &str,
         now_ms: i64,
-    ) -> Result<Option<Entity>, IndexError> {
-        self.engine.get(ns, collection, id, now_ms)
+    ) -> Result<Option<Entity>, DurableError> {
+        self.open_namespace(ns)?;
+        Ok(self.engine.get(ns, collection, id, now_ms)?)
     }
 
     /// Entities counted against `ns`'s quota.
-    pub fn entity_count(&self, ns: &Namespace) -> Result<usize, IndexError> {
-        self.engine.entity_count(ns)
+    pub fn entity_count(&self, ns: &Namespace) -> Result<usize, DurableError> {
+        self.open_namespace(ns)?;
+        Ok(self.engine.entity_count(ns)?)
+    }
+
+    /// Refuse a sealed namespace.
+    fn open_namespace(&self, ns: &Namespace) -> Result<(), DurableError> {
+        self.keyring
+            .check(ns.as_str())
+            .map_err(|sealed| DurableError::Sealed(sealed.0))
     }
 
     pub fn query(
@@ -258,8 +349,9 @@ impl DurableEngine {
         ns: &Namespace,
         request: &crate::query::QueryRequest,
         now_ms: i64,
-    ) -> Result<crate::query::QueryPage, IndexError> {
-        self.engine.query(ns, request, now_ms)
+    ) -> Result<crate::query::QueryPage, DurableError> {
+        self.open_namespace(ns)?;
+        Ok(self.engine.query(ns, request, now_ms)?)
     }
 
     pub fn upsert(
@@ -291,7 +383,7 @@ impl DurableEngine {
         {
             return Err(DurableError::TooLarge);
         }
-        self.write(now_ms, |engine, ops| {
+        self.write(Some(ns), now_ms, |engine, ops| {
             entities
                 .into_iter()
                 .map(|entity| {
@@ -313,7 +405,7 @@ impl DurableEngine {
         id: &str,
         now_ms: i64,
     ) -> Result<bool, DurableError> {
-        self.write(now_ms, |engine, ops| {
+        self.write(Some(ns), now_ms, |engine, ops| {
             let removed = engine.delete(ns, collection, id);
             if matches!(removed, Ok(true)) {
                 ops.push(Op::Delete {
@@ -330,8 +422,11 @@ impl DurableEngine {
     /// Run `change` under the writer lock, then log and sync what it
     /// applied. A logging failure poisons the engine: the index is ahead of
     /// the log, so further writes are refused until a reopen recovers.
+    /// `ns`, the namespace written, must be open and have its key before
+    /// anything changes; sealing state only changes under this lock.
     fn write<T>(
         &self,
+        ns: Option<&Namespace>,
         now_ms: i64,
         change: impl FnOnce(&Engine, &mut Vec<Op>) -> T,
     ) -> Result<T, DurableError> {
@@ -341,10 +436,23 @@ impl DurableEngine {
         if self.failed.load(Ordering::Acquire) {
             return Err(DurableError::Failed);
         }
+        if let Some(ns) = ns {
+            self.keyring
+                .current(ns.as_str())
+                .map_err(|sealed| DurableError::Sealed(sealed.0))?;
+        }
         let mut ops = Vec::new();
         let result = change(&self.engine, &mut ops);
         if !ops.is_empty() {
-            if let Err(error) = writer.wal.append(&ops) {
+            let mut seal = |lsn: u64, op: &Op, plain: &[u8]| {
+                let ns = op_namespace(op);
+                let Some((id, dek)) = self.keyring.current(ns.as_str()).map_err(|s| s.0)? else {
+                    return Ok(None);
+                };
+                let aad = crate::wal::sealed_aad(lsn, ns.as_str(), id.as_str());
+                keys::seal(&dek, &aad, plain).map(|body| Some((id.as_str().to_string(), body)))
+            };
+            if let Err(error) = writer.wal.append(&ops, &mut seal) {
                 self.failed.store(true, Ordering::Release);
                 return Err(error.into());
             }
@@ -363,7 +471,7 @@ impl DurableEngine {
     /// logged as a delete, so replay keeps it in order with later writes (a
     /// later, older observation of the same key is then admitted again).
     pub fn sweep_expired(&self, now_ms: i64) -> Result<usize, DurableError> {
-        self.write(now_ms, |engine, ops| {
+        self.write(None, now_ms, |engine, ops| {
             let removed = engine.take_expired(now_ms)?;
             let count = removed.len();
             ops.extend(
@@ -392,11 +500,43 @@ impl DurableEngine {
 
     fn snapshot_locked(&self, writer: &mut Writer, now_ms: i64) -> Result<u64, DurableError> {
         let lsn = writer.wal.last_lsn();
-        snapshot::write(
-            &self.config.dir.join("snapshots"),
-            lsn,
-            &self.engine.export()?,
-        )?;
+        let mut by_namespace: HashMap<Namespace, Vec<(Namespace, Entity)>> = HashMap::new();
+        for (ns, entity) in self.engine.export()? {
+            by_namespace
+                .entry(ns.clone())
+                .or_default()
+                .push((ns, entity));
+        }
+        let mut parts: Vec<Part> = writer.carried.values().cloned().collect();
+        for (ns, entities) in by_namespace {
+            let bytes = snapshot::encode_arrow(lsn, &entities)?;
+            let file = match self
+                .keyring
+                .current(ns.as_str())
+                .map_err(|sealed| DurableError::Sealed(sealed.0))?
+            {
+                Some((id, dek)) => {
+                    let aad = snapshot::sealed_aad(lsn, ns.as_str(), id.as_str());
+                    DataFile {
+                        bytes: keys::seal(&dek, &aad, &bytes).map_err(DurableError::Keys)?,
+                        sealed: Some(SealInfo {
+                            dek_id: id.as_str().to_string(),
+                            sealed_lsn: lsn,
+                        }),
+                    }
+                }
+                None => DataFile {
+                    sealed: None,
+                    bytes,
+                },
+            };
+            parts.push(Part {
+                namespace: ns.as_str().to_string(),
+                file: Some(file),
+                tail: Vec::new(),
+            });
+        }
+        let published = snapshot::write_set(&self.config.dir.join("snapshots"), lsn, &parts)?;
         // Only after the snapshot is durable may the log it covers go. A
         // failure here leaves the segment layout unknown, so writes stop.
         if let Err(error) = writer
@@ -407,15 +547,291 @@ impl DurableEngine {
             self.failed.store(true, Ordering::Release);
             return Err(error.into());
         }
+        // Everything is now sealed under the current keys (an emptied
+        // namespace holds nothing at all), so older keys are no longer
+        // needed. A set kept from before (no write since) may still use them.
+        if published {
+            for (namespace, id) in self.keyring.current_ids() {
+                self.keyring
+                    .retire_older(&namespace, &id)
+                    .map_err(DurableError::Keys)?;
+            }
+        }
         writer.since_snapshot = 0;
         writer.snapshot_at_ms = now_ms;
         Ok(lsn)
+    }
+
+    /// Check every open namespace's keys with the provider again. A
+    /// namespace whose key was revoked or whose grant expired is sealed: its
+    /// entities leave memory, sealed one last time under the key it had,
+    /// and are carried unread until a restart finds the key again. Returns
+    /// the namespaces sealed now.
+    pub fn refresh_keys(&self) -> Result<Vec<String>, DurableError> {
+        let mut writer = self.writer.lock().map_err(|_| DurableError::Failed)?;
+        if self.failed.load(Ordering::Acquire) {
+            return Err(DurableError::Failed);
+        }
+        let lsn = writer.wal.last_lsn();
+        let mut sealed = Vec::new();
+        for (namespace, last) in self.keyring.refresh() {
+            // The namespace is sealed already; its data must reach the
+            // carried parts, or the next snapshot would drop it with the log.
+            // On failure writes and snapshots stop until a reopen recovers it
+            // from disk.
+            match self.carry(&namespace, last, lsn) {
+                Ok(Some(part)) => {
+                    writer.carried.insert(namespace.clone(), part);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.failed.store(true, Ordering::Release);
+                    return Err(error);
+                }
+            }
+            sealed.push(namespace);
+        }
+        Ok(sealed)
+    }
+
+    /// Take `namespace` out of the index, sealed under `last`, its final
+    /// key, as a part to carry. `None` when it held nothing.
+    fn carry(
+        &self,
+        namespace: &str,
+        last: Option<(KeyId, Dek)>,
+        lsn: u64,
+    ) -> Result<Option<Part>, DurableError> {
+        let ns = Namespace::stored(namespace.to_string());
+        let entities: Vec<(Namespace, Entity)> = self
+            .engine
+            .drop_namespace(&ns)?
+            .into_iter()
+            .map(|entity| (ns.clone(), entity))
+            .collect();
+        if entities.is_empty() {
+            return Ok(None);
+        }
+        let Some((id, dek)) = last else {
+            return Err(DurableError::Keys(format!(
+                "{namespace}: no key to carry it under"
+            )));
+        };
+        let aad = snapshot::sealed_aad(lsn, namespace, id.as_str());
+        let bytes = snapshot::encode_arrow(lsn, &entities)?;
+        Ok(Some(Part {
+            namespace: namespace.to_string(),
+            file: Some(DataFile {
+                bytes: keys::seal(&dek, &aad, &bytes).map_err(DurableError::Keys)?,
+                sealed: Some(SealInfo {
+                    dek_id: id.as_str().to_string(),
+                    sealed_lsn: lsn,
+                }),
+            }),
+            tail: Vec::new(),
+        }))
+    }
+
+    /// Start a new current key for `ns`. New writes use it at once; the
+    /// next snapshot re-seals older data under it and retires the old key.
+    pub fn rotate_key(&self, ns: &Namespace) -> Result<(), DurableError> {
+        let _writer = self.writer.lock().map_err(|_| DurableError::Failed)?;
+        self.keyring
+            .rotate(ns.as_str())
+            .map(|_| ())
+            .map_err(|sealed| DurableError::Sealed(sealed.0))
     }
 
     /// Bytes the WAL holds now.
     pub fn wal_bytes(&self) -> Result<u64, DurableError> {
         let writer = self.writer.lock().map_err(|_| DurableError::Failed)?;
         Ok(writer.wal.size()?)
+    }
+}
+
+/// A loaded snapshot: entities to restore, records carried in its parts to
+/// apply after them, the parts of sealed namespaces as stored, and every
+/// part as stored, to carry a namespace the log turns out to seal.
+struct Loaded {
+    lsn: u64,
+    entities: Vec<(Namespace, Entity)>,
+    tail: Vec<(u64, Entry)>,
+    carried: HashMap<String, Part>,
+    stored: HashMap<String, Part>,
+}
+
+impl Loaded {
+    /// Move every namespace sealed since loading to the carried parts.
+    fn carry_sealed(&mut self, keyring: &Keyring) -> Result<(), DurableError> {
+        let mut sealed: HashMap<String, Vec<(Namespace, Entity)>> = HashMap::new();
+        let entities = std::mem::take(&mut self.entities);
+        for (ns, entity) in entities {
+            if keyring.check(ns.as_str()).is_ok() {
+                self.entities.push((ns, entity));
+            } else {
+                sealed
+                    .entry(ns.as_str().to_string())
+                    .or_default()
+                    .push((ns, entity));
+            }
+        }
+        self.tail
+            .retain(|(_, entry)| keyring.check(entry.namespace().as_str()).is_ok());
+        for (namespace, part) in std::mem::take(&mut self.stored) {
+            if keyring.check(&namespace).is_err() {
+                self.carried.entry(namespace).or_insert(part);
+            }
+        }
+        // Without a stored part (a version 1 snapshot) the data was
+        // plaintext on disk already, and is carried as such.
+        for (namespace, entities) in sealed {
+            if !self.carried.contains_key(&namespace) {
+                let bytes = snapshot::encode_arrow(self.lsn, &entities)?;
+                self.carried.insert(
+                    namespace.clone(),
+                    Part {
+                        namespace,
+                        file: Some(DataFile {
+                            sealed: None,
+                            bytes,
+                        }),
+                        tail: Vec::new(),
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Seal `namespace` when sealed data of it names a key the keyring cannot
+/// give, so one lost key isolates its namespace instead of failing the open.
+fn seal_if_unreadable(
+    keyring: &Keyring,
+    namespace: &str,
+    dek_id: &str,
+) -> Result<(), DurableError> {
+    if keyring.check(namespace).is_ok() && keyring.key(namespace, dek_id).is_err() {
+        keyring
+            .seal_namespace(namespace, &format!("its key {dek_id} is unavailable"))
+            .map_err(DurableError::Keys)?;
+    }
+    Ok(())
+}
+
+/// Read the snapshot `found`, opening each namespace's data with its key.
+/// Any unreadable part makes the whole snapshot damaged.
+fn load_snapshot(keyring: &Keyring, found: Found) -> Result<Loaded, DurableError> {
+    let damaged = |why: String| DurableError::Snapshot(SnapshotError(why));
+    let (lsn, parts) = match found {
+        Found::V1(path) => {
+            let (lsn, entities) = snapshot::read_v1(&path)?;
+            let mut loaded = Loaded {
+                lsn,
+                entities,
+                tail: Vec::new(),
+                carried: HashMap::new(),
+                stored: HashMap::new(),
+            };
+            loaded.carry_sealed(keyring)?;
+            return Ok(loaded);
+        }
+        Found::V2(dir) => snapshot::read_set(&dir)?,
+    };
+    let mut loaded = Loaded {
+        lsn,
+        entities: Vec::new(),
+        tail: Vec::new(),
+        carried: HashMap::new(),
+        stored: HashMap::new(),
+    };
+    for part in parts {
+        let mut tail = Vec::new();
+        for payload in &part.tail {
+            let (lsn, entry) =
+                crate::wal::decode_payload(payload).map_err(|error| damaged(error.to_string()))?;
+            if entry.namespace().as_str() != part.namespace {
+                return Err(damaged(format!("{}: foreign record", part.namespace)));
+            }
+            if let Entry::Sealed { dek_id, .. } = &entry {
+                seal_if_unreadable(keyring, &part.namespace, dek_id)?;
+            }
+            tail.push((lsn, entry));
+        }
+        if let Some(info) = part.file.as_ref().and_then(|file| file.sealed.as_ref()) {
+            seal_if_unreadable(keyring, &part.namespace, &info.dek_id)?;
+        }
+        if keyring.check(&part.namespace).is_err() {
+            loaded.carried.insert(part.namespace.clone(), part);
+            continue;
+        }
+        if let Some(file) = &part.file {
+            let entities = match &file.sealed {
+                None => snapshot::plain_entities(file)?,
+                Some(info) => {
+                    let dek = keyring
+                        .key(&part.namespace, &info.dek_id)
+                        .map_err(|sealed| damaged(sealed.0))?;
+                    let aad = snapshot::sealed_aad(info.sealed_lsn, &part.namespace, &info.dek_id);
+                    snapshot::current_entities(
+                        keys::open(&dek, &aad, &file.bytes).map_err(damaged)?,
+                    )?
+                }
+            };
+            // A part holds only its own namespace.
+            if entities.iter().any(|(ns, _)| ns.as_str() != part.namespace) {
+                return Err(damaged(format!("{}: foreign entities", part.namespace)));
+            }
+            loaded.entities.extend(entities);
+        }
+        loaded.tail.extend(tail);
+        loaded.stored.insert(part.namespace.clone(), part);
+    }
+    Ok(loaded)
+}
+
+/// Apply one logged entry, opening a sealed one with its namespace's key.
+fn apply_entry(
+    engine: &Engine,
+    keyring: &Keyring,
+    lsn: u64,
+    entry: Entry,
+) -> Result<(), DurableError> {
+    let op = match entry {
+        Entry::Op(op) => op,
+        Entry::Sealed {
+            namespace,
+            dek_id,
+            body,
+        } => {
+            let corrupt = |why: String| {
+                DurableError::Wal(WalError::Corrupt(format!(
+                    "record {lsn} of {}: {why}",
+                    namespace.as_str()
+                )))
+            };
+            let dek = keyring
+                .key(namespace.as_str(), &dek_id)
+                .map_err(|sealed| corrupt(sealed.0))?;
+            let aad = crate::wal::sealed_aad(lsn, namespace.as_str(), &dek_id);
+            let plain = keys::open(&dek, &aad, &body).map_err(corrupt)?;
+            match crate::wal::decode_payload(&plain).map_err(|error| corrupt(error.to_string()))? {
+                (inner, Entry::Op(op))
+                    if inner == lsn && op_namespace(&op).as_str() == namespace.as_str() =>
+                {
+                    op
+                }
+                _ => return Err(corrupt("sealed record does not match its frame".into())),
+            }
+        }
+    };
+    apply(engine, op)
+}
+
+fn op_namespace(op: &Op) -> &Namespace {
+    match op {
+        Op::Upsert(ns, _) => ns,
+        Op::Delete { namespace, .. } => namespace,
     }
 }
 

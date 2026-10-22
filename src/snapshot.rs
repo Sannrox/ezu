@@ -1,7 +1,12 @@
-//! Snapshots of every namespace as one Arrow IPC file per LSN, geometry as
-//! WKB. A snapshot is written to a temporary file, synced, renamed into
-//! place and the directory synced, so a crash leaves either the old snapshot
-//! or the new one. The format version and LSN live in the schema metadata.
+//! Snapshots, as Arrow IPC with geometry as WKB.
+//!
+//! Version 2 (written now) is a set per LSN: the directory
+//! `snapshots/<lsn>/` holds one data file per namespace, plaintext or sealed
+//! under that namespace's key, an optional tail of raw log payloads carried
+//! for a sealed namespace, and a `MANIFEST.json` naming each file with its
+//! CRC32. The set is written under `<lsn>.tmp/`, synced, and published by
+//! renaming the directory, so a crash leaves the old set or the new one.
+//! Version 1 (one file per LSN with a CRC32 sidecar) is still read.
 
 use crate::codec::{decode_fields, encode_fields, geometry_from_wkb, geometry_to_wkb};
 use crate::entity::{Entity, Namespace};
@@ -18,7 +23,8 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-const VERSION: &str = "1";
+/// Format stamped into the Arrow metadata of data files written now.
+const VERSION: &str = "2";
 const BATCH_ROWS: usize = 65_536;
 
 #[derive(Debug)]
@@ -52,10 +58,6 @@ fn schema(lsn: u64) -> Schema {
     ]))
 }
 
-fn path(dir: &Path, lsn: u64) -> PathBuf {
-    dir.join(format!("{lsn:020}.arrow"))
-}
-
 fn sum_path(dir: &Path, lsn: u64) -> PathBuf {
     dir.join(format!("{lsn:020}.crc32"))
 }
@@ -78,20 +80,10 @@ pub fn list(dir: &Path) -> Result<Vec<(u64, PathBuf)>, SnapshotError> {
     Ok(found)
 }
 
-/// Write every entity as the snapshot at `lsn`, then remove older ones.
-pub fn write(dir: &Path, lsn: u64, entities: &[(Namespace, Entity)]) -> Result<(), SnapshotError> {
-    fs::create_dir_all(dir).map_err(err)?;
-    // Every change takes an LSN, so a snapshot already published at this
-    // LSN holds the same state; it is kept rather than replaced in place.
-    // The directory is synced again first: a previous attempt may have
-    // renamed both files and then failed before its sync.
-    if path(dir, lsn).exists() && sum_path(dir, lsn).exists() {
-        return sync_dir(dir).map_err(err);
-    }
+/// Entities as Arrow IPC file bytes, stamped with the format and `lsn`.
+pub fn encode_arrow(lsn: u64, entities: &[(Namespace, Entity)]) -> Result<Vec<u8>, SnapshotError> {
     let schema = Arc::new(schema(lsn));
-    let temp = dir.join(format!("{lsn:020}.arrow.tmp"));
-    let file = File::create(&temp).map_err(err)?;
-    let mut writer = FileWriter::try_new(file, &schema).map_err(err)?;
+    let mut writer = FileWriter::try_new(Vec::new(), &schema).map_err(err)?;
     for chunk in entities.chunks(BATCH_ROWS) {
         let mut namespace = StringBuilder::new();
         let mut collection = StringBuilder::new();
@@ -127,38 +119,11 @@ pub fn write(dir: &Path, lsn: u64, entities: &[(Namespace, Entity)]) -> Result<(
         let batch = RecordBatch::try_new(schema.clone(), columns).map_err(err)?;
         writer.write(&batch).map_err(err)?;
     }
-    let file = writer.into_inner().map_err(err)?;
-    file.sync_all().map_err(err)?;
-    // Arrow carries no checksum of its buffers: a sidecar CRC, durable
-    // before the snapshot goes live, lets recovery tell damage from data.
-    let sum = crc32fast::hash(&fs::read(&temp).map_err(err)?);
-    let sum_temp = dir.join(format!("{lsn:020}.crc32.tmp"));
-    fs::write(&sum_temp, sum.to_string()).map_err(err)?;
-    File::open(&sum_temp)
-        .map_err(err)?
-        .sync_all()
-        .map_err(err)?;
-    fs::rename(&sum_temp, sum_path(dir, lsn)).map_err(err)?;
-    fs::rename(&temp, path(dir, lsn)).map_err(err)?;
-    sync_dir(dir).map_err(err)?;
-    for (older, stale) in list(dir)? {
-        if older < lsn {
-            fs::remove_file(stale).map_err(err)?;
-            let _ = fs::remove_file(sum_path(dir, older));
-        }
-    }
-    // Left-over temporary files are writes that never finished.
-    for entry in fs::read_dir(dir).map_err(err)? {
-        let stale = entry.map_err(err)?.path();
-        if stale.extension().is_some_and(|ext| ext == "tmp") {
-            fs::remove_file(stale).map_err(err)?;
-        }
-    }
-    sync_dir(dir).map_err(err)
+    writer.into_inner().map_err(err)
 }
 
-/// Read the snapshot at `path`: its LSN and every entity.
-pub fn read(path: &Path) -> Result<(u64, Vec<(Namespace, Entity)>), SnapshotError> {
+/// Read a version 1 snapshot file: its LSN and every entity.
+pub fn read_v1(path: &Path) -> Result<(u64, Vec<(Namespace, Entity)>), SnapshotError> {
     let bytes = fs::read(path).map_err(err)?;
     let expected: Option<u32> = fs::read_to_string(path.with_extension("crc32"))
         .ok()
@@ -166,9 +131,17 @@ pub fn read(path: &Path) -> Result<(u64, Vec<(Namespace, Entity)>), SnapshotErro
     if expected != Some(crc32fast::hash(&bytes)) {
         return Err(SnapshotError("checksum missing or mismatched".into()));
     }
+    decode_arrow(bytes, "1")
+}
+
+/// Entities from Arrow IPC bytes of format `version`, with their LSN.
+pub fn decode_arrow(
+    bytes: Vec<u8>,
+    version: &str,
+) -> Result<(u64, Vec<(Namespace, Entity)>), SnapshotError> {
     let reader = FileReader::try_new(std::io::Cursor::new(bytes), None).map_err(err)?;
     let metadata = reader.schema().metadata().clone();
-    if metadata.get("ezu.snapshot.version").map(String::as_str) != Some(VERSION) {
+    if metadata.get("ezu.snapshot.version").map(String::as_str) != Some(version) {
         return Err(SnapshotError("unknown snapshot format version".into()));
     }
     let lsn: u64 = metadata
@@ -235,4 +208,244 @@ pub fn read(path: &Path) -> Result<(u64, Vec<(Namespace, Entity)>), SnapshotErro
         }
     }
     Ok((lsn, entities))
+}
+
+/// How a sealed data file was sealed: under which key, and at which LSN (the
+/// LSN is bound into the seal, so a carried file keeps its own).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SealInfo {
+    pub dek_id: String,
+    pub sealed_lsn: u64,
+}
+
+/// A namespace's data file: Arrow IPC bytes, or those bytes sealed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DataFile {
+    pub sealed: Option<SealInfo>,
+    pub bytes: Vec<u8>,
+}
+
+/// One namespace's part of a snapshot set: its data file, and for a sealed
+/// namespace the raw log payloads written after that file, carried unread.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Part {
+    pub namespace: String,
+    pub file: Option<DataFile>,
+    pub tail: Vec<Vec<u8>>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Manifest {
+    version: u32,
+    lsn: u64,
+    parts: Vec<ManifestPart>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ManifestPart {
+    namespace: String,
+    file: Option<ManifestFile>,
+    tail: Option<ManifestFile>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ManifestFile {
+    name: String,
+    crc32: u32,
+    sealed: Option<SealInfo>,
+}
+
+/// Authenticated data binding a sealed data file to its LSN, namespace and
+/// key.
+pub fn sealed_aad(lsn: u64, namespace: &str, dek_id: &str) -> Vec<u8> {
+    let mut out = crate::codec::Writer::default();
+    out.str("ezu.snapshot");
+    out.u64(lsn);
+    out.str(namespace);
+    out.str(dek_id);
+    out.0
+}
+
+/// The newest snapshot of either format.
+pub enum Found {
+    V1(PathBuf),
+    V2(PathBuf),
+}
+
+fn set_lsn(path: &Path) -> Option<u64> {
+    path.is_dir()
+        .then(|| path.file_name()?.to_str()?.parse::<u64>().ok())
+        .flatten()
+}
+
+/// The newest published snapshot, set or single file.
+pub fn newest(dir: &Path) -> Result<Option<(u64, Found)>, SnapshotError> {
+    let mut best: Option<(u64, Found)> = list(dir)?
+        .into_iter()
+        .next()
+        .map(|(lsn, path)| (lsn, Found::V1(path)));
+    for entry in fs::read_dir(dir).map_err(err)? {
+        let path = entry.map_err(err)?.path();
+        if let Some(lsn) = set_lsn(&path)
+            && best.as_ref().is_none_or(|(best, _)| lsn > *best)
+        {
+            best = Some((lsn, Found::V2(path)));
+        }
+    }
+    Ok(best)
+}
+
+fn write_synced(path: &Path, bytes: &[u8]) -> Result<u32, SnapshotError> {
+    fs::write(path, bytes).map_err(err)?;
+    File::open(path).map_err(err)?.sync_all().map_err(err)?;
+    Ok(crc32fast::hash(bytes))
+}
+
+/// Publish the set at `lsn`, then remove older snapshots of both formats.
+/// False when a set at `lsn` already existed and was kept as it is.
+pub fn write_set(dir: &Path, lsn: u64, parts: &[Part]) -> Result<bool, SnapshotError> {
+    fs::create_dir_all(dir).map_err(err)?;
+    let target = dir.join(format!("{lsn:020}"));
+    // Every change takes an LSN, so a set already published at this LSN
+    // holds the same state. The directory is synced again first: an earlier
+    // attempt may have renamed it and failed before its sync.
+    if target.is_dir() {
+        return sync_dir(dir).map(|()| false).map_err(err);
+    }
+    let temp = dir.join(format!("{lsn:020}.tmp"));
+    if temp.exists() {
+        fs::remove_dir_all(&temp).map_err(err)?;
+    }
+    fs::create_dir(&temp).map_err(err)?;
+    let mut manifest = Manifest {
+        version: 2,
+        lsn,
+        parts: Vec::new(),
+    };
+    // Files are numbered; the manifest names each part's namespace, so any
+    // namespace fits.
+    for (index, part) in parts.iter().enumerate() {
+        let base = format!("{index:06}");
+        let file = match &part.file {
+            Some(file) => {
+                let name = format!("{base}.data");
+                Some(ManifestFile {
+                    crc32: write_synced(&temp.join(&name), &file.bytes)?,
+                    name,
+                    sealed: file.sealed.clone(),
+                })
+            }
+            None => None,
+        };
+        let tail = if part.tail.is_empty() {
+            None
+        } else {
+            let mut bytes = Vec::new();
+            for payload in &part.tail {
+                bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                bytes.extend_from_slice(payload);
+            }
+            let name = format!("{base}.tail");
+            Some(ManifestFile {
+                crc32: write_synced(&temp.join(&name), &bytes)?,
+                name,
+                sealed: None,
+            })
+        };
+        manifest.parts.push(ManifestPart {
+            namespace: part.namespace.clone(),
+            file,
+            tail,
+        });
+    }
+    let manifest_bytes = serde_json::to_vec(&manifest).map_err(err)?;
+    write_synced(&temp.join("MANIFEST.json"), &manifest_bytes)?;
+    sync_dir(&temp).map_err(err)?;
+    fs::rename(&temp, &target).map_err(err)?;
+    sync_dir(dir).map_err(err)?;
+    // Older snapshots, and anything an unfinished write left behind.
+    for entry in fs::read_dir(dir).map_err(err)? {
+        let stale = entry.map_err(err)?.path();
+        let older_set = set_lsn(&stale).is_some_and(|older| older < lsn);
+        let leftover = stale.extension().is_some_and(|ext| ext == "tmp");
+        if older_set || (leftover && stale.is_dir()) {
+            fs::remove_dir_all(&stale).map_err(err)?;
+        } else if leftover {
+            fs::remove_file(&stale).map_err(err)?;
+        }
+    }
+    for (older, stale) in list(dir)? {
+        if older < lsn {
+            fs::remove_file(stale).map_err(err)?;
+            let _ = fs::remove_file(sum_path(dir, older));
+        }
+    }
+    sync_dir(dir).map(|()| true).map_err(err)
+}
+
+fn read_checked(dir: &Path, file: &ManifestFile) -> Result<Vec<u8>, SnapshotError> {
+    if file.name.contains('/') || file.name.contains("..") {
+        return Err(SnapshotError(
+            "manifest names a file outside the set".into(),
+        ));
+    }
+    let bytes = fs::read(dir.join(&file.name)).map_err(err)?;
+    if crc32fast::hash(&bytes) != file.crc32 {
+        return Err(SnapshotError(format!("{}: checksum mismatched", file.name)));
+    }
+    Ok(bytes)
+}
+
+/// Read a set: its LSN and each namespace's part, checksums verified.
+pub fn read_set(dir: &Path) -> Result<(u64, Vec<Part>), SnapshotError> {
+    let manifest: Manifest =
+        serde_json::from_slice(&fs::read(dir.join("MANIFEST.json")).map_err(err)?).map_err(err)?;
+    if manifest.version != 2 || set_lsn(dir) != Some(manifest.lsn) {
+        return Err(SnapshotError("manifest does not match its set".into()));
+    }
+    let mut parts = Vec::new();
+    for part in manifest.parts {
+        let file = match &part.file {
+            Some(file) => Some(DataFile {
+                sealed: file.sealed.clone(),
+                bytes: read_checked(dir, file)?,
+            }),
+            None => None,
+        };
+        let mut tail = Vec::new();
+        if let Some(tail_file) = &part.tail {
+            let bytes = read_checked(dir, tail_file)?;
+            let mut offset = 0;
+            while offset < bytes.len() {
+                let len = bytes
+                    .get(offset..offset + 4)
+                    .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+                    .ok_or_else(|| SnapshotError("torn tail".into()))?;
+                let payload = bytes
+                    .get(offset + 4..offset + 4 + len)
+                    .ok_or_else(|| SnapshotError("torn tail".into()))?;
+                tail.push(payload.to_vec());
+                offset += 4 + len;
+            }
+        }
+        parts.push(Part {
+            namespace: part.namespace,
+            file,
+            tail,
+        });
+    }
+    Ok((manifest.lsn, parts))
+}
+
+/// Plaintext entities from a data file, which must not be sealed.
+pub fn plain_entities(file: &DataFile) -> Result<Vec<(Namespace, Entity)>, SnapshotError> {
+    if file.sealed.is_some() {
+        return Err(SnapshotError("the data file is sealed".into()));
+    }
+    decode_arrow(file.bytes.clone(), VERSION).map(|(_, entities)| entities)
+}
+
+/// Entities from Arrow bytes written now (after any unsealing).
+pub fn current_entities(bytes: Vec<u8>) -> Result<Vec<(Namespace, Entity)>, SnapshotError> {
+    decode_arrow(bytes, VERSION).map(|(_, entities)| entities)
 }

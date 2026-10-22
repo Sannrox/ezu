@@ -35,3 +35,28 @@ other authorization decision. Authentication is one of:
 `EZU_TLS_CERT` and `EZU_TLS_KEY` serve over TLS; `EZU_TLS_CLIENT_CA` adds
 mutual TLS. The server needs `EZU_DATA_DIR` and listens on `EZU_LISTEN`
 (default `127.0.0.1:7600`); it refuses to start without authentication.
+
+## Encryption at rest
+
+An embedding host passes `DurabilityConfig::keys`: a key provider (the
+`sekai-keys` `KeyProvider` contract) and an unwrap grant per namespace. Each
+granted namespace gets a data key that is minted by Ezu, wrapped by the
+provider and stored only wrapped under `keys/`. Its WAL records and snapshot
+data are sealed with AES-256-GCM, bound to their LSN, namespace and key id.
+Namespace names and key ids stay readable as metadata.
+
+This protects confidentiality: without its key, an encrypted namespace's
+data cannot be read from disk, and sealed content that was altered fails to
+open. It does not protect against someone who can write the data directory
+replacing data with forged plaintext or rolling it back; that needs an
+authenticated chain over the whole store and is not provided.
+
+Snapshots are per-namespace sets (`snapshots/<lsn>/`, format version 2);
+version 1 single-file snapshots still load. `refresh_keys` rechecks every
+key with the provider (the server does so with each expiry sweep). A revoked
+key or withdrawn grant seals that namespace alone: it refuses reads and
+writes, its data leaves memory and is carried, still sealed, through later
+snapshots. It opens again on the next restart that can unwrap its key.
+`rotate_key` starts a new key at once; the next snapshot after a write
+re-seals older data under it and retires the old key. Granting a key to a
+namespace with plaintext data seals that data the same way.

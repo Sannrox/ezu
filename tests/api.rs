@@ -52,6 +52,7 @@ async fn server_with(
             segment_bytes: 1 << 20,
             snapshot_every_records: 10_000,
             snapshot_every_ms: i64::MAX,
+            keys: None,
         },
         Quotas {
             max_entities: 1_000,

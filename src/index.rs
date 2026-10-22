@@ -315,6 +315,33 @@ impl Engine {
         Ok(all)
     }
 
+    /// Remove a namespace with every entity in it, returning them. Its key
+    /// was revoked: nothing of it stays readable in memory.
+    pub(crate) fn drop_namespace(&self, ns: &Namespace) -> Result<Vec<Entity>, IndexError> {
+        let Some(state) = self
+            .namespaces
+            .write()
+            .map_err(|_| IndexError::Poisoned)?
+            .remove(ns)
+        else {
+            return Ok(Vec::new());
+        };
+        let partitions: Vec<Arc<RwLock<Partition>>> = state
+            .collections
+            .read()
+            .map_err(|_| IndexError::Poisoned)?
+            .values()
+            .cloned()
+            .collect();
+        let mut dropped = Vec::new();
+        for partition in partitions {
+            let mut partition = partition.write().map_err(|_| IndexError::Poisoned)?;
+            dropped.extend(std::mem::take(&mut partition.entities).into_values());
+            partition.tree = build_tree(Vec::new());
+        }
+        Ok(dropped)
+    }
+
     /// Remove an entity; true when it existed.
     pub fn delete(&self, ns: &Namespace, collection: &str, id: &str) -> Result<bool, IndexError> {
         let Some(partition) = self.existing_partition(ns, collection)? else {

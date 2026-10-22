@@ -8,6 +8,7 @@ pub mod durable;
 pub mod entity;
 pub mod geometry;
 pub mod index;
+pub mod keys;
 pub mod query;
 mod snapshot;
 mod wal;
