@@ -10,7 +10,7 @@
 //! One process owns a directory at a time: `LOCK` is held for the engine's
 //! life, so a second instance fails to open instead of writing alongside.
 
-use crate::entity::{Entity, Namespace};
+use crate::entity::{Entity, Labels, Namespace, visible};
 use crate::fence::{
     EventId, EventPage, Expired, Fence, FenceEvent, Fences, Recent, Space, decode_state,
     encode_state,
@@ -393,15 +393,21 @@ impl DurableEngine {
 
     /// Reads go to the live index; writes only through this engine, so
     /// every change is logged.
+    /// The entity, if it is live and `readable` may see it (`None`: no
+    /// label filter).
     pub fn get(
         &self,
         ns: &Namespace,
         collection: &str,
         id: &str,
+        readable: Option<&Labels>,
         now_ms: i64,
     ) -> Result<Option<Entity>, DurableError> {
         self.open_namespace(ns)?;
-        Ok(self.engine.get(ns, collection, id, now_ms)?)
+        Ok(self
+            .engine
+            .get(ns, collection, id, now_ms)?
+            .filter(|entity| visible(&entity.labels, readable)))
     }
 
     /// Entities counted against `ns`'s quota.
@@ -808,6 +814,7 @@ impl DurableEngine {
         ns: &Namespace,
         after: Option<EventId>,
         fences: &[String],
+        readable: Option<&Labels>,
         limit: usize,
     ) -> Result<EventPage, DurableError> {
         self.open_namespace(ns)?;
@@ -820,7 +827,7 @@ impl DurableEngine {
         let events = self.events.lock().map_err(|_| DurableError::Failed)?;
         let mut page = match events.get(ns) {
             Some(recent) => recent
-                .after(after, fences, limit)
+                .after(after, fences, readable, limit)
                 .map_err(DurableError::Expired)?,
             None => EventPage {
                 events: Vec::new(),
@@ -888,21 +895,30 @@ impl DurableEngine {
         })
     }
 
-    pub fn get_fence(&self, ns: &Namespace, id: &str) -> Result<Option<Fence>, DurableError> {
+    /// The fence, if `readable` may see it.
+    pub fn get_fence(
+        &self,
+        ns: &Namespace,
+        id: &str,
+        readable: Option<&Labels>,
+    ) -> Result<Option<Fence>, DurableError> {
         self.open_namespace(ns)?;
         let writer = self.writer.lock().map_err(|_| DurableError::Failed)?;
         Ok(writer
             .fences
             .space(ns)
             .and_then(|space| space.get(id))
+            .filter(|fence| visible(&fence.labels, readable))
             .cloned())
     }
 
-    /// Fences of `ns` after the id `after`, in id order, at most `limit`.
+    /// Fences of `ns` after the id `after` that `readable` may see, in id
+    /// order, at most `limit`.
     pub fn list_fences(
         &self,
         ns: &Namespace,
         after: Option<&str>,
+        readable: Option<&Labels>,
         limit: usize,
     ) -> Result<Vec<Fence>, DurableError> {
         self.open_namespace(ns)?;
@@ -914,6 +930,7 @@ impl DurableEngine {
                 space
                     .list()
                     .filter(|fence| after.is_none_or(|after| fence.id.as_str() > after))
+                    .filter(|fence| visible(&fence.labels, readable))
                     .take(limit)
                     .cloned()
                     .collect()

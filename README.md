@@ -120,6 +120,27 @@ disconnects and Ezu restarts without gaps. A resume point older than the
 newest dropped event fails with `OUT_OF_RANGE` (HTTP 410) instead of
 silently skipping events.
 
+## Labels and governed mode
+
+Entities and fences carry up to 16 opaque labels: 1 to 64 bytes each, with
+no control characters, commas or surrounding whitespace. Ezu never interprets them.
+
+A read may carry a label filter, the set of labels the caller may read.
+It then sees only entities, fences and events that carry no other label;
+an event carries the labels of both its entity and its fence. Filtering
+happens inside the index, so pages and limits stay exact. The filter is
+`label_filter` in request bodies, gRPC messages and Flight tickets, and
+the `x-ezu-readable-labels` header (comma-separated) on HTTP reads without
+a body.
+
+With `EZU_GOVERNED=1`, every read (get, query, export, fences, events)
+without a filter is refused. Which labels a caller may read is the
+caller's decision, made in front of Ezu.
+
+Labels are written to the log and snapshots only where present. Data
+without labels stays readable by older binaries; labeled data makes them
+refuse to start rather than drop the labels.
+
 ## Encryption at rest
 
 An embedding host passes `DurabilityConfig::keys`: a key provider (the

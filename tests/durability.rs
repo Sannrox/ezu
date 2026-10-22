@@ -64,6 +64,7 @@ fn entity(id: u64, ts_ms: i64, lon: f64) -> Entity {
         heading: None,
         ttl_ms: None,
         fields: BTreeMap::from([("n".into(), FieldValue::Int(id as i64))]),
+        labels: Default::default(),
     }
 }
 
@@ -78,6 +79,7 @@ fn contents(engine: &DurableEngine) -> BTreeMap<String, Entity> {
                 filters: Vec::new(),
                 limit: 10_000,
                 cursor: None,
+                readable: None,
             },
             0,
         )
@@ -412,7 +414,10 @@ fn a_flipped_snapshot_or_final_record_fails_closed_and_expiry_is_swept_on_open()
     engine.upsert(&ns(), older.clone(), 400).unwrap();
     drop(engine);
     let engine = DurableEngine::open(config(&dir, u64::MAX), small, None, 400).unwrap();
-    assert_eq!(engine.get(&ns(), "c", "e0009", 400).unwrap(), Some(older));
+    assert_eq!(
+        engine.get(&ns(), "c", "e0009", None, 400).unwrap(),
+        Some(older)
+    );
     drop(engine);
     let _ = fs::remove_dir_all(&dir);
 }

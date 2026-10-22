@@ -31,6 +31,7 @@ fn point(id: &str, lon: f64, lat: f64, ts_ms: i64) -> Entity {
         heading: Some(90.0),
         ttl_ms: None,
         fields: BTreeMap::new(),
+        labels: Default::default(),
     }
 }
 

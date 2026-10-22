@@ -10,13 +10,15 @@
 //! as `{"variant": {...}}`):
 //! `POST /v1/entities`, `GET|DELETE /v1/entities/{collection}/{id}`,
 //! `POST /v1/query`, `GET /v1/status`, `GET /v1/fences`,
-//! `PUT|GET|DELETE /v1/fences/{id}` and `GET /v1/events`. `GET /healthz`
+//! `PUT|GET|DELETE /v1/fences/{id}` and `GET /v1/events`. A read's label
+//! filter is the `label_filter` of a JSON body or, for reads without one,
+//! the `x-ezu-readable-labels` header. `GET /healthz`
 //! and `GET /metrics` (Prometheus text, aggregated over namespaces) take no
 //! token.
 
 use crate::auth::{AuthError, Authenticator, bearer};
 use crate::durable::{DurableEngine, DurableError};
-use crate::entity::{Entity, FieldValue, Namespace};
+use crate::entity::{Entity, FieldValue, Labels, Namespace};
 use crate::fence::{EventKind, Fence, FenceEvent, Shape};
 use crate::geometry::{Geometry, Position};
 use crate::index::{IndexError, Upsert};
@@ -106,6 +108,7 @@ impl IntoResponse for ApiError {
             tonic::Code::NotFound => StatusCode::NOT_FOUND,
             tonic::Code::ResourceExhausted => StatusCode::TOO_MANY_REQUESTS,
             tonic::Code::OutOfRange => StatusCode::GONE,
+            tonic::Code::FailedPrecondition => StatusCode::BAD_REQUEST,
             _ => StatusCode::SERVICE_UNAVAILABLE,
         };
         (status, Json(serde_json::json!({"error": self.message}))).into_response()
@@ -185,6 +188,7 @@ fn entity(entity: proto::Entity) -> Result<Entity, ApiError> {
             .into_iter()
             .map(|(name, value)| Ok((name, field_value(value)?)))
             .collect::<Result<BTreeMap<_, _>, ApiError>>()?,
+        labels: entity.labels.into_iter().collect(),
     })
 }
 
@@ -222,6 +226,7 @@ fn to_entity(entity: Entity) -> proto::Entity {
             .into_iter()
             .map(|(name, value)| (name, to_field_value(value)))
             .collect(),
+        labels: entity.labels.into_iter().collect(),
     }
 }
 
@@ -253,6 +258,7 @@ pub(crate) fn query_request(request: proto::QueryRequest) -> Result<QueryRequest
         filters: filters(request.filters)?,
         limit: request.limit as usize,
         cursor: (!request.cursor.is_empty()).then_some(request.cursor),
+        readable: None,
     })
 }
 
@@ -313,6 +319,7 @@ fn fence(fence: Option<proto::Fence>) -> Result<Fence, ApiError> {
         filters: filters(fence.filters)?,
         dwell_ms: fence.dwell_ms,
         inside_per_second: fence.inside_per_second,
+        labels: fence.labels.into_iter().collect(),
     })
 }
 
@@ -338,6 +345,7 @@ fn to_fence(fence: Fence) -> proto::Fence {
         filters: fence.filters.into_iter().map(to_filter).collect(),
         dwell_ms: fence.dwell_ms,
         inside_per_second: fence.inside_per_second,
+        labels: fence.labels.into_iter().collect(),
     }
 }
 
@@ -357,6 +365,8 @@ fn to_event(event: FenceEvent) -> proto::FenceEvent {
         kind: kind as i32,
         ts_ms: event.ts_ms,
         position: Some(to_position(event.position)),
+        entity_labels: event.entity_labels.into_iter().collect(),
+        fence_labels: event.fence_labels.into_iter().collect(),
     }
 }
 
@@ -373,11 +383,39 @@ fn page(limit: u32) -> usize {
 pub struct Api {
     engine: Arc<DurableEngine>,
     auth: Arc<dyn Authenticator>,
+    governed: bool,
 }
 
 impl Api {
     pub fn new(engine: Arc<DurableEngine>, auth: Arc<dyn Authenticator>) -> Self {
-        Self { engine, auth }
+        Self {
+            engine,
+            auth,
+            governed: false,
+        }
+    }
+
+    /// Governed mode: every read (get, query, export, fences, events) must
+    /// carry a label filter, and one without is refused. The caller in front
+    /// of Ezu decides which labels a reader may see; Ezu only applies it.
+    pub fn governed(mut self, governed: bool) -> Self {
+        self.governed = governed;
+        self
+    }
+
+    /// The reader's label filter, which governed mode requires.
+    pub(crate) fn readable(
+        &self,
+        filter: Option<proto::LabelFilter>,
+    ) -> Result<Option<Labels>, ApiError> {
+        match filter {
+            Some(filter) => Ok(Some(filter.readable.into_iter().collect())),
+            None if self.governed => Err(ApiError::new(
+                tonic::Code::FailedPrecondition,
+                "governed mode: a read needs a label_filter",
+            )),
+            None => Ok(None),
+        }
     }
 
     pub(crate) fn namespace(&self, authorization: Option<&str>) -> Result<Namespace, ApiError> {
@@ -461,9 +499,16 @@ impl Api {
         request: proto::GetRequest,
     ) -> Result<proto::GetResponse, ApiError> {
         let ns = self.namespace(authorization)?;
+        let readable = self.readable(request.label_filter)?;
         let found = self
             .blocking(move |engine| {
-                Ok(engine.get(&ns, &request.collection, &request.id, now_ms())?)
+                Ok(engine.get(
+                    &ns,
+                    &request.collection,
+                    &request.id,
+                    readable.as_ref(),
+                    now_ms(),
+                )?)
             })
             .await?;
         Ok(proto::GetResponse {
@@ -477,7 +522,9 @@ impl Api {
         request: proto::QueryRequest,
     ) -> Result<proto::QueryResponse, ApiError> {
         let ns = self.namespace(authorization)?;
-        let request = query_request(request)?;
+        let readable = self.readable(request.label_filter.clone())?;
+        let mut request = query_request(request)?;
+        request.readable = readable;
         let page = self
             .blocking(move |engine| Ok(engine.query(&ns, &request, now_ms())?))
             .await?;
@@ -524,8 +571,9 @@ impl Api {
         request: proto::GetFenceRequest,
     ) -> Result<proto::GetFenceResponse, ApiError> {
         let ns = self.namespace(authorization)?;
+        let readable = self.readable(request.label_filter)?;
         let found = self
-            .blocking(move |engine| Ok(engine.get_fence(&ns, &request.id)?))
+            .blocking(move |engine| Ok(engine.get_fence(&ns, &request.id, readable.as_ref())?))
             .await?;
         Ok(proto::GetFenceResponse {
             fence: found.map(to_fence),
@@ -550,10 +598,11 @@ impl Api {
         request: proto::ListFencesRequest,
     ) -> Result<proto::ListFencesResponse, ApiError> {
         let ns = self.namespace(authorization)?;
+        let readable = self.readable(request.label_filter)?;
         let fences = self
             .blocking(move |engine| {
                 let after = (!request.after_id.is_empty()).then_some(request.after_id.as_str());
-                Ok(engine.list_fences(&ns, after, page(request.limit))?)
+                Ok(engine.list_fences(&ns, after, readable.as_ref(), page(request.limit))?)
             })
             .await?;
         Ok(proto::ListFencesResponse {
@@ -567,10 +616,17 @@ impl Api {
         request: proto::ListEventsRequest,
     ) -> Result<proto::ListEventsResponse, ApiError> {
         let ns = self.namespace(authorization)?;
+        let readable = self.readable(request.label_filter)?;
         let after = request.after_lsn.map(|lsn| (lsn, request.after_index));
         let events = self
             .blocking(move |engine| {
-                Ok(engine.events(&ns, after, &request.fences, page(request.limit))?)
+                Ok(engine.events(
+                    &ns,
+                    after,
+                    &request.fences,
+                    readable.as_ref(),
+                    page(request.limit),
+                )?)
             })
             .await?;
         Ok(proto::ListEventsResponse {
@@ -591,6 +647,7 @@ impl Api {
     ) -> Result<tokio::sync::mpsc::Receiver<Result<proto::FenceEvent, ApiError>>, ApiError> {
         const BATCH: usize = 256;
         let ns = self.namespace(authorization)?;
+        let readable = Arc::new(self.readable(request.label_filter)?);
         let engine = self.engine.clone();
         let fences = Arc::new(request.fences);
         let mut cursor = request.after_lsn.map(|lsn| (lsn, request.after_index));
@@ -600,11 +657,14 @@ impl Api {
         // Reads take the engine's locks, so they run off the async workers.
         let read = move |cursor: Option<(u64, u32)>| {
             let (engine, ns, fences) = (engine.clone(), ns.clone(), fences.clone());
+            let readable = readable.clone();
             async move {
-                tokio::task::spawn_blocking(move || engine.events(&ns, cursor, &fences, BATCH))
-                    .await
-                    .map_err(|_| ApiError::new(tonic::Code::Internal, "read task failed"))?
-                    .map_err(ApiError::from)
+                tokio::task::spawn_blocking(move || {
+                    engine.events(&ns, cursor, &fences, readable.as_ref().as_ref(), BATCH)
+                })
+                .await
+                .map_err(|_| ApiError::new(tonic::Code::Internal, "read task failed"))?
+                .map_err(ApiError::from)
             }
         };
         let mut page = read(cursor).await?;
@@ -795,6 +855,26 @@ fn events_params(query: &str) -> Result<proto::ListEventsRequest, ApiError> {
     Ok(request)
 }
 
+/// The label filter of an HTTP read without a body: the
+/// `x-ezu-readable-labels` header, UTF-8 and comma-separated (labels have
+/// no commas or surrounding whitespace, so this is lossless); present but
+/// empty means the reader may see only what carries no label.
+fn header_labels(headers: &HeaderMap) -> Result<Option<proto::LabelFilter>, ApiError> {
+    let Some(value) = headers.get("x-ezu-readable-labels") else {
+        return Ok(None);
+    };
+    let text = std::str::from_utf8(value.as_bytes())
+        .map_err(|_| ApiError::invalid("x-ezu-readable-labels is not UTF-8"))?;
+    Ok(Some(proto::LabelFilter {
+        readable: text
+            .split(',')
+            .map(str::trim)
+            .filter(|label| !label.is_empty())
+            .map(str::to_string)
+            .collect(),
+    }))
+}
+
 fn header_auth(headers: &HeaderMap) -> Option<&str> {
     headers
         .get("authorization")
@@ -820,9 +900,16 @@ pub fn http_router(api: Api) -> axum::Router {
                 |State(api): State<Api>,
                  headers: HeaderMap,
                  Path((collection, id)): Path<(String, String)>| async move {
-                    api.get(header_auth(&headers), proto::GetRequest { collection, id })
-                        .await
-                        .map(Json)
+                    api.get(
+                        header_auth(&headers),
+                        proto::GetRequest {
+                            collection,
+                            id,
+                            label_filter: header_labels(&headers)?,
+                        },
+                    )
+                    .await
+                    .map(Json)
                 },
             )
             .delete(
@@ -853,7 +940,8 @@ pub fn http_router(api: Api) -> axum::Router {
             get(
                 |State(api): State<Api>,
                  headers: HeaderMap,
-                 Params(params): Params<proto::ListFencesRequest>| async move {
+                 Params(mut params): Params<proto::ListFencesRequest>| async move {
+                    params.label_filter = header_labels(&headers)?;
                     api.list_fences(header_auth(&headers), params)
                         .await
                         .map(Json)
@@ -879,9 +967,15 @@ pub fn http_router(api: Api) -> axum::Router {
             )
             .get(
                 |State(api): State<Api>, headers: HeaderMap, Path(id): Path<String>| async move {
-                    api.get_fence(header_auth(&headers), proto::GetFenceRequest { id })
-                        .await
-                        .map(Json)
+                    api.get_fence(
+                        header_auth(&headers),
+                        proto::GetFenceRequest {
+                            id,
+                            label_filter: header_labels(&headers)?,
+                        },
+                    )
+                    .await
+                    .map(Json)
                 },
             )
             .delete(
@@ -896,7 +990,8 @@ pub fn http_router(api: Api) -> axum::Router {
             "/v1/events",
             get(
                 |State(api): State<Api>, headers: HeaderMap, RawQuery(query): RawQuery| async move {
-                    let params = events_params(query.as_deref().unwrap_or(""))?;
+                    let mut params = events_params(query.as_deref().unwrap_or(""))?;
+                    params.label_filter = header_labels(&headers)?;
                     api.list_events(header_auth(&headers), params)
                         .await
                         .map(Json)

@@ -23,8 +23,11 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// Format stamped into the Arrow metadata of data files written now.
+/// Format stamped into the Arrow metadata of data files written now: "3"
+/// when any entity carries labels (an extra `labels` column), so a binary
+/// from before labels refuses the file rather than drop them; else "2".
 const VERSION: &str = "2";
+const LABELED: &str = "3";
 const BATCH_ROWS: usize = 65_536;
 
 #[derive(Debug)]
@@ -40,8 +43,8 @@ fn err(error: impl std::fmt::Display) -> SnapshotError {
     SnapshotError(error.to_string())
 }
 
-fn schema(lsn: u64) -> Schema {
-    Schema::new(vec![
+fn schema(lsn: u64, labeled: bool) -> Schema {
+    let mut fields = vec![
         Field::new("namespace", DataType::Utf8, false),
         Field::new("collection", DataType::Utf8, false),
         Field::new("id", DataType::Utf8, false),
@@ -51,9 +54,13 @@ fn schema(lsn: u64) -> Schema {
         Field::new("heading", DataType::Float64, true),
         Field::new("ttl_ms", DataType::Int64, true),
         Field::new("fields", DataType::Binary, false),
-    ])
-    .with_metadata(HashMap::from([
-        ("ezu.snapshot.version".to_string(), VERSION.to_string()),
+    ];
+    if labeled {
+        fields.push(Field::new("labels", DataType::Binary, false));
+    }
+    let version = if labeled { LABELED } else { VERSION };
+    Schema::new(fields).with_metadata(HashMap::from([
+        ("ezu.snapshot.version".to_string(), version.to_string()),
         ("ezu.snapshot.lsn".to_string(), lsn.to_string()),
     ]))
 }
@@ -82,7 +89,8 @@ pub fn list(dir: &Path) -> Result<Vec<(u64, PathBuf)>, SnapshotError> {
 
 /// Entities as Arrow IPC file bytes, stamped with the format and `lsn`.
 pub fn encode_arrow(lsn: u64, entities: &[(Namespace, Entity)]) -> Result<Vec<u8>, SnapshotError> {
-    let schema = Arc::new(schema(lsn));
+    let labeled = entities.iter().any(|(_, entity)| !entity.labels.is_empty());
+    let schema = Arc::new(schema(lsn, labeled));
     let mut writer = FileWriter::try_new(Vec::new(), &schema).map_err(err)?;
     for chunk in entities.chunks(BATCH_ROWS) {
         let mut namespace = StringBuilder::new();
@@ -94,6 +102,7 @@ pub fn encode_arrow(lsn: u64, entities: &[(Namespace, Entity)]) -> Result<Vec<u8
         let mut heading = Float64Builder::new();
         let mut ttl = Int64Builder::new();
         let mut fields = BinaryBuilder::new();
+        let mut labels = BinaryBuilder::new();
         for (ns, entity) in chunk {
             namespace.append_value(ns.as_str());
             collection.append_value(&entity.collection);
@@ -104,8 +113,11 @@ pub fn encode_arrow(lsn: u64, entities: &[(Namespace, Entity)]) -> Result<Vec<u8
             heading.append_option(entity.heading);
             ttl.append_option(entity.ttl_ms);
             fields.append_value(encode_fields(&entity.fields));
+            let mut encoded = crate::codec::Writer::default();
+            crate::codec::encode_labels(&mut encoded, &entity.labels);
+            labels.append_value(encoded.0);
         }
-        let columns: Vec<ArrayRef> = vec![
+        let mut columns: Vec<ArrayRef> = vec![
             Arc::new(namespace.finish()),
             Arc::new(collection.finish()),
             Arc::new(id.finish()),
@@ -116,6 +128,9 @@ pub fn encode_arrow(lsn: u64, entities: &[(Namespace, Entity)]) -> Result<Vec<u8
             Arc::new(ttl.finish()),
             Arc::new(fields.finish()),
         ];
+        if labeled {
+            columns.push(Arc::new(labels.finish()));
+        }
         let batch = RecordBatch::try_new(schema.clone(), columns).map_err(err)?;
         writer.write(&batch).map_err(err)?;
     }
@@ -131,19 +146,23 @@ pub fn read_v1(path: &Path) -> Result<(u64, Vec<(Namespace, Entity)>), SnapshotE
     if expected != Some(crc32fast::hash(&bytes)) {
         return Err(SnapshotError("checksum missing or mismatched".into()));
     }
-    decode_arrow(bytes, "1")
+    decode_arrow(bytes, &["1"])
 }
 
-/// Entities from Arrow IPC bytes of format `version`, with their LSN.
+/// Entities from Arrow IPC bytes of one of the formats `versions`, with
+/// their LSN.
 pub fn decode_arrow(
     bytes: Vec<u8>,
-    version: &str,
+    versions: &[&str],
 ) -> Result<(u64, Vec<(Namespace, Entity)>), SnapshotError> {
     let reader = FileReader::try_new(std::io::Cursor::new(bytes), None).map_err(err)?;
     let metadata = reader.schema().metadata().clone();
-    if metadata.get("ezu.snapshot.version").map(String::as_str) != Some(version) {
-        return Err(SnapshotError("unknown snapshot format version".into()));
-    }
+    let version = metadata
+        .get("ezu.snapshot.version")
+        .map(String::as_str)
+        .filter(|version| versions.contains(version))
+        .ok_or_else(|| SnapshotError("unknown snapshot format version".into()))?;
+    let labeled = version == LABELED;
     let lsn: u64 = metadata
         .get("ezu.snapshot.lsn")
         .and_then(|lsn| lsn.parse().ok())
@@ -189,6 +208,7 @@ pub fn decode_arrow(
             int(7)?,
             binary(8)?,
         );
+        let labels = labeled.then(|| binary(9)).transpose()?;
         for row in 0..batch.num_rows() {
             let maybe = |array: &Float64Array| (!array.is_null(row)).then(|| array.value(row));
             let entity = Entity {
@@ -200,6 +220,15 @@ pub fn decode_arrow(
                 heading: maybe(&heading),
                 ttl_ms: (!ttl.is_null(row)).then(|| ttl.value(row)),
                 fields: decode_fields(fields.value(row)).map_err(err)?,
+                labels: match &labels {
+                    Some(labels) => {
+                        let mut input = crate::codec::Reader(labels.value(row));
+                        let decoded = crate::codec::decode_labels(&mut input).map_err(err)?;
+                        input.done().map_err(err)?;
+                        decoded
+                    }
+                    None => Default::default(),
+                },
             };
             // A readable file can still hold damaged values; those make the
             // whole snapshot unusable rather than failing later in the index.
@@ -510,10 +539,10 @@ pub fn plain_entities(file: &DataFile) -> Result<Vec<(Namespace, Entity)>, Snaps
     if file.sealed.is_some() {
         return Err(SnapshotError("the data file is sealed".into()));
     }
-    decode_arrow(file.bytes.clone(), VERSION).map(|(_, entities)| entities)
+    decode_arrow(file.bytes.clone(), &[VERSION, LABELED]).map(|(_, entities)| entities)
 }
 
 /// Entities from Arrow bytes written now (after any unsealing).
 pub fn current_entities(bytes: Vec<u8>) -> Result<Vec<(Namespace, Entity)>, SnapshotError> {
-    decode_arrow(bytes, VERSION).map(|(_, entities)| entities)
+    decode_arrow(bytes, &[VERSION, LABELED]).map(|(_, entities)| entities)
 }

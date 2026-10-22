@@ -2,7 +2,7 @@
 //! WKB, and the rest of an entity as length-prefixed fields. Decoding never
 //! trusts its input: every length is checked against what is left.
 
-use crate::entity::{Entity, FieldValue};
+use crate::entity::{Entity, FieldValue, Labels, MAX_LABELS};
 use crate::geometry::{Geometry, Position};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -250,6 +250,24 @@ fn read_optional_f64(input: &mut Reader<'_>) -> Result<Option<f64>, CodecError> 
     }
 }
 
+pub fn encode_labels(out: &mut Writer, labels: &Labels) {
+    out.u32(labels.len() as u32);
+    for label in labels {
+        out.str(label);
+    }
+}
+
+pub fn decode_labels(input: &mut Reader<'_>) -> Result<Labels, CodecError> {
+    let n = input.u32()?;
+    if n as usize > MAX_LABELS {
+        return Err(CodecError("label count"));
+    }
+    (0..n).map(|_| input.str()).collect()
+}
+
+/// An entity as a log record ends with it. Labels come last and only when
+/// there are any, so unlabeled records stay readable by binaries from
+/// before labels, which refuse labeled ones rather than drop the labels.
 pub fn encode_entity(out: &mut Writer, entity: &Entity) {
     out.str(&entity.collection);
     out.str(&entity.id);
@@ -265,10 +283,14 @@ pub fn encode_entity(out: &mut Writer, entity: &Entity) {
         None => out.u8(0),
     }
     out.bytes(&encode_fields(&entity.fields));
+    if !entity.labels.is_empty() {
+        encode_labels(out, &entity.labels);
+    }
 }
 
+/// Read [`encode_entity`]; the entity must end the input.
 pub fn decode_entity(input: &mut Reader<'_>) -> Result<Entity, CodecError> {
-    Ok(Entity {
+    let mut entity = Entity {
         collection: input.str()?,
         id: input.str()?,
         geometry: geometry_from_wkb(input.bytes()?)?,
@@ -281,7 +303,12 @@ pub fn decode_entity(input: &mut Reader<'_>) -> Result<Entity, CodecError> {
             _ => return Err(CodecError("option tag")),
         },
         fields: decode_fields(input.bytes()?)?,
-    })
+        labels: Labels::new(),
+    };
+    if !input.0.is_empty() {
+        entity.labels = decode_labels(input)?;
+    }
+    Ok(entity)
 }
 
 #[cfg(test)]
@@ -325,6 +352,7 @@ mod tests {
                 ("c".into(), FieldValue::Bool(true)),
                 ("d".into(), FieldValue::Float(0.25)),
             ]),
+            labels: Default::default(),
         };
         let mut out = Writer::default();
         encode_entity(&mut out, &entity);

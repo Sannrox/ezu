@@ -91,6 +91,7 @@ fn vessel(i: u64) -> Entity {
             ("tonnage".into(), FieldValue::Int(i as i64)),
             ("draft".into(), FieldValue::Float(1.0)),
         ]),
+        labels: Default::default(),
     }
 }
 
