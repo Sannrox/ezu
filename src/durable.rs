@@ -248,6 +248,11 @@ impl DurableEngine {
         self.engine.get(ns, collection, id, now_ms)
     }
 
+    /// Entities counted against `ns`'s quota.
+    pub fn entity_count(&self, ns: &Namespace) -> Result<usize, IndexError> {
+        self.engine.entity_count(ns)
+    }
+
     pub fn query(
         &self,
         ns: &Namespace,

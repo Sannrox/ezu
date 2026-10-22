@@ -1,0 +1,164 @@
+// Ezu API, version 1. The caller's namespace always comes from its
+// authenticated identity; no request names one.
+syntax = "proto3";
+
+package ezu.v1;
+
+service Ezu {
+  // Insert or replace entities. Each gets its own outcome.
+  rpc Upsert(UpsertRequest) returns (UpsertResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Query(QueryRequest) returns (QueryResponse);
+  rpc Status(StatusRequest) returns (StatusResponse);
+}
+
+// Longitude and latitude in WGS 84 degrees.
+message Position {
+  double lon = 1;
+  double lat = 2;
+}
+
+message Ring {
+  repeated Position positions = 1;
+}
+
+// Exterior ring first, then holes; rings are closed.
+message Polygon {
+  repeated Ring rings = 1;
+}
+
+message Geometry {
+  oneof shape {
+    Position point = 1;
+    Ring line = 2;
+    Polygon polygon = 3;
+  }
+}
+
+message FieldValue {
+  oneof value {
+    bool bool_value = 1;
+    int64 int_value = 2;
+    double float_value = 3;
+    string text_value = 4;
+  }
+}
+
+message Entity {
+  string collection = 1;
+  string id = 2;
+  Geometry geometry = 3;
+  // Observation time, Unix milliseconds.
+  int64 ts_ms = 4;
+  optional double speed = 5;
+  optional double heading = 6;
+  optional int64 ttl_ms = 7;
+  map<string, FieldValue> fields = 8;
+}
+
+message UpsertRequest {
+  repeated Entity entities = 1;
+}
+
+enum Outcome {
+  OUTCOME_UNSPECIFIED = 0;
+  OUTCOME_INSERTED = 1;
+  OUTCOME_UPDATED = 2;
+  // Older than the stored entity; nothing changed.
+  OUTCOME_STALE = 3;
+  OUTCOME_REFUSED = 4;
+}
+
+message UpsertResult {
+  Outcome outcome = 1;
+  // Why a refused entity was refused.
+  string error = 2;
+}
+
+message UpsertResponse {
+  repeated UpsertResult results = 1;
+}
+
+message DeleteRequest {
+  string collection = 1;
+  string id = 2;
+}
+
+message DeleteResponse {
+  bool removed = 1;
+}
+
+message GetRequest {
+  string collection = 1;
+  string id = 2;
+}
+
+message GetResponse {
+  // Absent when the entity does not exist or has expired.
+  Entity entity = 1;
+}
+
+message Bbox {
+  double west = 1;
+  double south = 2;
+  double east = 3;
+  double north = 4;
+}
+
+message Radius {
+  Position center = 1;
+  double meters = 2;
+}
+
+message PolygonQuery {
+  Polygon polygon = 1;
+  // True for entities inside the polygon, false for any that touch it.
+  bool contains = 2;
+}
+
+message Nearest {
+  Position center = 1;
+  uint32 k = 2;
+}
+
+message Range {
+  optional double min = 1;
+  optional double max = 2;
+}
+
+message Filter {
+  string field = 1;
+  oneof test {
+    FieldValue equals = 2;
+    Range range = 3;
+  }
+}
+
+message QueryRequest {
+  string collection = 1;
+  oneof query {
+    Bbox bbox = 2;
+    Radius radius = 3;
+    PolygonQuery polygon = 4;
+    Nearest nearest = 5;
+  }
+  repeated Filter filters = 6;
+  uint32 limit = 7;
+  // The next_cursor of the previous page.
+  string cursor = 8;
+}
+
+message QueryResponse {
+  repeated Entity entities = 1;
+  string next_cursor = 2;
+}
+
+message StatusRequest {}
+
+message StatusResponse {
+  string version = 1;
+  // The caller's namespace, as its identity maps it.
+  string namespace = 2;
+  uint64 entity_count = 3;
+}

@@ -1,6 +1,8 @@
 //! Ezu: live spatial engine. An index over moving entities, spatial queries,
 //! geofencing events and recent tracks.
 
+pub mod api;
+pub mod auth;
 mod codec;
 pub mod durable;
 pub mod entity;
