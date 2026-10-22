@@ -17,7 +17,7 @@ use crate::geometry::{Geometry, Position};
 use crate::index::{IndexError, Upsert};
 use crate::query::{Filter, MAX_LIMIT, Query, QueryRequest, Relation};
 use axum::Json;
-use axum::extract::{Path, Query as Params, State};
+use axum::extract::{Path, Query as Params, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
@@ -81,6 +81,7 @@ impl From<DurableError> for ApiError {
         match error {
             DurableError::Index(error) => error.into(),
             DurableError::TooLarge => Self::invalid(error.to_string()),
+            DurableError::Expired(_) => Self::new(tonic::Code::OutOfRange, error.to_string()),
             other => Self::new(tonic::Code::Unavailable, other.to_string()),
         }
     }
@@ -99,6 +100,7 @@ impl IntoResponse for ApiError {
             tonic::Code::InvalidArgument => StatusCode::BAD_REQUEST,
             tonic::Code::NotFound => StatusCode::NOT_FOUND,
             tonic::Code::ResourceExhausted => StatusCode::TOO_MANY_REQUESTS,
+            tonic::Code::OutOfRange => StatusCode::GONE,
             _ => StatusCode::SERVICE_UNAVAILABLE,
         };
         (status, Json(serde_json::json!({"error": self.message}))).into_response()
@@ -562,11 +564,77 @@ impl Api {
         let ns = self.namespace(authorization)?;
         let after = request.after_lsn.map(|lsn| (lsn, request.after_index));
         let events = self
-            .blocking(move |engine| Ok(engine.events(&ns, after, page(request.limit))?))
+            .blocking(move |engine| {
+                Ok(engine.events(&ns, after, &request.fences, page(request.limit))?)
+            })
             .await?;
         Ok(proto::ListEventsResponse {
-            events: events.into_iter().map(to_event).collect(),
+            events: events.events.into_iter().map(to_event).collect(),
+            through_lsn: Some(events.through.0),
+            through_index: events.through.1,
         })
+    }
+
+    /// Stream events from the resume point on, then live. The first read
+    /// happens before the stream starts, so an expired resume point fails
+    /// the call itself. A later failure (the reader fell behind the
+    /// retention, or the namespace was sealed) ends the stream with it.
+    pub async fn subscribe(
+        &self,
+        authorization: Option<&str>,
+        request: proto::SubscribeRequest,
+    ) -> Result<tokio::sync::mpsc::Receiver<Result<proto::FenceEvent, ApiError>>, ApiError> {
+        const BATCH: usize = 256;
+        let ns = self.namespace(authorization)?;
+        let engine = self.engine.clone();
+        let fences = Arc::new(request.fences);
+        let mut cursor = request.after_lsn.map(|lsn| (lsn, request.after_index));
+        // Marked seen before each read, so a publish after it wakes the wait.
+        let mut published = engine.watch_events();
+        published.borrow_and_update();
+        // Reads take the engine's locks, so they run off the async workers.
+        let read = move |cursor: Option<(u64, u32)>| {
+            let (engine, ns, fences) = (engine.clone(), ns.clone(), fences.clone());
+            async move {
+                tokio::task::spawn_blocking(move || engine.events(&ns, cursor, &fences, BATCH))
+                    .await
+                    .map_err(|_| ApiError::new(tonic::Code::Internal, "read task failed"))?
+                    .map_err(ApiError::from)
+            }
+        };
+        let mut page = read(cursor).await?;
+        let (sender, receiver) = tokio::sync::mpsc::channel(BATCH);
+        tokio::spawn(async move {
+            loop {
+                // Nothing read past the cursor: wait for a publish. A page
+                // of only filtered-out events still moves the cursor on.
+                if Some(page.through) == cursor {
+                    tokio::select! {
+                        changed = published.changed() => {
+                            if changed.is_err() {
+                                return;
+                            }
+                        }
+                        () = sender.closed() => return,
+                    }
+                }
+                for event in page.events.drain(..) {
+                    if sender.send(Ok(to_event(event))).await.is_err() {
+                        return;
+                    }
+                }
+                cursor = Some(page.through);
+                published.borrow_and_update();
+                page = match read(cursor).await {
+                    Ok(batch) => batch,
+                    Err(error) => {
+                        let _ = sender.send(Err(error)).await;
+                        return;
+                    }
+                };
+            }
+        });
+        Ok(receiver)
     }
 }
 
@@ -580,6 +648,22 @@ fn metadata_auth<T>(request: &tonic::Request<T>) -> Option<String> {
 
 #[tonic::async_trait]
 impl Ezu for Api {
+    type SubscribeStream = std::pin::Pin<
+        Box<dyn tokio_stream::Stream<Item = Result<proto::FenceEvent, tonic::Status>> + Send>,
+    >;
+
+    async fn subscribe(
+        &self,
+        request: tonic::Request<proto::SubscribeRequest>,
+    ) -> Result<tonic::Response<Self::SubscribeStream>, tonic::Status> {
+        use tokio_stream::StreamExt;
+        let auth = metadata_auth(&request);
+        let events = Api::subscribe(self, auth.as_deref(), request.into_inner()).await?;
+        let stream = tokio_stream::wrappers::ReceiverStream::new(events)
+            .map(|event| event.map_err(tonic::Status::from));
+        Ok(tonic::Response::new(Box::pin(stream)))
+    }
+
     async fn upsert(
         &self,
         request: tonic::Request<proto::UpsertRequest>,
@@ -678,6 +762,32 @@ impl Ezu for Api {
             Api::list_events(self, auth.as_deref(), request.into_inner()).await?,
         ))
     }
+}
+
+/// `GET /v1/events` parameters: `after_lsn`, `after_index`, `limit`, and
+/// `fence` once per fence to read.
+fn events_params(query: &str) -> Result<proto::ListEventsRequest, ApiError> {
+    let pairs: Vec<(String, String)> =
+        serde_urlencoded::from_str(query).map_err(|error| ApiError::invalid(error.to_string()))?;
+    let mut request = proto::ListEventsRequest::default();
+    let number = |value: &str| {
+        value
+            .parse::<u64>()
+            .map_err(|_| ApiError::invalid(format!("not a number: {value}")))
+    };
+    for (name, value) in pairs {
+        match name.as_str() {
+            "after_lsn" => request.after_lsn = Some(number(&value)?),
+            "after_index" => {
+                request.after_index = u32::try_from(number(&value)?)
+                    .map_err(|_| ApiError::invalid("after_index is too large"))?;
+            }
+            "limit" => request.limit = u32::try_from(number(&value)?).unwrap_or(u32::MAX),
+            "fence" => request.fences.push(value),
+            _ => return Err(ApiError::invalid(format!("unknown parameter {name}"))),
+        }
+    }
+    Ok(request)
 }
 
 fn header_auth(headers: &HeaderMap) -> Option<&str> {
@@ -780,9 +890,8 @@ pub fn http_router(api: Api) -> axum::Router {
         .route(
             "/v1/events",
             get(
-                |State(api): State<Api>,
-                 headers: HeaderMap,
-                 Params(params): Params<proto::ListEventsRequest>| async move {
+                |State(api): State<Api>, headers: HeaderMap, RawQuery(query): RawQuery| async move {
+                    let params = events_params(query.as_deref().unwrap_or(""))?;
                     api.list_events(header_auth(&headers), params)
                         .await
                         .map(Json)

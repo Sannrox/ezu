@@ -151,6 +151,8 @@ fn encode(lsn: u64, op: &Op) -> Vec<u8> {
 }
 
 const COMMIT: u8 = 0xC0;
+/// The smallest frame: its 12-byte header and a commit payload (LSN, tag).
+const MIN_FRAME: u64 = 12 + 9;
 const SEALED: u8 = 3;
 const FENCE_PUT: u8 = 4;
 const FENCE_DELETE: u8 = 5;
@@ -290,8 +292,9 @@ impl Wal {
     /// or refused), then open a fresh segment for appends after the last LSN
     /// or after `floor`, the LSN a snapshot covers, if that is later. A
     /// superseded log (`read == false`, after an authoritative rebuild) is
-    /// not read: appends start past every existing segment, and the next
-    /// snapshot's drop removes the old ones.
+    /// not read: appends start past every LSN the existing segments could
+    /// hold (bounded by their sizes), so no discarded LSN is reused, and the
+    /// next snapshot's drop removes the old ones.
     pub fn open(
         dir: &Path,
         floor: u64,
@@ -302,10 +305,14 @@ impl Wal {
         fs::create_dir_all(dir)?;
         let found = segments(dir)?;
         if !read {
-            let next_lsn = found
-                .last()
-                .map_or(floor, |(first, _)| (*first).max(floor))
-                .saturating_add(1);
+            let mut last = floor;
+            for (first, path) in &found {
+                // Every frame takes at least MIN_FRAME bytes, so a segment
+                // holds no LSN past this, however damaged it is.
+                let frames = fs::metadata(path)?.len() / MIN_FRAME;
+                last = last.max(first.saturating_add(frames));
+            }
+            let next_lsn = last.saturating_add(1);
             let (file, written) = new_segment(dir, next_lsn)?;
             return Ok((
                 Self {

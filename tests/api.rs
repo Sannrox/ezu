@@ -377,6 +377,18 @@ async fn fences_and_their_events_are_served_per_namespace_over_http() {
     let path = format!("/v1/events?after_lsn={lsn}&after_index=0");
     let (_, body) = http(&address, "GET", &path, Some(&a), "").await;
     assert!(!body.contains("harbour"), "{body}");
+    // Filtered by fence, one `fence` parameter per fence.
+    let (_, body) = http(
+        &address,
+        "GET",
+        "/v1/events?fence=harbour&fence=x",
+        Some(&a),
+        "",
+    )
+    .await;
+    assert!(body.contains("\"harbour\""), "{body}");
+    let (_, body) = http(&address, "GET", "/v1/events?fence=other", Some(&a), "").await;
+    assert!(!body.contains("\"harbour\""), "{body}");
     let (_, body) = http(&address, "GET", "/v1/fences", Some(&a), "").await;
     assert!(body.contains("\"harbour\""), "{body}");
     let (_, body) = http(&address, "GET", "/v1/fences/harbour", Some(&b), "").await;
@@ -386,4 +398,73 @@ async fn fences_and_their_events_are_served_per_namespace_over_http() {
     let (code, body) = http(&address, "DELETE", "/v1/fences/harbour", Some(&a), "").await;
     assert_eq!(code, 200);
     assert!(body.contains("true"), "{body}");
+}
+
+#[tokio::test]
+async fn a_subscriber_gets_events_live_and_resumes_after_its_last_id() {
+    let (address, _stop) = server().await;
+    let a = token("tenant-a");
+    let mut client = EzuClient::connect(format!("http://{address}"))
+        .await
+        .unwrap();
+    let fence = proto::Fence {
+        id: "harbour".into(),
+        shape: Some(proto::fence::Shape::Circle(proto::Radius {
+            center: Some(proto::Position {
+                lon: 10.0,
+                lat: 50.0,
+            }),
+            meters: 500.0,
+        })),
+        ..Default::default()
+    };
+    client
+        .put_fence(authed(proto::PutFenceRequest { fence: Some(fence) }, &a))
+        .await
+        .unwrap();
+    let mut stream = client
+        .subscribe(authed(proto::SubscribeRequest::default(), &a))
+        .await
+        .unwrap()
+        .into_inner();
+    // Raised after the subscription started: delivered live.
+    client
+        .upsert(authed(
+            proto::UpsertRequest {
+                entities: vec![ship("s1")],
+            },
+            &a,
+        ))
+        .await
+        .unwrap();
+    let entered = stream.message().await.unwrap().unwrap();
+    assert_eq!(
+        (entered.fence.as_str(), entered.kind),
+        ("harbour", proto::EventKind::Enter as i32)
+    );
+    client
+        .upsert(authed(
+            proto::UpsertRequest {
+                entities: vec![ship("s2")],
+            },
+            &a,
+        ))
+        .await
+        .unwrap();
+    drop(stream);
+    // Resuming after the first id yields exactly the second event.
+    let mut resumed = client
+        .subscribe(authed(
+            proto::SubscribeRequest {
+                after_lsn: Some(entered.lsn),
+                after_index: entered.index,
+                fences: vec!["harbour".into()],
+            },
+            &a,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let next = resumed.message().await.unwrap().unwrap();
+    assert_eq!(next.entity, "s2");
 }

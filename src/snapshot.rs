@@ -233,6 +233,9 @@ pub struct Part {
     pub namespace: String,
     pub file: Option<DataFile>,
     pub fences: Option<DataFile>,
+    /// Whether the fences file also holds the namespace's recent events
+    /// (written since events were kept); older ones hold fence state only.
+    pub fences_with_events: bool,
     pub tail: Vec<Vec<u8>>,
 }
 
@@ -240,6 +243,13 @@ pub struct Part {
 struct Manifest {
     version: u32,
     lsn: u64,
+    /// Written by binaries that keep events in snapshots; a set without it
+    /// kept none, so history before it is unknown.
+    #[serde(default)]
+    events_kept: bool,
+    /// Event ids before this are unknown to every namespace.
+    #[serde(default)]
+    events_floor: Option<(u64, u32)>,
     parts: Vec<ManifestPart>,
 }
 
@@ -250,6 +260,8 @@ struct ManifestPart {
     /// Absent in sets written before fences.
     #[serde(default)]
     fences: Option<ManifestFile>,
+    #[serde(default)]
+    fences_with_events: bool,
     tail: Option<ManifestFile>,
 }
 
@@ -319,7 +331,12 @@ fn write_synced(path: &Path, bytes: &[u8]) -> Result<u32, SnapshotError> {
 
 /// Publish the set at `lsn`, then remove older snapshots of both formats.
 /// False when a set at `lsn` already existed and was kept as it is.
-pub fn write_set(dir: &Path, lsn: u64, parts: &[Part]) -> Result<bool, SnapshotError> {
+pub fn write_set(
+    dir: &Path,
+    lsn: u64,
+    parts: &[Part],
+    events_floor: Option<(u64, u32)>,
+) -> Result<bool, SnapshotError> {
     fs::create_dir_all(dir).map_err(err)?;
     let target = dir.join(format!("{lsn:020}"));
     // Every change takes an LSN, so a set already published at this LSN
@@ -333,15 +350,20 @@ pub fn write_set(dir: &Path, lsn: u64, parts: &[Part]) -> Result<bool, SnapshotE
         fs::remove_dir_all(&temp).map_err(err)?;
     }
     fs::create_dir(&temp).map_err(err)?;
-    // Version 3 marks a set with fences, so a binary from before them
-    // refuses it rather than dropping them; others stay readable by it.
+    // Version 3 marks a set with fences and 4 one whose fences files hold
+    // events, so a binary from before either refuses the set rather than
+    // dropping or misreading them; others stay readable by it.
     let mut manifest = Manifest {
-        version: if parts.iter().any(|part| part.fences.is_some()) {
+        version: if parts.iter().any(|part| part.fences_with_events) {
+            4
+        } else if parts.iter().any(|part| part.fences.is_some()) {
             3
         } else {
             2
         },
         lsn,
+        events_kept: true,
+        events_floor,
         parts: Vec::new(),
     };
     // Files are numbered; the manifest names each part's namespace, so any
@@ -380,6 +402,7 @@ pub fn write_set(dir: &Path, lsn: u64, parts: &[Part]) -> Result<bool, SnapshotE
             namespace: part.namespace.clone(),
             file,
             fences,
+            fences_with_events: part.fences_with_events,
             tail,
         });
     }
@@ -421,11 +444,20 @@ fn read_checked(dir: &Path, file: &ManifestFile) -> Result<Vec<u8>, SnapshotErro
     Ok(bytes)
 }
 
+/// A read snapshot set.
+pub struct Set {
+    pub lsn: u64,
+    pub parts: Vec<Part>,
+    /// Event ids before this are unknown: the set's own floor, or for a set
+    /// from before events were kept, everything up to its LSN.
+    pub events_floor: Option<(u64, u32)>,
+}
+
 /// Read a set: its LSN and each namespace's part, checksums verified.
-pub fn read_set(dir: &Path) -> Result<(u64, Vec<Part>), SnapshotError> {
+pub fn read_set(dir: &Path) -> Result<Set, SnapshotError> {
     let manifest: Manifest =
         serde_json::from_slice(&fs::read(dir.join("MANIFEST.json")).map_err(err)?).map_err(err)?;
-    if !(2..=3).contains(&manifest.version) || set_lsn(dir) != Some(manifest.lsn) {
+    if !(2..=4).contains(&manifest.version) || set_lsn(dir) != Some(manifest.lsn) {
         return Err(SnapshotError("manifest does not match its set".into()));
     }
     let mut parts = Vec::new();
@@ -459,10 +491,18 @@ pub fn read_set(dir: &Path) -> Result<(u64, Vec<Part>), SnapshotError> {
             namespace: part.namespace,
             file,
             fences,
+            fences_with_events: part.fences_with_events,
             tail,
         });
     }
-    Ok((manifest.lsn, parts))
+    Ok(Set {
+        lsn: manifest.lsn,
+        parts,
+        events_floor: match manifest.events_kept {
+            true => manifest.events_floor,
+            false => Some((manifest.lsn, u32::MAX)),
+        },
+    })
 }
 
 /// Plaintext entities from a data file, which must not be sealed.
