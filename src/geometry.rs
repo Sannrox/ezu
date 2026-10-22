@@ -130,10 +130,9 @@ impl Geometry {
             });
         // A ring that winds once around a pole contains every longitude.
         if let Self::Polygon(rings) = self
-            && let Some(winding) = rings.first().map(|ring| lon_winding(ring))
-            && winding.abs() > 180.0
+            && encloses_pole(rings)
         {
-            let north = min_lat + max_lat >= 0.0;
+            let north = polar_north(rings);
             return vec![BoundingBox {
                 min_lon: -180.0,
                 min_lat: if north { min_lat } else { -90.0 },
@@ -228,7 +227,9 @@ fn segment_intervals(positions: &[Position]) -> Vec<(f64, f64)> {
         .collect()
 }
 
-fn short_step(from: f64, to: f64) -> f64 {
+/// The longitude step from `from` to `to` taken the short way round, as the
+/// index bounds take it; exactly 180° keeps its sign in the original frame.
+pub(crate) fn short_step(from: f64, to: f64) -> f64 {
     let step = to - from;
     if step > 180.0 {
         step - 360.0
@@ -237,6 +238,26 @@ fn short_step(from: f64, to: f64) -> f64 {
     } else {
         step
     }
+}
+
+/// For a polygon around a pole, whether that pole is the north one: the side
+/// its latitude extremes lean to. Shared by bounds and containment so both
+/// pick the same pole whatever vertex a ring starts at.
+pub(crate) fn polar_north(rings: &[Vec<Position>]) -> bool {
+    let (lo, hi) = rings
+        .iter()
+        .flatten()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| {
+            (lo.min(p.lat), hi.max(p.lat))
+        });
+    lo + hi >= 0.0
+}
+
+/// Whether a polygon's exterior ring winds once around a pole.
+pub(crate) fn encloses_pole(rings: &[Vec<Position>]) -> bool {
+    rings
+        .first()
+        .is_some_and(|ring| lon_winding(ring).abs() > 180.0)
 }
 
 /// Sum of longitude steps, each taken the short way round. About ±360 for a

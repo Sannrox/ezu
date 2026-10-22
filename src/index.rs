@@ -8,6 +8,10 @@
 
 use crate::entity::{Entity, EntityError, Namespace};
 use crate::geometry::{BoundingBox, query_boxes};
+use crate::query::{
+    EARTH_RADIUS_M, MAX_LIMIT, Query, QueryPage, QueryRequest, distance, invalid, matches,
+    radius_windows, windows,
+};
 use rstar::primitives::{GeomWithData, Rectangle};
 use rstar::{AABB, RTree};
 use std::collections::{HashMap, HashSet};
@@ -43,6 +47,7 @@ pub enum IndexError {
     },
     /// A query window outside WGS 84 or with `south > north`.
     InvalidWindow,
+    InvalidQuery(&'static str),
     PartitionNotEmpty,
     /// A writer panicked while holding a lock; the partition is not trusted.
     Poisoned,
@@ -71,6 +76,7 @@ impl fmt::Display for IndexError {
             Self::InvalidWindow => f.write_str(
                 "query window needs finite lon in [-180, 180], lat in [-90, 90] and south <= north",
             ),
+            Self::InvalidQuery(reason) => write!(f, "invalid query: {reason}"),
             Self::PartitionNotEmpty => f.write_str("bulk load needs an empty collection"),
             Self::Poisoned => f.write_str("index partition is unavailable after a failed write"),
         }
@@ -329,6 +335,78 @@ impl Engine {
         Ok(found)
     }
 
+    /// Run a spatial query. Results are live entities matching every filter,
+    /// in id order with a cursor for the next page, or for `Nearest` the `k`
+    /// closest by distance then id.
+    pub fn query(
+        &self,
+        ns: &Namespace,
+        request: &QueryRequest,
+        now_ms: i64,
+    ) -> Result<QueryPage, IndexError> {
+        if let Some(reason) = invalid(&request.query) {
+            return Err(IndexError::InvalidQuery(reason));
+        }
+        if request.limit == 0 || request.limit > MAX_LIMIT {
+            return Err(IndexError::InvalidQuery("limit must be 1 to 10000"));
+        }
+        let empty = QueryPage {
+            entities: Vec::new(),
+            next_cursor: None,
+        };
+        let Some(partition) = self.existing_partition(ns, &request.collection)? else {
+            return Ok(empty);
+        };
+        let partition = partition.read().map_err(|_| IndexError::Poisoned)?;
+        let keep = |entity: &&Entity| {
+            !entity.expired(now_ms) && request.filters.iter().all(|f| f.matches(entity))
+        };
+        if let Query::Nearest { center, k } = &request.query {
+            let take = request.limit.min(*k);
+            let world = std::f64::consts::PI * EARTH_RADIUS_M;
+            // Grow the radius until it holds `take` entities: any entity
+            // closer than the radius lies in its windows, so those are the
+            // nearest.
+            let mut meters: f64 = 1_000.0;
+            loop {
+                let mut found: Vec<(f64, &Entity)> =
+                    candidates(&partition, &radius_windows(*center, meters))
+                        .into_iter()
+                        .filter(keep)
+                        .map(|entity| (distance(&entity.geometry, *center), entity))
+                        .filter(|(d, _)| *d <= meters)
+                        .collect();
+                if found.len() >= take || meters >= world {
+                    found.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.id.cmp(&b.1.id)));
+                    return Ok(QueryPage {
+                        entities: found
+                            .into_iter()
+                            .take(take)
+                            .map(|(_, entity)| entity.clone())
+                            .collect(),
+                        next_cursor: None,
+                    });
+                }
+                meters = (meters * 4.0).min(world);
+            }
+        }
+        let mut found: Vec<&Entity> = candidates(&partition, &windows(&request.query))
+            .into_iter()
+            .filter(keep)
+            .filter(|entity| request.cursor.as_ref().is_none_or(|c| entity.id > *c))
+            .filter(|entity| matches(&request.query, &entity.geometry))
+            .collect();
+        found.sort_by(|a, b| a.id.cmp(&b.id));
+        let more = found.len() > request.limit;
+        found.truncate(request.limit);
+        Ok(QueryPage {
+            next_cursor: more
+                .then(|| found.last().map(|entity| entity.id.clone()))
+                .flatten(),
+            entities: found.into_iter().cloned().collect(),
+        })
+    }
+
     /// Remove every expired entity; returns how many were removed.
     pub fn sweep_expired(&self, now_ms: i64) -> Result<usize, IndexError> {
         let namespaces: Vec<Arc<NamespaceState>> = self
@@ -489,4 +567,24 @@ fn existing(
         .map_err(|_| IndexError::Poisoned)?
         .get(collection)
         .cloned())
+}
+
+/// Entities whose boxes meet any window, each once.
+fn candidates<'a>(partition: &'a Partition, windows: &[BoundingBox]) -> Vec<&'a Entity> {
+    let mut seen = HashSet::new();
+    let mut found = Vec::new();
+    for window in windows {
+        let envelope = AABB::from_corners(
+            [window.min_lon, window.min_lat],
+            [window.max_lon, window.max_lat],
+        );
+        for hit in partition.tree.locate_in_envelope_intersecting(envelope) {
+            if seen.insert(hit.data.as_str())
+                && let Some(entity) = partition.entities.get(&hit.data)
+            {
+                found.push(entity);
+            }
+        }
+    }
+    found
 }
