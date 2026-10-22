@@ -11,6 +11,14 @@ service Ezu {
   rpc Get(GetRequest) returns (GetResponse);
   rpc Query(QueryRequest) returns (QueryResponse);
   rpc Status(StatusRequest) returns (StatusResponse);
+  // Add or replace a fence by id.
+  rpc PutFence(PutFenceRequest) returns (PutFenceResponse);
+  rpc GetFence(GetFenceRequest) returns (GetFenceResponse);
+  // Remove a fence; its members raise no exit events.
+  rpc DeleteFence(DeleteFenceRequest) returns (DeleteFenceResponse);
+  rpc ListFences(ListFencesRequest) returns (ListFencesResponse);
+  // Recent fence events, oldest first.
+  rpc ListEvents(ListEventsRequest) returns (ListEventsResponse);
 }
 
 // Longitude and latitude in WGS 84 degrees.
@@ -161,4 +169,90 @@ message StatusResponse {
   // The caller's namespace, as its identity maps it.
   string namespace = 2;
   uint64 entity_count = 3;
+}
+
+// A static geofence. An entity is inside while its geometry intersects the
+// shape and it passes the selector: one of `collections` (any when empty)
+// and every filter.
+message Fence {
+  string id = 1;
+  oneof shape {
+    Radius circle = 2;
+    Polygon polygon = 3;
+  }
+  repeated string collections = 4;
+  repeated Filter filters = 5;
+  // Raise a dwell event once per stay, this long after entering.
+  optional int64 dwell_ms = 6;
+  // Raise inside events on updates while inside, at most this many per
+  // second for the fence. None when absent.
+  optional uint32 inside_per_second = 7;
+}
+
+message PutFenceRequest {
+  Fence fence = 1;
+}
+
+message PutFenceResponse {
+  bool replaced = 1;
+}
+
+message GetFenceRequest {
+  string id = 1;
+}
+
+message GetFenceResponse {
+  // Absent when the fence does not exist.
+  Fence fence = 1;
+}
+
+message DeleteFenceRequest {
+  string id = 1;
+}
+
+message DeleteFenceResponse {
+  bool removed = 1;
+}
+
+message ListFencesRequest {
+  // Fences after this id, in id order.
+  string after_id = 1;
+  uint32 limit = 2;
+}
+
+message ListFencesResponse {
+  repeated Fence fences = 1;
+}
+
+enum EventKind {
+  EVENT_KIND_UNSPECIFIED = 0;
+  EVENT_KIND_ENTER = 1;
+  EVENT_KIND_EXIT = 2;
+  EVENT_KIND_INSIDE = 3;
+  EVENT_KIND_DWELL = 4;
+}
+
+// An event is identified by (lsn, index): the write that raised it and its
+// place among that write's events. Ids only grow.
+message FenceEvent {
+  uint64 lsn = 1;
+  uint32 index = 2;
+  string fence = 3;
+  string collection = 4;
+  string entity = 5;
+  EventKind kind = 6;
+  // The entity's observation time, Unix milliseconds.
+  int64 ts_ms = 7;
+  Position position = 8;
+}
+
+message ListEventsRequest {
+  // Events after this id; from the oldest kept when absent.
+  optional uint64 after_lsn = 1;
+  uint32 after_index = 2;
+  uint32 limit = 3;
+}
+
+message ListEventsResponse {
+  repeated FenceEvent events = 1;
 }

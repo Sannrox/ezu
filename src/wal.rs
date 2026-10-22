@@ -13,12 +13,15 @@
 
 use crate::codec::{CodecError, Reader, Writer, decode_entity, encode_entity};
 use crate::entity::{Entity, Namespace};
+use crate::fence::{Fence, decode_fence, encode_fence};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 4] = b"EZUW";
 /// Version 2 adds sealed records; version 1 segments are still read.
+/// Fence records came without a version change: a binary from before them
+/// refuses a log that holds them, and only then.
 const VERSION: u32 = 2;
 const HEADER: u64 = 8;
 /// Largest record payload; a frame claiming more is damage, not data.
@@ -40,8 +43,8 @@ pub enum Entry {
 impl Entry {
     pub fn namespace(&self) -> &Namespace {
         match self {
-            Self::Op(Op::Upsert(ns, _)) => ns,
-            Self::Op(Op::Delete { namespace, .. }) | Self::Sealed { namespace, .. } => namespace,
+            Self::Op(op) => op.namespace(),
+            Self::Sealed { namespace, .. } => namespace,
         }
     }
 }
@@ -73,6 +76,20 @@ pub enum Op {
         collection: String,
         id: String,
     },
+    FencePut(Namespace, Fence),
+    FenceDelete {
+        namespace: Namespace,
+        id: String,
+    },
+}
+
+impl Op {
+    pub fn namespace(&self) -> &Namespace {
+        match self {
+            Self::Upsert(ns, _) | Self::FencePut(ns, _) => ns,
+            Self::Delete { namespace, .. } | Self::FenceDelete { namespace, .. } => namespace,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -119,12 +136,24 @@ fn encode(lsn: u64, op: &Op) -> Vec<u8> {
             out.str(collection);
             out.str(id);
         }
+        Op::FencePut(ns, fence) => {
+            out.u8(FENCE_PUT);
+            out.str(ns.as_str());
+            encode_fence(&mut out, fence);
+        }
+        Op::FenceDelete { namespace, id } => {
+            out.u8(FENCE_DELETE);
+            out.str(namespace.as_str());
+            out.str(id);
+        }
     }
     out.0
 }
 
 const COMMIT: u8 = 0xC0;
 const SEALED: u8 = 3;
+const FENCE_PUT: u8 = 4;
+const FENCE_DELETE: u8 = 5;
 
 enum Frame {
     Record(u64, Entry),
@@ -180,6 +209,14 @@ fn decode(payload: &[u8]) -> Result<Frame, CodecError> {
         2 => Op::Delete {
             namespace: Namespace::stored(input.str()?),
             collection: input.str()?,
+            id: input.str()?,
+        },
+        FENCE_PUT => {
+            let ns = Namespace::stored(input.str()?);
+            Op::FencePut(ns, decode_fence(&mut input)?)
+        }
+        FENCE_DELETE => Op::FenceDelete {
+            namespace: Namespace::stored(input.str()?),
             id: input.str()?,
         },
         _ => return Err(CodecError("op")),
@@ -359,10 +396,7 @@ impl Wal {
             let plain = encode(lsn, op);
             let payload = match seal(lsn, op, &plain).map_err(WalError::Seal)? {
                 Some((dek_id, body)) => {
-                    let namespace = match op {
-                        Op::Upsert(ns, _) => ns,
-                        Op::Delete { namespace, .. } => namespace,
-                    };
+                    let namespace = op.namespace();
                     sealed_payload(lsn, namespace.as_str(), &dek_id, &body)
                 }
                 None => plain,
@@ -457,7 +491,7 @@ fn read_segment(path: &Path, last: bool, records: &mut Vec<Record>) -> Result<()
         )));
     }
     let version = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-    if version != 1 && version != VERSION {
+    if !(1..=VERSION).contains(&version) {
         return Err(WalError::Corrupt(format!(
             "{}: format version {version}",
             path.display()

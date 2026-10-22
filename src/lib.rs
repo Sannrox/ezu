@@ -6,6 +6,7 @@ pub mod auth;
 mod codec;
 pub mod durable;
 pub mod entity;
+pub mod fence;
 pub mod geometry;
 pub mod index;
 pub mod keys;

@@ -80,6 +80,7 @@ async fn run() -> Result<(), String> {
             segment_bytes: 64 << 20,
             snapshot_every_records: 1_000_000,
             snapshot_every_ms: 10 * 60 * 1000,
+            events_retained: 100_000,
             keys: None,
         },
         Quotas {
@@ -87,6 +88,7 @@ async fn run() -> Result<(), String> {
             max_collections: 1_000,
             max_vertices: 10_000,
             max_updates_per_second: 100_000,
+            max_fences: 100_000,
         },
         None,
         now,

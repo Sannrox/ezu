@@ -19,7 +19,8 @@ The contract is the versioned protobuf in `proto/ezu/v1/ezu.proto`: upsert,
 delete, get, query (bbox, radius, polygon contains/intersects, nearest) and
 status. One listener serves it over gRPC and as HTTP/JSON:
 `POST /v1/entities`, `GET|DELETE /v1/entities/{collection}/{id}`,
-`POST /v1/query`, `GET /v1/status`. JSON bodies are the same messages in
+`POST /v1/query`, `GET /v1/status`, `GET /v1/fences`,
+`PUT|GET|DELETE /v1/fences/{id}` and `GET /v1/events`. JSON bodies are the same messages in
 snake_case; a oneof is an object naming its variant.
 
 Every request carries `authorization: Bearer <token>`. The namespace comes
@@ -35,6 +36,19 @@ other authorization decision. Authentication is one of:
 `EZU_TLS_CERT` and `EZU_TLS_KEY` serve over TLS; `EZU_TLS_CLIENT_CA` adds
 mutual TLS. The server needs `EZU_DATA_DIR` and listens on `EZU_LISTEN`
 (default `127.0.0.1:7600`); it refuses to start without authentication.
+
+## Geofences
+
+A fence is a circle or polygon with a selector (collections, field
+filters). Every logged entity write is tested against the fences whose
+bounds it touches, through an R-tree over fence bounds, and raises `enter`,
+`exit` (also on delete and expiry), `dwell` once per stay after `dwell_ms`,
+and, for fences that ask, `inside` capped at `inside_per_second` per fence.
+An event's id is the LSN of the write that raised it plus its index in that
+write. Memberships are logged state and part of snapshots, so a restart
+neither re-enters nor resets dwell timers, and replay raises the same events
+with the same ids. Recent events are kept in memory per namespace
+(`events_retained`) and read with `ListEvents` from a last-seen id.
 
 ## Encryption at rest
 

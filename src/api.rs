@@ -6,19 +6,21 @@
 //! HTTP routes (JSON bodies are the protobuf messages in snake_case, oneofs
 //! as `{"variant": {...}}`):
 //! `POST /v1/entities`, `GET|DELETE /v1/entities/{collection}/{id}`,
-//! `POST /v1/query`, `GET /v1/status`.
+//! `POST /v1/query`, `GET /v1/status`, `GET /v1/fences`,
+//! `PUT|GET|DELETE /v1/fences/{id}` and `GET /v1/events`.
 
 use crate::auth::{AuthError, Authenticator, bearer};
 use crate::durable::{DurableEngine, DurableError};
 use crate::entity::{Entity, FieldValue, Namespace};
+use crate::fence::{EventKind, Fence, FenceEvent, Shape};
 use crate::geometry::{Geometry, Position};
 use crate::index::{IndexError, Upsert};
-use crate::query::{Filter, Query, QueryRequest, Relation};
+use crate::query::{Filter, MAX_LIMIT, Query, QueryRequest, Relation};
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query as Params, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -66,7 +68,8 @@ impl From<IndexError> for ApiError {
             IndexError::EntityQuota { .. }
             | IndexError::CollectionQuota { .. }
             | IndexError::VertexQuota { .. }
-            | IndexError::RateQuota { .. } => tonic::Code::ResourceExhausted,
+            | IndexError::RateQuota { .. }
+            | IndexError::FenceQuota { .. } => tonic::Code::ResourceExhausted,
             IndexError::Poisoned => tonic::Code::Unavailable,
         };
         Self::new(code, error.to_string())
@@ -237,8 +240,17 @@ fn query_request(request: proto::QueryRequest) -> Result<QueryRequest, ApiError>
         },
         None => return Err(ApiError::invalid("a query is required")),
     };
-    let filters = request
-        .filters
+    Ok(QueryRequest {
+        collection: request.collection,
+        query,
+        filters: filters(request.filters)?,
+        limit: request.limit as usize,
+        cursor: (!request.cursor.is_empty()).then_some(request.cursor),
+    })
+}
+
+fn filters(filters: Vec<proto::Filter>) -> Result<Vec<Filter>, ApiError> {
+    filters
         .into_iter()
         .map(|filter| {
             use proto::filter::Test;
@@ -252,14 +264,101 @@ fn query_request(request: proto::QueryRequest) -> Result<QueryRequest, ApiError>
                 None => return Err(ApiError::invalid("a filter needs a test")),
             })
         })
-        .collect::<Result<_, ApiError>>()?;
-    Ok(QueryRequest {
-        collection: request.collection,
-        query,
-        filters,
-        limit: request.limit as usize,
-        cursor: (!request.cursor.is_empty()).then_some(request.cursor),
+        .collect()
+}
+
+fn to_filter(filter: Filter) -> proto::Filter {
+    use proto::filter::Test;
+    match filter {
+        Filter::Eq(field, value) => proto::Filter {
+            field,
+            test: Some(Test::Equals(to_field_value(value))),
+        },
+        Filter::Range { field, min, max } => proto::Filter {
+            field,
+            test: Some(Test::Range(proto::Range { min, max })),
+        },
+    }
+}
+
+fn to_position(p: Position) -> proto::Position {
+    proto::Position {
+        lon: p.lon,
+        lat: p.lat,
+    }
+}
+
+fn fence(fence: Option<proto::Fence>) -> Result<Fence, ApiError> {
+    use proto::fence::Shape as Kind;
+    let fence = fence.ok_or_else(|| ApiError::invalid("a fence is required"))?;
+    let shape = match fence.shape {
+        Some(Kind::Circle(circle)) => Shape::Circle {
+            center: position(circle.center)?,
+            meters: circle.meters,
+        },
+        Some(Kind::Polygon(p)) => Shape::Polygon(polygon(Some(p))?),
+        None => return Err(ApiError::invalid("a fence needs a shape")),
+    };
+    Ok(Fence {
+        id: fence.id,
+        shape,
+        collections: fence.collections,
+        filters: filters(fence.filters)?,
+        dwell_ms: fence.dwell_ms,
+        inside_per_second: fence.inside_per_second,
     })
+}
+
+fn to_fence(fence: Fence) -> proto::Fence {
+    use proto::fence::Shape as Kind;
+    proto::Fence {
+        id: fence.id,
+        shape: Some(match fence.shape {
+            Shape::Circle { center, meters } => Kind::Circle(proto::Radius {
+                center: Some(to_position(center)),
+                meters,
+            }),
+            Shape::Polygon(rings) => Kind::Polygon(proto::Polygon {
+                rings: rings
+                    .into_iter()
+                    .map(|ring| proto::Ring {
+                        positions: ring.into_iter().map(to_position).collect(),
+                    })
+                    .collect(),
+            }),
+        }),
+        collections: fence.collections,
+        filters: fence.filters.into_iter().map(to_filter).collect(),
+        dwell_ms: fence.dwell_ms,
+        inside_per_second: fence.inside_per_second,
+    }
+}
+
+fn to_event(event: FenceEvent) -> proto::FenceEvent {
+    let kind = match event.kind {
+        EventKind::Enter => proto::EventKind::Enter,
+        EventKind::Exit => proto::EventKind::Exit,
+        EventKind::Inside => proto::EventKind::Inside,
+        EventKind::Dwell => proto::EventKind::Dwell,
+    };
+    proto::FenceEvent {
+        lsn: event.lsn,
+        index: event.index,
+        fence: event.fence,
+        collection: event.collection,
+        entity: event.entity,
+        kind: kind as i32,
+        ts_ms: event.ts_ms,
+        position: Some(to_position(event.position)),
+    }
+}
+
+/// A page size: the requested one, or the largest when none is given.
+fn page(limit: u32) -> usize {
+    match limit {
+        0 => MAX_LIMIT,
+        limit => (limit as usize).min(MAX_LIMIT),
+    }
 }
 
 /// The shared core both transports call.
@@ -398,6 +497,79 @@ impl Api {
     }
 }
 
+impl Api {
+    pub async fn put_fence(
+        &self,
+        authorization: Option<&str>,
+        request: proto::PutFenceRequest,
+    ) -> Result<proto::PutFenceResponse, ApiError> {
+        let ns = self.namespace(authorization)?;
+        let fence = fence(request.fence)?;
+        let replaced = self
+            .blocking(move |engine| Ok(engine.put_fence(&ns, fence, now_ms())?))
+            .await?;
+        Ok(proto::PutFenceResponse { replaced })
+    }
+
+    pub async fn get_fence(
+        &self,
+        authorization: Option<&str>,
+        request: proto::GetFenceRequest,
+    ) -> Result<proto::GetFenceResponse, ApiError> {
+        let ns = self.namespace(authorization)?;
+        let found = self
+            .blocking(move |engine| Ok(engine.get_fence(&ns, &request.id)?))
+            .await?;
+        Ok(proto::GetFenceResponse {
+            fence: found.map(to_fence),
+        })
+    }
+
+    pub async fn delete_fence(
+        &self,
+        authorization: Option<&str>,
+        request: proto::DeleteFenceRequest,
+    ) -> Result<proto::DeleteFenceResponse, ApiError> {
+        let ns = self.namespace(authorization)?;
+        let removed = self
+            .blocking(move |engine| Ok(engine.delete_fence(&ns, &request.id, now_ms())?))
+            .await?;
+        Ok(proto::DeleteFenceResponse { removed })
+    }
+
+    pub async fn list_fences(
+        &self,
+        authorization: Option<&str>,
+        request: proto::ListFencesRequest,
+    ) -> Result<proto::ListFencesResponse, ApiError> {
+        let ns = self.namespace(authorization)?;
+        let fences = self
+            .blocking(move |engine| {
+                let after = (!request.after_id.is_empty()).then_some(request.after_id.as_str());
+                Ok(engine.list_fences(&ns, after, page(request.limit))?)
+            })
+            .await?;
+        Ok(proto::ListFencesResponse {
+            fences: fences.into_iter().map(to_fence).collect(),
+        })
+    }
+
+    pub async fn list_events(
+        &self,
+        authorization: Option<&str>,
+        request: proto::ListEventsRequest,
+    ) -> Result<proto::ListEventsResponse, ApiError> {
+        let ns = self.namespace(authorization)?;
+        let after = request.after_lsn.map(|lsn| (lsn, request.after_index));
+        let events = self
+            .blocking(move |engine| Ok(engine.events(&ns, after, page(request.limit))?))
+            .await?;
+        Ok(proto::ListEventsResponse {
+            events: events.into_iter().map(to_event).collect(),
+        })
+    }
+}
+
 fn metadata_auth<T>(request: &tonic::Request<T>) -> Option<String> {
     request
         .metadata()
@@ -457,6 +629,55 @@ impl Ezu for Api {
             Api::status(self, auth.as_deref()).await?,
         ))
     }
+    async fn put_fence(
+        &self,
+        request: tonic::Request<proto::PutFenceRequest>,
+    ) -> Result<tonic::Response<proto::PutFenceResponse>, tonic::Status> {
+        let auth = metadata_auth(&request);
+        Ok(tonic::Response::new(
+            Api::put_fence(self, auth.as_deref(), request.into_inner()).await?,
+        ))
+    }
+
+    async fn get_fence(
+        &self,
+        request: tonic::Request<proto::GetFenceRequest>,
+    ) -> Result<tonic::Response<proto::GetFenceResponse>, tonic::Status> {
+        let auth = metadata_auth(&request);
+        Ok(tonic::Response::new(
+            Api::get_fence(self, auth.as_deref(), request.into_inner()).await?,
+        ))
+    }
+
+    async fn delete_fence(
+        &self,
+        request: tonic::Request<proto::DeleteFenceRequest>,
+    ) -> Result<tonic::Response<proto::DeleteFenceResponse>, tonic::Status> {
+        let auth = metadata_auth(&request);
+        Ok(tonic::Response::new(
+            Api::delete_fence(self, auth.as_deref(), request.into_inner()).await?,
+        ))
+    }
+
+    async fn list_fences(
+        &self,
+        request: tonic::Request<proto::ListFencesRequest>,
+    ) -> Result<tonic::Response<proto::ListFencesResponse>, tonic::Status> {
+        let auth = metadata_auth(&request);
+        Ok(tonic::Response::new(
+            Api::list_fences(self, auth.as_deref(), request.into_inner()).await?,
+        ))
+    }
+
+    async fn list_events(
+        &self,
+        request: tonic::Request<proto::ListEventsRequest>,
+    ) -> Result<tonic::Response<proto::ListEventsResponse>, tonic::Status> {
+        let auth = metadata_auth(&request);
+        Ok(tonic::Response::new(
+            Api::list_events(self, auth.as_deref(), request.into_inner()).await?,
+        ))
+    }
 }
 
 fn header_auth(headers: &HeaderMap) -> Option<&str> {
@@ -509,6 +730,62 @@ pub fn http_router(api: Api) -> axum::Router {
                  headers: HeaderMap,
                  Json(body): Json<proto::QueryRequest>| async move {
                     api.query(header_auth(&headers), body).await.map(Json)
+                },
+            ),
+        )
+        .route(
+            "/v1/fences",
+            get(
+                |State(api): State<Api>,
+                 headers: HeaderMap,
+                 Params(params): Params<proto::ListFencesRequest>| async move {
+                    api.list_fences(header_auth(&headers), params)
+                        .await
+                        .map(Json)
+                },
+            ),
+        )
+        .route(
+            "/v1/fences/{id}",
+            put(
+                |State(api): State<Api>,
+                 headers: HeaderMap,
+                 Path(id): Path<String>,
+                 Json(mut body): Json<proto::Fence>| async move {
+                    // The path names the fence.
+                    body.id = id;
+                    api.put_fence(
+                        header_auth(&headers),
+                        proto::PutFenceRequest { fence: Some(body) },
+                    )
+                    .await
+                    .map(Json)
+                },
+            )
+            .get(
+                |State(api): State<Api>, headers: HeaderMap, Path(id): Path<String>| async move {
+                    api.get_fence(header_auth(&headers), proto::GetFenceRequest { id })
+                        .await
+                        .map(Json)
+                },
+            )
+            .delete(
+                |State(api): State<Api>, headers: HeaderMap, Path(id): Path<String>| async move {
+                    api.delete_fence(header_auth(&headers), proto::DeleteFenceRequest { id })
+                        .await
+                        .map(Json)
+                },
+            ),
+        )
+        .route(
+            "/v1/events",
+            get(
+                |State(api): State<Api>,
+                 headers: HeaderMap,
+                 Params(params): Params<proto::ListEventsRequest>| async move {
+                    api.list_events(header_auth(&headers), params)
+                        .await
+                        .map(Json)
                 },
             ),
         )

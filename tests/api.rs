@@ -52,6 +52,7 @@ async fn server_with(
             segment_bytes: 1 << 20,
             snapshot_every_records: 10_000,
             snapshot_every_ms: i64::MAX,
+            events_retained: 1_000,
             keys: None,
         },
         Quotas {
@@ -59,6 +60,7 @@ async fn server_with(
             max_collections: 4,
             max_vertices: 64,
             max_updates_per_second: 10_000,
+            max_fences: 1_000,
         },
         None,
         0,
@@ -347,4 +349,41 @@ async fn an_http_1_1_client_reaches_the_json_api_over_tls() {
     let response = String::from_utf8_lossy(&response);
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     assert!(response.contains("tenant-a"), "{response}");
+}
+
+#[tokio::test]
+async fn fences_and_their_events_are_served_per_namespace_over_http() {
+    let (address, _stop) = server().await;
+    let (a, b) = (token("tenant-a"), token("tenant-b"));
+    let fence = r#"{"shape":{"circle":{"center":{"lon":10.0,"lat":50.0},"meters":500}},"collections":["ships"]}"#;
+    let (code, body) = http(&address, "PUT", "/v1/fences/harbour", Some(&a), fence).await;
+    assert_eq!(code, 200, "{body}");
+    let entity = r#"{"entities":[{"collection":"ships","id":"h1","geometry":{"shape":{"point":{"lon":10.0,"lat":50.0}}},"ts_ms":7}]}"#;
+    http(&address, "POST", "/v1/entities", Some(&a), entity).await;
+    let (code, body) = http(&address, "GET", "/v1/events?limit=10", Some(&a), "").await;
+    assert_eq!(code, 200, "{body}");
+    assert!(
+        body.contains("\"harbour\"") && body.contains("\"kind\":1") && body.contains("\"ts_ms\":7"),
+        "{body}"
+    );
+    // Resuming after the last event returns nothing new.
+    let lsn = body
+        .split("\"lsn\":")
+        .nth(1)
+        .unwrap()
+        .split(',')
+        .next()
+        .unwrap();
+    let path = format!("/v1/events?after_lsn={lsn}&after_index=0");
+    let (_, body) = http(&address, "GET", &path, Some(&a), "").await;
+    assert!(!body.contains("harbour"), "{body}");
+    let (_, body) = http(&address, "GET", "/v1/fences", Some(&a), "").await;
+    assert!(body.contains("\"harbour\""), "{body}");
+    let (_, body) = http(&address, "GET", "/v1/fences/harbour", Some(&b), "").await;
+    assert!(!body.contains("harbour"), "{body}");
+    let (_, body) = http(&address, "GET", "/v1/events", Some(&b), "").await;
+    assert!(!body.contains("harbour"), "{body}");
+    let (code, body) = http(&address, "DELETE", "/v1/fences/harbour", Some(&a), "").await;
+    assert_eq!(code, 200);
+    assert!(body.contains("true"), "{body}");
 }

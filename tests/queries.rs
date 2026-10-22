@@ -83,6 +83,7 @@ fn fixture(rng: &mut Rng) -> (Engine, Namespace, Vec<Entity>) {
         max_collections: 4,
         max_vertices: 64,
         max_updates_per_second: 1_000_000,
+        max_fences: 1_000,
     });
     let ns = Namespace::of(&Identity::authenticated("svc", "t"));
     let entities: Vec<Entity> = (0..1_500)
