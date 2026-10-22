@@ -27,7 +27,7 @@ crc32fast = "1"
 rstar = "0.13"
 aes-gcm = "0.10"
 rand = "0.8"
-sekai-keys = { git = "https://github.com/Sannrox/sekai-chisei.git", rev = "ab44e5da642e5f3c74c635b32607f42eb8d043b2" }
+sekai-keys = { git = "https://github.com/Sannrox/sekai-chisei.git", rev = "ab44e5da642e5f3c74c635b32607f42eb8d043b2", version = "1" }
 
 [build-dependencies]
 protoc-bin-vendored = "3"

@@ -32,3 +32,16 @@ jobs:
         with:
           components: clippy
       - run: cargo clippy --all-targets --locked -- -D warnings
+  deny:
+    name: Licenses & advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+      # Optional backends are gated on their own: every feature enabled.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses
+          arguments: --all-features
