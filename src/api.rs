@@ -12,7 +12,9 @@
 //! `POST /v1/query`, `GET /v1/status`, `GET /v1/fences`,
 //! `PUT|GET|DELETE /v1/fences/{id}` and `GET /v1/events`. A read's label
 //! filter is the `label_filter` of a JSON body or, for reads without one,
-//! the `x-ezu-readable-labels` header. `GET /healthz`
+//! the `x-ezu-readable-labels` header. `POST /v1/packages` renders an
+//! offline map package (see [`crate::tiles`]): the PMTiles archive as the
+//! body, its manifest as JSON in `x-ezu-package-manifest`. `GET /healthz`
 //! and `GET /metrics` (Prometheus text, aggregated over namespaces) take no
 //! token.
 
@@ -703,6 +705,36 @@ impl Api {
     }
 }
 
+/// A map package request: region `[west, south, east, north]`, the zoom
+/// range, and the reader's label filter as in queries.
+#[derive(Debug, serde::Deserialize)]
+pub struct PackageBody {
+    pub region: [f64; 4],
+    pub min_zoom: u8,
+    pub max_zoom: u8,
+    #[serde(default)]
+    pub label_filter: Option<proto::LabelFilter>,
+}
+
+impl Api {
+    /// Render an offline map package: the PMTiles archive and its manifest.
+    pub async fn package(
+        &self,
+        authorization: Option<&str>,
+        body: PackageBody,
+    ) -> Result<(Vec<u8>, crate::tiles::Manifest), ApiError> {
+        let ns = self.namespace(authorization)?;
+        let request = crate::tiles::PackageRequest {
+            region: body.region,
+            min_zoom: body.min_zoom,
+            max_zoom: body.max_zoom,
+            readable: self.readable(body.label_filter)?,
+        };
+        self.blocking(move |engine| Ok(crate::tiles::package(engine, &ns, &request, now_ms())?))
+            .await
+    }
+}
+
 pub(crate) fn metadata_auth<T>(request: &tonic::Request<T>) -> Option<String> {
     request
         .metadata()
@@ -1003,6 +1035,31 @@ pub fn http_router(api: Api) -> axum::Router {
             get(|State(api): State<Api>, headers: HeaderMap| async move {
                 api.status(header_auth(&headers)).await.map(Json)
             }),
+        )
+        .route(
+            "/v1/packages",
+            post(
+                |State(api): State<Api>,
+                 headers: HeaderMap,
+                 Json(body): Json<PackageBody>| async move {
+                    let (archive, manifest) = api.package(header_auth(&headers), body).await?;
+                    let manifest = serde_json::to_string(&manifest)
+                        .map_err(|error| ApiError::new(tonic::Code::Internal, error.to_string()))?;
+                    Ok::<_, ApiError>((
+                        [
+                            (
+                                axum::http::header::CONTENT_TYPE,
+                                "application/vnd.pmtiles".to_string(),
+                            ),
+                            (
+                                axum::http::HeaderName::from_static("x-ezu-package-manifest"),
+                                manifest,
+                            ),
+                        ],
+                        archive,
+                    ))
+                },
+            ),
         )
         // Probes and scrapes carry no token; neither reveals tenant data.
         .route(

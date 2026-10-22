@@ -98,6 +98,11 @@ impl FenceEvent {
 }
 
 impl Fence {
+    /// Bounding boxes that hold the shape, split at the antimeridian.
+    pub fn boxes(&self) -> Vec<BoundingBox> {
+        windows(&self.query())
+    }
+
     fn query(&self) -> Query {
         match &self.shape {
             Shape::Circle { center, meters } => Query::Radius {

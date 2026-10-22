@@ -484,6 +484,43 @@ impl Engine {
         Ok(found)
     }
 
+    /// Visit each live entity of `collection` whose bounds meet `window`
+    /// (`[west, south, east, north]`) and that `readable` may see, once,
+    /// under the partition's read lock; nothing is cloned for the caller.
+    /// `visit` returns false to stop. True when every entity was visited.
+    pub(crate) fn visit_region(
+        &self,
+        ns: &Namespace,
+        collection: &str,
+        [west, south, east, north]: [f64; 4],
+        readable: Option<&crate::entity::Labels>,
+        now_ms: i64,
+        visit: &mut dyn FnMut(&Entity) -> bool,
+    ) -> Result<bool, IndexError> {
+        let Some(partition) = self.existing_partition(ns, collection)? else {
+            return Ok(true);
+        };
+        let partition = partition.read().map_err(|_| IndexError::Poisoned)?;
+        let mut seen = HashSet::new();
+        for window in query_boxes(west, south, east, north) {
+            let envelope = AABB::from_corners(
+                [window.min_lon, window.min_lat],
+                [window.max_lon, window.max_lat],
+            );
+            for hit in partition.tree.locate_in_envelope_intersecting(envelope) {
+                if seen.insert(hit.data.as_str())
+                    && let Some(entity) = partition.entities.get(&hit.data)
+                    && !entity.expired(now_ms)
+                    && crate::entity::visible(&entity.labels, readable)
+                    && !visit(entity)
+                {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
     /// Run a spatial query. Results are live entities matching every filter,
     /// in id order with a cursor for the next page, or for `Nearest` the `k`
     /// closest by distance then id.
@@ -608,6 +645,28 @@ impl Engine {
     }
 
     /// Live and expired-but-unswept entities counted against the quota.
+    /// The collections of `ns`, in name order.
+    pub fn collections(&self, ns: &Namespace) -> Result<Vec<String>, IndexError> {
+        let Some(state) = self
+            .namespaces
+            .read()
+            .map_err(|_| IndexError::Poisoned)?
+            .get(ns)
+            .cloned()
+        else {
+            return Ok(Vec::new());
+        };
+        let mut names: Vec<String> = state
+            .collections
+            .read()
+            .map_err(|_| IndexError::Poisoned)?
+            .keys()
+            .cloned()
+            .collect();
+        names.sort();
+        Ok(names)
+    }
+
     /// Entities across every namespace.
     pub fn total_entities(&self) -> Result<usize, IndexError> {
         Ok(self
