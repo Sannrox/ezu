@@ -7,3 +7,4 @@ description = "Live spatial engine: an index over moving entities, spatial queri
 publish = false
 
 [dependencies]
+rstar = "0.13"
