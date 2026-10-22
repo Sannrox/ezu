@@ -5,7 +5,8 @@
 set -euo pipefail
 binary=$(realpath "$1")
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+# The server runs as root inside the namespace, so its files need sudo too.
+trap 'sudo rm -rf "$work"' EXIT
 printf 'offline-check-token' > "$work/token"
 sudo unshare --net bash -euo pipefail -c '
   ip link set lo up
