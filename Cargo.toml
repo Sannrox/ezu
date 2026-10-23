@@ -41,3 +41,9 @@ tonic-prost-build = "0.14"
 pmtiles = { version = "0.25", features = ["write", "mmap-async-tokio"] }
 base64 = "0.22"
 rcgen = "0.14"
+
+# Dependencies build without debug info in dev and test builds: backtraces
+# and debuggers keep full detail for workspace crates, and build directories
+# stay a fraction of the size.
+[profile.dev.package."*"]
+debug = false
