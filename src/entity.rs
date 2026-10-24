@@ -18,7 +18,7 @@ pub type Labels = BTreeSet<String>;
 
 /// Whether something carrying `labels` is visible to a reader allowed
 /// `readable`; `None` means the reader gave no filter and sees everything.
-pub fn visible(labels: &Labels, readable: Option<&Labels>) -> bool {
+pub(crate) fn visible(labels: &Labels, readable: Option<&Labels>) -> bool {
     readable.is_none_or(|readable| labels.is_subset(readable))
 }
 
