@@ -92,7 +92,7 @@ pub struct FenceEvent {
 impl FenceEvent {
     /// Whether a reader allowed `readable` may see the event: it carries the
     /// labels of both the entity and the fence.
-    pub fn visible(&self, readable: Option<&Labels>) -> bool {
+    fn visible(&self, readable: Option<&Labels>) -> bool {
         visible(&self.entity_labels, readable) && visible(&self.fence_labels, readable)
     }
 }

@@ -270,7 +270,7 @@ fn lon_winding(ring: &[Position]) -> f64 {
 
 /// Query boxes for a window from `west` to `east`; a window with
 /// `west > east` wraps across the antimeridian and becomes two boxes.
-pub fn query_boxes(west: f64, south: f64, east: f64, north: f64) -> Vec<BoundingBox> {
+pub(crate) fn query_boxes(west: f64, south: f64, east: f64, north: f64) -> Vec<BoundingBox> {
     let make = |min_lon, max_lon| BoundingBox {
         min_lon,
         min_lat: south,

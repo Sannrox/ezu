@@ -155,7 +155,7 @@ pub(crate) fn invalid(query: &Query) -> Option<&'static str> {
 }
 
 /// Great-circle distance in metres.
-pub fn haversine(a: Position, b: Position) -> f64 {
+pub(crate) fn haversine(a: Position, b: Position) -> f64 {
     let (lat1, lat2) = (a.lat.to_radians(), b.lat.to_radians());
     let dlat = lat2 - lat1;
     // The short way round, so -180 and 180 are the same meridian.
@@ -486,7 +486,7 @@ fn segments(geometry: &Geometry) -> Vec<(Position, Position)> {
 }
 
 /// How `geometry` relates to the query polygon.
-pub fn relates(geometry: &Geometry, rings: &[Vec<Position>], relation: Relation) -> bool {
+pub(crate) fn relates(geometry: &Geometry, rings: &[Vec<Position>], relation: Relation) -> bool {
     let frame = Frame::new(rings);
     let points = vertices(geometry);
     let crossing = || {

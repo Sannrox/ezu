@@ -90,8 +90,9 @@ downstream-unblocking depth and then Issue number. Call this a deterministic
 presentation order, not project priority.
 
 Parallel candidates must not depend on each other or collide on a shared
-surface: ports and settings, governance adapters, the workspace jail, or the
-sekai-client proto pin. Read each candidate's affected boundary and scope;
+surface: the API listener and proto, auth hook, WAL/snapshot/key files,
+fences and events, packages, or governed label filters.
+Read each candidate's affected boundary and scope;
 when two candidates name the same surface, present them as sequential, not
 parallel, and report the collision for maintainer judgment.
 

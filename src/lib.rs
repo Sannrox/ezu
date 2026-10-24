@@ -12,7 +12,7 @@ pub mod flight;
 pub mod geometry;
 pub mod index;
 pub mod keys;
-pub mod metrics;
+mod metrics;
 pub mod query;
 mod snapshot;
 pub mod tiles;

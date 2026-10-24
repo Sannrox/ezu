@@ -708,7 +708,7 @@ impl Api {
 /// A map package request: region `[west, south, east, north]`, the zoom
 /// range, and the reader's label filter as in queries.
 #[derive(Debug, serde::Deserialize)]
-pub struct PackageBody {
+struct PackageBody {
     pub region: [f64; 4],
     pub min_zoom: u8,
     pub max_zoom: u8,
@@ -718,7 +718,7 @@ pub struct PackageBody {
 
 impl Api {
     /// Render an offline map package: the PMTiles archive and its manifest.
-    pub async fn package(
+    async fn package(
         &self,
         authorization: Option<&str>,
         body: PackageBody,
@@ -914,7 +914,7 @@ fn header_auth(headers: &HeaderMap) -> Option<&str> {
 }
 
 /// The HTTP/JSON routes.
-pub fn http_router(api: Api) -> axum::Router {
+fn http_router(api: Api) -> axum::Router {
     axum::Router::new()
         .route(
             "/v1/entities",
