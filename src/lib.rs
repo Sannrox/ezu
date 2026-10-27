@@ -9,6 +9,7 @@ pub mod durable;
 pub mod entity;
 pub mod fence;
 pub mod flight;
+pub mod follow;
 pub mod geometry;
 pub mod index;
 pub mod keys;
@@ -18,7 +19,7 @@ mod snapshot;
 pub mod tiles;
 mod wal;
 
-pub use durable::{DurabilityConfig, DurableEngine, DurableError, RebuildSource};
+pub use durable::{DurabilityConfig, DurableEngine, DurableError, RebuildSource, ReplicaError};
 pub use entity::{Entity, EntityError, FieldValue, Identity, Namespace};
 pub use geometry::{BoundingBox, Geometry, GeometryError, Position};
 pub use index::{Engine, IndexError, Quotas, Upsert};

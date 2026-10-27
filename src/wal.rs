@@ -27,6 +27,11 @@
 //! an owner of a release without epochs, which it cannot fence and refuses
 //! to promote past. Releases without epochs read only `.seg` files in `wal/`
 //! and ignore `EPOCH` and `OWNER`.
+//!
+//! A [`Tail`] reads the committed records of a live log in order, for
+//! shipping to a follower, without ever cutting anything off. A follower
+//! logs them again with [`Wal::append_shipped`], at the same LSNs, and
+//! takes its leader's epochs with [`Wal::follow_epoch`].
 
 use crate::codec::{
     CodecError, Reader, Writer, decode_entity, decode_labels, encode_entity, encode_labels,
@@ -445,6 +450,11 @@ impl Wal {
         let mut logged = 0;
         let next_lsn = if read {
             read_log(&found, floor, &mut records, &mut logged)?;
+            // What was read counts as durable from now on (followers are
+            // shipped it), even if the writer before never synced it.
+            if let Some((_, path)) = found.last() {
+                File::open(path)?.sync_all()?;
+            }
             records
                 .last()
                 .map_or(0, |record| record.lsn)
@@ -618,6 +628,57 @@ impl Wal {
         self.fenced(|wal| wal.append_unfenced(ops, seal))
     }
 
+    /// Append records shipped from a leader, their payloads exactly as
+    /// logged there, as one batch synced once; their LSNs must continue
+    /// this log. Returns the batch's last LSN.
+    pub fn append_shipped(&mut self, records: &[Record]) -> Result<u64, WalError> {
+        self.fenced(|wal| {
+            if wal.written >= wal.segment_bytes {
+                wal.rotate_unfenced()?;
+            }
+            let mut frames = Vec::new();
+            let mut lsn = wal.next_lsn;
+            for record in records {
+                if record.lsn != lsn {
+                    return Err(WalError::Corrupt(format!(
+                        "shipped record {} does not continue the log at {lsn}",
+                        record.lsn
+                    )));
+                }
+                frame(&record.payload, &mut frames);
+                lsn += 1;
+            }
+            wal.next_lsn = lsn;
+            wal.write_batch(frames)
+        })
+    }
+
+    /// Take `epoch`, past this writer's, as the log's: a follower following
+    /// its leader's promotion. The log is marked as the epoch format, the
+    /// epoch recorded in `EPOCH`, and a new segment begun, whose promotion
+    /// frame records it in the log.
+    pub fn follow_epoch(&mut self, epoch: u64) -> Result<(), WalError> {
+        if epoch <= self.epoch {
+            return Ok(());
+        }
+        self.epochs.0.lock()?;
+        let raised = (|| {
+            let directory = self.epochs.read()?;
+            if directory != self.epoch {
+                return Err(WalError::Fenced {
+                    epoch: self.epoch,
+                    directory,
+                });
+            }
+            mark_promoted(&self.dir)?;
+            self.epochs.write(epoch)
+        })();
+        self.epochs.0.unlock()?;
+        raised?;
+        self.epoch = epoch;
+        self.rotate()
+    }
+
     fn append_unfenced(&mut self, ops: &[Op], seal: &mut Sealer<'_>) -> Result<u64, WalError> {
         if self.written >= self.segment_bytes {
             self.rotate_unfenced()?;
@@ -639,6 +700,12 @@ impl Wal {
         // Sealing happened before any byte was written, so a refusal leaves
         // the log and its LSNs untouched.
         self.next_lsn = lsn;
+        self.write_batch(frames)
+    }
+
+    /// Write a batch's record frames, sync, then its commit frame for the
+    /// LSN before `next_lsn`, and sync again.
+    fn write_batch(&mut self, frames: Vec<u8>) -> Result<u64, WalError> {
         self.file.write_all(&frames)?;
         if self.fsync {
             self.file.sync_data()?;
@@ -669,13 +736,15 @@ impl Wal {
         Ok(())
     }
 
-    /// Remove segments whose records all have LSN at most `lsn`. The current
-    /// segment is kept.
+    /// Remove segments whose records all come before `lsn`. The segment
+    /// holding `lsn` itself is kept, so a follower that applied through it
+    /// can still prove it holds the same record (recovery skips it), and so
+    /// is the current segment.
     pub fn drop_through(&mut self, lsn: u64) -> Result<(), WalError> {
         let found = segments(&self.dir)?;
         for pair in found.windows(2) {
             let ((_, path), (next_first, _)) = (&pair[0], &pair[1]);
-            if *next_first <= lsn + 1 {
+            if *next_first <= lsn {
                 fs::remove_file(path)?;
             }
         }
@@ -985,6 +1054,255 @@ fn commit_after(bytes: &[u8], offset: usize) -> bool {
     })
 }
 
+/// A reader of the committed records of a live log in order, for shipping
+/// to a follower. It only reads: an unfinished batch at the end is left for
+/// a later read, never cut off. Committed bytes are never rewritten, so it
+/// resumes at the offset it reached.
+pub struct Tail {
+    dir: PathBuf,
+    /// The LSN of the last record handed out.
+    after: u64,
+    segment: Option<TailSegment>,
+    /// Committed records not handed out yet, with their epoch.
+    ready: std::collections::VecDeque<(u64, Record)>,
+}
+
+struct TailSegment {
+    first: u64,
+    file: File,
+    /// Where the frame after the last commit read begins.
+    offset: u64,
+    /// The epoch of this segment's records: its promotion frame's, or 0.
+    epoch: u64,
+}
+
+/// Why a tail cannot go on.
+#[derive(Debug)]
+pub enum TailError {
+    Wal(WalError),
+    /// The records after this LSN were dropped from the log (covered by a
+    /// snapshot), or never logged (a rebuild skipped past them).
+    Gone(u64),
+}
+
+impl From<WalError> for TailError {
+    fn from(error: WalError) -> Self {
+        Self::Wal(error)
+    }
+}
+
+impl From<io::Error> for TailError {
+    fn from(error: io::Error) -> Self {
+        Self::Wal(error.into())
+    }
+}
+
+impl Tail {
+    /// A tail of the log in `dir` from the record after `after`.
+    pub fn new(dir: &Path, after: u64) -> Self {
+        Self {
+            dir: dir.to_path_buf(),
+            after,
+            segment: None,
+            ready: Default::default(),
+        }
+    }
+
+    /// The LSN of the last record handed out.
+    pub fn after(&self) -> u64 {
+        self.after
+    }
+
+    /// The next committed records with LSNs up to `through` (what is
+    /// durable), all of one epoch, about `budget` payload bytes and at least
+    /// one record when any is ready; none when nothing new is.
+    pub fn next(&mut self, through: u64, budget: usize) -> Result<(u64, Vec<Record>), TailError> {
+        if self.ready.is_empty() {
+            self.fill(through)?;
+        }
+        let Some(epoch) = self.ready.front().map(|(epoch, _)| *epoch) else {
+            return Ok((self.segment.as_ref().map_or(0, |s| s.epoch), Vec::new()));
+        };
+        let mut records = Vec::new();
+        let mut bytes = 0;
+        while let Some((at, record)) = self.ready.front()
+            && *at == epoch
+            && record.lsn <= through
+            && (records.is_empty() || bytes < budget)
+        {
+            bytes += record.payload.len();
+            self.after = record.lsn;
+            records.push(record.clone());
+            self.ready.pop_front();
+        }
+        Ok((epoch, records))
+    }
+
+    /// Read committed records after `after`, up to `through`, into `ready`,
+    /// moving on to the next segment once this one is complete.
+    fn fill(&mut self, through: u64) -> Result<(), TailError> {
+        loop {
+            // Listed before reading: once a later segment exists, nothing is
+            // appended to the earlier one any more, so reading it to its end
+            // after the listing reads all of it.
+            let found = segments(&self.dir)?;
+            let wanted = self.after + 1;
+            let segment = match self.segment.take() {
+                Some(segment) => segment,
+                None => {
+                    let Some((first, path)) = found
+                        .iter()
+                        .rev()
+                        .find(|(first, _)| *first <= wanted)
+                        .cloned()
+                    else {
+                        return match found.first() {
+                            Some(_) => Err(TailError::Gone(self.after)),
+                            None => Ok(()),
+                        };
+                    };
+                    let file = File::open(&path)?;
+                    TailSegment {
+                        first,
+                        file,
+                        offset: HEADER,
+                        epoch: 0,
+                    }
+                }
+            };
+            let mut segment = segment;
+            let end = self.read(&mut segment, through)?;
+            let successor = found
+                .iter()
+                .find(|(first, _)| *first > segment.first)
+                .map(|(first, _)| *first);
+            let Some(next) = successor else {
+                self.segment = Some(segment);
+                return Ok(());
+            };
+            if !self.ready.is_empty() || end == End::Waiting {
+                self.segment = Some(segment);
+                return Ok(());
+            }
+            // This segment is final and read through; anything after its last
+            // commit is damage, and the next one must continue the log.
+            if end == End::Unfinished {
+                return Err(WalError::Corrupt(format!(
+                    "segment {}: damaged record before {next}",
+                    segment.first
+                ))
+                .into());
+            }
+            if next != wanted {
+                return Err(TailError::Gone(self.after));
+            }
+        }
+    }
+
+    /// Read `segment` from its offset to its end into `ready`, and how
+    /// what was read ends.
+    fn read(&mut self, segment: &mut TailSegment, through: u64) -> Result<End, TailError> {
+        let mut bytes = Vec::new();
+        segment.file.seek(SeekFrom::Start(0))?;
+        (&segment.file).take(HEADER).read_to_end(&mut bytes)?;
+        if bytes.len() < HEADER as usize {
+            // A header still being written: nothing to read yet.
+            return Ok(match bytes.is_empty() {
+                true => End::Clean,
+                false => End::Unfinished,
+            });
+        }
+        let version = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        if &bytes[..4] != MAGIC || !(1..=VERSION).contains(&version) {
+            return Err(WalError::Corrupt(format!("segment {}: header", segment.first)).into());
+        }
+        bytes.clear();
+        segment.file.seek(SeekFrom::Start(segment.offset))?;
+        segment.file.read_to_end(&mut bytes)?;
+        let mut pending: Vec<Record> = Vec::new();
+        let mut offset = 0;
+        let mut committed = 0;
+        let mut end = End::Clean;
+        while offset < bytes.len() {
+            let Some((frame, next)) = parse_frame(&bytes, offset) else {
+                // Unfinished: a batch still being written. Damage when a
+                // sound commit still follows.
+                if commit_after(&bytes, offset) {
+                    return Err(WalError::Corrupt(format!(
+                        "segment {}: damaged record",
+                        segment.first
+                    ))
+                    .into());
+                }
+                end = End::Unfinished;
+                break;
+            };
+            match frame {
+                Frame::Record(lsn, entry) => pending.push(Record {
+                    lsn,
+                    entry: *entry,
+                    payload: bytes[offset + 12..next].to_vec(),
+                }),
+                Frame::Commit(lsn) => {
+                    // Written but not yet durable: left for a later read.
+                    if lsn > through {
+                        end = End::Waiting;
+                        break;
+                    }
+                    if pending.last().map(|record| record.lsn) != Some(lsn) {
+                        return Err(WalError::Corrupt(format!(
+                            "segment {}: commit does not close its batch",
+                            segment.first
+                        ))
+                        .into());
+                    }
+                    for record in pending.drain(..) {
+                        let expected =
+                            self.ready.back().map_or(self.after, |(_, last)| last.lsn) + 1;
+                        if record.lsn < expected {
+                            continue;
+                        }
+                        if record.lsn > expected {
+                            return Err(TailError::Gone(expected - 1));
+                        }
+                        self.ready.push_back((segment.epoch, record));
+                    }
+                    committed = next;
+                }
+                Frame::Promote(epoch) => {
+                    if !pending.is_empty() {
+                        return Err(WalError::Corrupt(format!(
+                            "segment {}: promotion inside a batch",
+                            segment.first
+                        ))
+                        .into());
+                    }
+                    segment.epoch = epoch;
+                    committed = next;
+                }
+            }
+            offset = next;
+        }
+        if end == End::Clean && committed != bytes.len() {
+            // Whole record frames with no commit yet.
+            end = End::Unfinished;
+        }
+        segment.offset += committed as u64;
+        Ok(end)
+    }
+}
+
+/// How a tail's read of a segment ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum End {
+    /// At the end of a commit or promotion frame.
+    Clean,
+    /// At a commit not yet durable.
+    Waiting,
+    /// At an unfinished batch or frame.
+    Unfinished,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1023,6 +1341,43 @@ mod tests {
                 directory: 1
             })
         ));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_tail_hands_out_only_durable_commits_and_waits_at_an_unfinished_batch() {
+        let dir = std::env::temp_dir().join(format!(
+            "ezu-wal-tail-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let (mut wal, _) = Wal::open(&dir, 0, 1 << 20, false, true).unwrap();
+        let delete = |id: &str| Op::FenceDelete {
+            namespace: Namespace::stored("t".into()),
+            id: id.into(),
+        };
+        let mut plain = |_: u64, _: &Op, _: &[u8]| Ok(None);
+        wal.append(&[delete("a"), delete("b")], &mut plain).unwrap();
+        wal.append(&[delete("c")], &mut plain).unwrap();
+        let mut tail = Tail::new(&dir, 0);
+        // The second batch is written but not yet durable.
+        let (_, first) = tail.next(2, usize::MAX).unwrap();
+        assert_eq!(first.iter().map(|r| r.lsn).collect::<Vec<_>>(), [1, 2]);
+        assert!(tail.next(2, usize::MAX).unwrap().1.is_empty());
+        // A torn frame after it is an unfinished batch: left, not refused.
+        let segment = segments(&dir).unwrap().pop().unwrap().1;
+        let mut torn = Vec::new();
+        frame(&encode(4, &delete("d")), &mut torn);
+        OpenOptions::new()
+            .append(true)
+            .open(&segment)
+            .unwrap()
+            .write_all(&torn[..torn.len() - 3])
+            .unwrap();
+        let (_, second) = tail.next(3, usize::MAX).unwrap();
+        assert_eq!(second.iter().map(|r| r.lsn).collect::<Vec<_>>(), [3]);
+        assert!(tail.next(u64::MAX, usize::MAX).unwrap().1.is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -17,9 +17,14 @@
 //! body, its manifest as JSON in `x-ezu-package-manifest`. `GET /healthz`
 //! and `GET /metrics` (Prometheus text, aggregated over namespaces) take no
 //! token.
+//!
+//! The `Replication` gRPC service ships the committed log to followers. It
+//! carries every namespace, so it takes the replication token
+//! ([`Api::replication_token`]) and is refused without one. On a follower,
+//! every write is refused with `FAILED_PRECONDITION`.
 
-use crate::auth::{AuthError, Authenticator, bearer};
-use crate::durable::{DurableEngine, DurableError};
+use crate::auth::{AuthError, Authenticator, StaticToken, bearer};
+use crate::durable::{DurableEngine, DurableError, ReplicaError};
 use crate::entity::{Entity, FieldValue, Labels, Namespace};
 use crate::fence::{EventKind, Fence, FenceEvent, Shape};
 use crate::geometry::{Geometry, Position};
@@ -40,6 +45,7 @@ pub mod proto {
 }
 
 use proto::ezu_server::{Ezu, EzuServer};
+use proto::replication_server::{Replication, ReplicationServer};
 
 /// A refused request: a gRPC code and the same meaning over HTTP.
 #[derive(Debug)]
@@ -90,7 +96,15 @@ impl From<DurableError> for ApiError {
         match error {
             DurableError::Index(error) => error.into(),
             DurableError::TooLarge => Self::invalid(error.to_string()),
-            DurableError::Expired(_) => Self::new(tonic::Code::OutOfRange, error.to_string()),
+            DurableError::Expired(_) | DurableError::Replica(ReplicaError::Gone(_)) => {
+                Self::new(tonic::Code::OutOfRange, error.to_string())
+            }
+            DurableError::ReadOnly | DurableError::Replica(ReplicaError::Ahead { .. }) => {
+                Self::new(tonic::Code::FailedPrecondition, error.to_string())
+            }
+            DurableError::Replica(ReplicaError::Diverged(_)) => {
+                Self::new(tonic::Code::DataLoss, error.to_string())
+            }
             other => Self::new(tonic::Code::Unavailable, other.to_string()),
         }
     }
@@ -111,6 +125,7 @@ impl IntoResponse for ApiError {
             tonic::Code::ResourceExhausted => StatusCode::TOO_MANY_REQUESTS,
             tonic::Code::OutOfRange => StatusCode::GONE,
             tonic::Code::FailedPrecondition => StatusCode::BAD_REQUEST,
+            tonic::Code::PermissionDenied => StatusCode::FORBIDDEN,
             _ => StatusCode::SERVICE_UNAVAILABLE,
         };
         (status, Json(serde_json::json!({"error": self.message}))).into_response()
@@ -386,6 +401,8 @@ pub struct Api {
     engine: Arc<DurableEngine>,
     auth: Arc<dyn Authenticator>,
     governed: bool,
+    /// The token followers present; log shipping is refused without one.
+    replication: Option<Arc<StaticToken>>,
 }
 
 impl Api {
@@ -394,7 +411,15 @@ impl Api {
             engine,
             auth,
             governed: false,
+            replication: None,
         }
+    }
+
+    /// Serve the log to followers presenting `token`, compared in constant
+    /// time; `None` refuses every follower.
+    pub fn replication_token(mut self, token: Option<&str>) -> Self {
+        self.replication = token.map(|token| Arc::new(StaticToken::new(token, "replication")));
+        self
     }
 
     /// Governed mode: every read (get, query, export, fences, events) must
@@ -702,6 +727,135 @@ impl Api {
             }
         });
         Ok(receiver)
+    }
+}
+
+impl Api {
+    /// Stream committed records after `after_lsn` to a follower, then live
+    /// as they become durable, with an empty heartbeat batch after a second
+    /// without one. The follower's last record is checked against this
+    /// log's first (see [`DurableEngine::shipping`]). That check and the
+    /// first read happen before the stream starts, so a follower that
+    /// diverged, or whose next record is gone, fails the call itself.
+    pub async fn follow(
+        &self,
+        authorization: Option<&str>,
+        request: proto::FollowRequest,
+    ) -> Result<tokio::sync::mpsc::Receiver<Result<proto::FollowBatch, ApiError>>, ApiError> {
+        /// Payload bytes per batch, past the first record.
+        const BUDGET: usize = 1 << 20;
+        const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(1);
+        let token = self.replication.as_ref().ok_or_else(|| {
+            ApiError::new(
+                tonic::Code::PermissionDenied,
+                "log shipping is not enabled on this node",
+            )
+        })?;
+        token.authenticate(bearer(authorization))?;
+        // Followers do not ship on: a chain would relabel records across an
+        // epoch change. Replicas follow the leader directly.
+        if self.engine.replication().is_some() {
+            return Err(ApiError::new(
+                tonic::Code::FailedPrecondition,
+                "a follower does not ship its log; follow the leader",
+            ));
+        }
+        let engine = self.engine.clone();
+        // Marked seen before each read, so a write after it wakes the wait.
+        let mut durable = engine.watch_durable();
+        durable.borrow_and_update();
+        // Reads go to disk, so they run off the async workers.
+        let read = move |mut from: crate::durable::Shipping| {
+            let engine = engine.clone();
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let shipped = engine.ship(&mut from, BUDGET);
+                    (from, shipped)
+                })
+                .await
+                .map_err(|_| ApiError::new(tonic::Code::Internal, "read task failed"))
+            }
+        };
+        let last = request.last.map(|last| crate::durable::Fingerprint {
+            crc32: last.crc32,
+            epoch: last.epoch,
+        });
+        let start = self.engine.clone();
+        let start = tokio::task::spawn_blocking(move || start.shipping(request.after_lsn, last))
+            .await
+            .map_err(|_| ApiError::new(tonic::Code::Internal, "read task failed"))??;
+        let (mut from, shipped) = read(start).await?;
+        let mut shipped = shipped?;
+        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        tokio::spawn(async move {
+            loop {
+                if shipped.records.is_empty() {
+                    tokio::select! {
+                        changed = durable.changed() => {
+                            if changed.is_err() {
+                                return;
+                            }
+                        }
+                        () = tokio::time::sleep(HEARTBEAT) => {
+                            let heartbeat = proto::FollowBatch {
+                                epoch: 0,
+                                records: Vec::new(),
+                                leader_lsn: shipped.leader_lsn,
+                            };
+                            if sender.send(Ok(heartbeat)).await.is_err() {
+                                return;
+                            }
+                        }
+                        () = sender.closed() => return,
+                    }
+                } else {
+                    let batch = proto::FollowBatch {
+                        epoch: shipped.epoch,
+                        records: std::mem::take(&mut shipped.records),
+                        leader_lsn: shipped.leader_lsn,
+                    };
+                    if sender.send(Ok(batch)).await.is_err() {
+                        return;
+                    }
+                }
+                durable.borrow_and_update();
+                let next = match read(from).await {
+                    Ok(next) => next,
+                    Err(error) => {
+                        let _ = sender.send(Err(error)).await;
+                        return;
+                    }
+                };
+                from = next.0;
+                shipped = match next.1 {
+                    Ok(shipped) => shipped,
+                    Err(error) => {
+                        let _ = sender.send(Err(error.into())).await;
+                        return;
+                    }
+                };
+            }
+        });
+        Ok(receiver)
+    }
+}
+
+#[tonic::async_trait]
+impl Replication for Api {
+    type FollowStream = std::pin::Pin<
+        Box<dyn tokio_stream::Stream<Item = Result<proto::FollowBatch, tonic::Status>> + Send>,
+    >;
+
+    async fn follow(
+        &self,
+        request: tonic::Request<proto::FollowRequest>,
+    ) -> Result<tonic::Response<Self::FollowStream>, tonic::Status> {
+        use tokio_stream::StreamExt;
+        let auth = metadata_auth(&request);
+        let batches = Api::follow(self, auth.as_deref(), request.into_inner()).await?;
+        let stream = tokio_stream::wrappers::ReceiverStream::new(batches)
+            .map(|batch| batch.map_err(tonic::Status::from));
+        Ok(tonic::Response::new(Box::pin(stream)))
     }
 }
 
@@ -1065,9 +1219,28 @@ fn http_router(api: Api) -> axum::Router {
         .route(
             "/healthz",
             get(|State(api): State<Api>| async move {
-                match api.engine.healthy() {
-                    true => (StatusCode::OK, "ok"),
-                    false => (StatusCode::SERVICE_UNAVAILABLE, "durability lost; reopen"),
+                match (api.engine.healthy(), api.engine.replication()) {
+                    (true, None) => (StatusCode::OK, "ok".to_string()),
+                    (true, Some(follower)) => (
+                        StatusCode::OK,
+                        format!(
+                            "following: applied {}, leader {}, lag {}{}",
+                            follower.applied_lsn,
+                            follower.leader_lsn,
+                            follower.lag(),
+                            if follower.connected { "" } else { ", not connected" }
+                        ),
+                    ),
+                    // The reason can name a namespace, and this endpoint
+                    // takes no token: it goes to the server log only.
+                    (false, Some(_)) => (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "replication stopped; see the server log".to_string(),
+                    ),
+                    (false, None) => (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "durability lost; reopen".to_string(),
+                    ),
                 }
             }),
         )
@@ -1149,6 +1322,7 @@ pub async fn serve(
     let flight = arrow_flight::flight_service_server::FlightServiceServer::new(api.clone())
         .max_decoding_message_size(64 << 20);
     let routes = tonic::service::Routes::from(http_router(api.clone()))
+        .add_service(ReplicationServer::new(api.clone()))
         .add_service(EzuServer::new(api))
         .add_service(flight);
     let server = tonic::transport::Server::builder()

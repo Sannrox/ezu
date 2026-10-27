@@ -28,6 +28,8 @@ pub struct Gauges {
     pub snapshot_age_seconds: f64,
     pub sealed_namespaces: u64,
     pub healthy: bool,
+    /// Set on a follower.
+    pub replication: Option<crate::durable::Replication>,
 }
 
 impl Metrics {
@@ -107,9 +109,35 @@ impl Metrics {
         series(
             "ezu_up",
             "gauge",
-            "1 while the engine accepts writes, 0 after a durability failure.",
+            "1 while the engine accepts writes (a follower: applies its leader's log), 0 after a durability failure.",
             u8::from(gauges.healthy).to_string(),
         );
+        if let Some(replication) = &gauges.replication {
+            series(
+                "ezu_replication_leader_lsn",
+                "gauge",
+                "The leader's last durable LSN, as this follower last heard it.",
+                replication.leader_lsn.to_string(),
+            );
+            series(
+                "ezu_replication_applied_lsn",
+                "gauge",
+                "The last LSN this follower applied.",
+                replication.applied_lsn.to_string(),
+            );
+            series(
+                "ezu_replication_lag_records",
+                "gauge",
+                "Records the leader holds that this follower has not applied.",
+                replication.lag().to_string(),
+            );
+            series(
+                "ezu_replication_connected",
+                "gauge",
+                "1 while a stream from the leader is open.",
+                u8::from(replication.connected).to_string(),
+            );
+        }
         let _ = writeln!(
             out,
             "# HELP ezu_query_duration_seconds Query latency.\n# TYPE ezu_query_duration_seconds histogram"
@@ -153,6 +181,7 @@ mod tests {
             snapshot_age_seconds: 1.5,
             sealed_namespaces: 0,
             healthy: true,
+            replication: None,
         });
         assert!(text.contains("ezu_query_duration_seconds_bucket{le=\"0.001\"} 1"));
         assert!(text.contains("ezu_query_duration_seconds_bucket{le=\"0.05\"} 2"));

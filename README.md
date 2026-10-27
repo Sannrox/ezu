@@ -20,7 +20,9 @@ delete, get, query (bbox, radius, polygon contains/intersects, nearest) and
 status. One listener serves it over gRPC and as HTTP/JSON:
 `POST /v1/entities`, `GET|DELETE /v1/entities/{collection}/{id}`,
 `POST /v1/query`, `GET /v1/status`, `GET /v1/fences`,
-`PUT|GET|DELETE /v1/fences/{id}` and `GET /v1/events`. JSON bodies are the same messages in
+`PUT|GET|DELETE /v1/fences/{id}` and `GET /v1/events`. Log shipping to
+followers is the separate gRPC service `Replication` (see Follower
+replicas). JSON bodies are the same messages in
 snake_case; a oneof is an object naming its variant.
 
 Every request carries `authorization: Bearer <token>`. The namespace comes
@@ -40,7 +42,8 @@ mutual TLS. The server needs `EZU_DATA_DIR` and listens on `EZU_LISTEN`
 ## Operations
 
 - `GET /healthz` answers 200 while the engine accepts writes and 503 after a
-  durability failure (reopen to recover).
+  durability failure (reopen to recover); for a follower, see Follower
+  replicas.
 - `DurableEngine::promote(dir)` raises the data directory's epoch, kept in
   `wal/EPOCH` and recorded in the log. An engine still holding the directory
   at an older epoch refuses every later write and reports unhealthy, even
@@ -57,7 +60,10 @@ mutual TLS. The server needs `EZU_DATA_DIR` and listens on `EZU_LISTEN`
   - entity count, logged writes and fence events;
   - query latency as a histogram;
   - WAL bytes and records since the last snapshot (the WAL lag);
-  - snapshot age, sealed namespaces and an `ezu_up` gauge.
+  - snapshot age, sealed namespaces and an `ezu_up` gauge;
+  - on a follower, the leader's last LSN, the applied LSN, the lag
+    between them in records, and whether it is connected
+    (`ezu_replication_*`).
 
   Every series is aggregated over namespaces, so neither endpoint takes a
   token or reveals tenant data.
@@ -74,6 +80,65 @@ mutual TLS. The server needs `EZU_DATA_DIR` and listens on `EZU_LISTEN`
 - `ezu-bench` measures throughput, query and fence latency, memory and
   recovery; see [docs/benchmarks.md](docs/benchmarks.md) for how it runs in
   CI and the latest results.
+
+## Follower replicas
+
+A follower serves reads from a copy of its leader's state, so reads go on
+when the leader's node is lost. Promotion is not part of this yet.
+
+- The leader serves its committed log over the `Replication.Follow` gRPC
+  stream on its API listener. The stream carries every namespace, so it
+  takes a token of its own, `EZU_REPLICATION_TOKEN_FILE`, and is refused
+  without one. Only records the leader has synced are shipped, never an
+  unfinished batch.
+- `EZU_FOLLOW=<leader URL>` (with the same token file) runs the server as
+  a follower. Over `https`, `EZU_FOLLOW_CA` verifies the leader, and
+  `EZU_TLS_CERT` and `EZU_TLS_KEY` are the client certificate the leader's
+  mutual TLS asks for.
+- A follower logs what it is shipped in its own `EZU_DATA_DIR`, byte for
+  byte at the leader's LSNs, and applies it as recovery replays a log. Its
+  applied LSN is its own last LSN, so a restart or a dropped stream
+  resumes right after it, and a resent record changes nothing. Queries and
+  fence events read the same, with the same event ids.
+- Each time it connects, the follower sends the CRC32 and epoch of its
+  last record, and the leader compares them with its own record at that
+  LSN before shipping more. A follower that followed another history is
+  refused (`DATA_LOSS`) and stops. To keep that record checkable, a
+  snapshot keeps the segment holding the LSN it covers, so the WAL holds
+  up to one segment more than before.
+- A follower marks its data directory with a `FOLLOWER` file, written
+  before it applies anything, and the server refuses to open a marked
+  directory as a leader: it would write past its leader's log. Promotion
+  (a follow-up) is the way to turn a follower into a leader; until then
+  the only way to clear the mark is to delete the file by hand. Releases
+  from before followers ignore the file and would open the directory as
+  a leader.
+- Every write (API, Flight) is refused with `FAILED_PRECONDITION`. Expiry
+  removals come from the leader's log.
+- It records the epoch of the records it applies (`wal/EPOCH`, and a
+  promotion frame in its log). A record of an older epoch after a newer
+  one, a gap in LSNs, or a leader that no longer holds the next record
+  (a snapshot dropped it) stops the follower for good. It keeps serving
+  what it applied, `GET /healthz` answers 503 (the reason goes to the server
+  log), and it needs a rebuild. While it applies, `/healthz` answers 200 with the applied
+  LSN, the leader's and the lag.
+- The leader drops its log at each snapshot. A follower down for longer
+  than that, or new against a leader whose log no longer starts at LSN 1,
+  stops and needs a re-seed: stop it, empty its data directory, copy the
+  leader's newest `snapshots/<lsn>/` set into `snapshots/` there, and
+  start it again. It follows from that LSN. Holding no record of its own
+  at that LSN, it sends no fingerprint on its first connect: the copy is
+  trusted as it is.
+- On each connect the leader checks the follower's last record (its
+  checksum and epoch) against its own at that LSN and refuses a mismatch.
+  That catches a follower that diverged from this leader, not a different
+  log that happens to hold the same last record: follow one leader per
+  follower directory. Switching a follower to another leader comes with
+  promotion.
+- Encrypted namespaces are not replicated: a follower takes no keys, and a
+  sealed record, shipped or in a seeded snapshot, stops it.
+- Followers do not ship on: every replica follows the leader directly. A
+  refused replication token stops the follower instead of retrying.
 
 ## Bulk interchange (Arrow Flight)
 

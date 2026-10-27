@@ -13,6 +13,12 @@
 //! - `EZU_GOVERNED=1`: every read must carry a label filter.
 //! - `EZU_TLS_CERT` and `EZU_TLS_KEY` (PEM) serve over TLS; adding
 //!   `EZU_TLS_CLIENT_CA` requires client certificates (mTLS).
+//! - `EZU_REPLICATION_TOKEN_FILE`: the token followers present; without
+//!   it no follower is served. A follower presents it to its leader.
+//! - `EZU_FOLLOW`: the leader's URL (`http://` or `https://`); the server
+//!   then runs as a read-only follower of it. Over `https`, `EZU_FOLLOW_CA`
+//!   (PEM) verifies the leader, and `EZU_TLS_CERT` and `EZU_TLS_KEY`, when
+//!   set, are the follower's client certificate.
 
 use ezu::api::{Api, serve};
 use ezu::auth::{Authenticator, Jwt, StaticToken};
@@ -71,31 +77,45 @@ fn now_ms() -> i64 {
         })
 }
 
+/// The leader to follow, from `EZU_FOLLOW`, with TLS over `https`.
+fn leader() -> Result<Option<tonic::transport::Endpoint>, String> {
+    let Some(url) = var("EZU_FOLLOW") else {
+        return Ok(None);
+    };
+    let identity = read("EZU_TLS_CERT")?.zip(read("EZU_TLS_KEY")?);
+    ezu::follow::endpoint(&url, read("EZU_FOLLOW_CA")?, identity)
+        .map(Some)
+        .map_err(|error| format!("EZU_FOLLOW: {error}"))
+}
+
 async fn run() -> Result<(), String> {
     let dir = var("EZU_DATA_DIR").ok_or("EZU_DATA_DIR is required")?;
     let auth = authenticator()?;
     let tls = tls()?;
+    let leader = leader()?;
+    let replication_token =
+        read("EZU_REPLICATION_TOKEN_FILE")?.map(|token| token.trim().to_string());
     let now = now_ms();
-    let engine = DurableEngine::open(
-        DurabilityConfig {
-            dir: dir.into(),
-            fsync: true,
-            segment_bytes: 64 << 20,
-            snapshot_every_records: 1_000_000,
-            snapshot_every_ms: 10 * 60 * 1000,
-            events_retained: 100_000,
-            keys: None,
-        },
-        Quotas {
-            max_entities: 10_000_000,
-            max_collections: 1_000,
-            max_vertices: 10_000,
-            max_updates_per_second: 100_000,
-            max_fences: 100_000,
-        },
-        None,
-        now,
-    )
+    let config = DurabilityConfig {
+        dir: dir.into(),
+        fsync: true,
+        segment_bytes: 64 << 20,
+        snapshot_every_records: 1_000_000,
+        snapshot_every_ms: 10 * 60 * 1000,
+        events_retained: 100_000,
+        keys: None,
+    };
+    let quotas = Quotas {
+        max_entities: 10_000_000,
+        max_collections: 1_000,
+        max_vertices: 10_000,
+        max_updates_per_second: 100_000,
+        max_fences: 100_000,
+    };
+    let engine = match leader {
+        Some(_) => DurableEngine::open_follower(config, quotas, now),
+        None => DurableEngine::open(config, quotas, None, now),
+    }
     .map_err(|error| error.to_string())?;
     let listen = var("EZU_LISTEN").unwrap_or_else(|| "127.0.0.1:7600".into());
     let listener = tokio::net::TcpListener::bind(&listen)
@@ -103,6 +123,19 @@ async fn run() -> Result<(), String> {
         .map_err(|error| format!("{listen}: {error}"))?;
     eprintln!("ezu {} listening on {listen}", env!("CARGO_PKG_VERSION"));
     let engine = Arc::new(engine);
+    if let Some(leader) = leader {
+        let token = replication_token
+            .clone()
+            .ok_or("EZU_FOLLOW needs EZU_REPLICATION_TOKEN_FILE")?;
+        let follower = engine.clone();
+        tokio::spawn(async move {
+            let stopped = ezu::follow::follow(follower, leader, token, |why| {
+                eprintln!("ezu: following the leader: {why}; reconnecting");
+            })
+            .await;
+            eprintln!("ezu: following stopped: {stopped}");
+        });
+    }
     // Expired entities are hidden at once but hold memory and quota until
     // swept; sweep them in the background, off the async workers. The same
     // pass rechecks namespace keys, so a revoked key seals its namespace.
@@ -111,6 +144,10 @@ async fn run() -> Result<(), String> {
         let mut every = tokio::time::interval(std::time::Duration::from_secs(10));
         loop {
             every.tick().await;
+            // A follower's removals come from its leader's log.
+            if sweeper.replication().is_some() {
+                return;
+            }
             let engine = sweeper.clone();
             let swept = move || {
                 engine.refresh_keys()?;
@@ -128,7 +165,9 @@ async fn run() -> Result<(), String> {
     };
     let governed = matches!(var("EZU_GOVERNED").as_deref(), Some("1" | "true"));
     serve(
-        Api::new(engine, auth).governed(governed),
+        Api::new(engine, auth)
+            .governed(governed)
+            .replication_token(replication_token.as_deref()),
         listener,
         tls,
         shutdown,

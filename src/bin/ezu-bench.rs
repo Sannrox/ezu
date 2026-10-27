@@ -11,8 +11,10 @@
 //! synced), query latency (bbox, radius, nearest), fence evaluation (the
 //! latency of single updates against `--fences` fences, without the disk
 //! sync, whose cost the throughput already shows), memory per entity
-//! (resident set, Linux only) and recovery time (reopen from a snapshot plus
-//! a WAL of one move). Prints the results as JSON. With
+//! (resident set, Linux only), recovery time (reopen from a snapshot plus
+//! a WAL of one move) and follower convergence (a follower tailing a load
+//! of at most 10^6 entities in process: its lag during the load and the
+//! time it takes to catch up after). Prints the results as JSON. With
 //! `--baseline`, compares against an earlier result and exits non-zero when
 //! any measure is more than 10% worse.
 
@@ -25,6 +27,8 @@ use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const BATCH: usize = 10_000;
@@ -62,28 +66,92 @@ fn options() -> Result<Options, String> {
     Ok(options)
 }
 
+fn config(dir: &Path, fsync: bool) -> DurabilityConfig {
+    DurabilityConfig {
+        dir: dir.to_path_buf(),
+        fsync,
+        segment_bytes: 256 << 20,
+        snapshot_every_records: u64::MAX,
+        snapshot_every_ms: i64::MAX,
+        events_retained: 10_000,
+        keys: None,
+    }
+}
+
+fn quotas() -> Quotas {
+    Quotas {
+        max_entities: usize::MAX,
+        max_collections: 16,
+        max_vertices: 64,
+        max_updates_per_second: u32::MAX,
+        max_fences: usize::MAX,
+    }
+}
+
 fn open(dir: &Path, fsync: bool) -> Result<DurableEngine, String> {
-    DurableEngine::open(
-        DurabilityConfig {
-            dir: dir.to_path_buf(),
-            fsync,
-            segment_bytes: 256 << 20,
-            snapshot_every_records: u64::MAX,
-            snapshot_every_ms: i64::MAX,
-            events_retained: 10_000,
-            keys: None,
-        },
-        Quotas {
-            max_entities: usize::MAX,
-            max_collections: 16,
-            max_vertices: 64,
-            max_updates_per_second: u32::MAX,
-            max_fences: usize::MAX,
-        },
-        None,
-        0,
-    )
-    .map_err(|error| error.to_string())
+    DurableEngine::open(config(dir, fsync), quotas(), None, 0).map_err(|error| error.to_string())
+}
+
+/// A follower tails a leader in process (ship, then apply, as over the
+/// API without the network) while the leader loads `count` entities.
+/// Returns the leader's load rate, the follower's lag in records sampled
+/// after each batch it applied, and the seconds from the leader's last
+/// write until the follower has applied it.
+fn replication(dir: &Path, count: u64) -> Result<Value, String> {
+    let leader = Arc::new(open(&dir.join("leader"), true)?);
+    let follower = DurableEngine::open_follower(config(&dir.join("follower"), true), quotas(), 0)
+        .map_err(|error| error.to_string())?;
+    let done = Arc::new(AtomicBool::new(false));
+    let tailing = {
+        let (leader, done) = (leader.clone(), done.clone());
+        std::thread::spawn(move || -> Result<(Vec<u64>, Instant), String> {
+            let mut from = leader
+                .shipping(0, None)
+                .map_err(|error| error.to_string())?;
+            let mut lags = Vec::new();
+            let mut applied = 0;
+            loop {
+                let shipped = leader
+                    .ship(&mut from, 1 << 20)
+                    .map_err(|error| error.to_string())?;
+                if shipped.records.is_empty() {
+                    // Caught up once the load is done and the follower holds
+                    // the leader's last record: the empty read may predate
+                    // the final batch.
+                    if done.load(Ordering::Acquire)
+                        && applied >= leader.last_lsn().map_err(|error| error.to_string())?
+                    {
+                        return Ok((lags, Instant::now()));
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+                applied = follower
+                    .apply_shipped(shipped, 0)
+                    .map_err(|error| error.to_string())?;
+                let last = leader.last_lsn().map_err(|error| error.to_string())?;
+                lags.push(last.saturating_sub(applied));
+            }
+        })
+    };
+    let load = write_all(&leader, count, 0);
+    let finished = Instant::now();
+    done.store(true, Ordering::Release);
+    let (mut lags, caught_up) = tailing
+        .join()
+        .map_err(|_| "the follower thread panicked".to_string())??;
+    let load = load?;
+    lags.sort_unstable();
+    let at = |q: f64| {
+        lags.get(((lags.len().max(1) - 1) as f64 * q) as usize)
+            .copied()
+    };
+    Ok(json!({
+        "entities": count,
+        "load_updates_per_s": load,
+        "lag_records": { "p50": at(0.5), "p99": at(0.99), "max": lags.last() },
+        "catchup_s": caught_up.saturating_duration_since(finished).as_secs_f64(),
+    }))
 }
 
 fn ns() -> Namespace {
@@ -248,6 +316,8 @@ fn measure(options: &Options, dir: &Path) -> Result<Value, String> {
 
     drop(engine);
 
+    let follower = replication(&dir.join("replication"), options.entities.min(1_000_000))?;
+
     Ok(json!({
         "entities": options.entities,
         "fences": options.fences,
@@ -259,6 +329,7 @@ fn measure(options: &Options, dir: &Path) -> Result<Value, String> {
         "fence_evaluation": percentiles(fenced),
         "memory_bytes_per_entity": memory,
         "recovery_s": recovery,
+        "follower": follower,
     }))
 }
 
@@ -291,7 +362,7 @@ fn regressions(result: &Value, baseline: &Value) -> Vec<String> {
     flat.iter()
         .filter_map(|(name, value)| {
             let (now, then) = (value.as_f64()?, old.get(name)?.as_f64()?);
-            if name == "entities" || name == "fences" || then <= 0.0 {
+            if name.ends_with("entities") || name == "fences" || then <= 0.0 {
                 return None;
             }
             let worse = match name.ends_with("_per_s") {

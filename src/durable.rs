@@ -12,6 +12,19 @@
 //! [`DurableEngine::promote`] fences an owner that may still run: it refuses
 //! every write after. A new owner opens the directory once the old process
 //! is gone.
+//!
+//! A follower ([`DurableEngine::open_follower`]) is read-only: it refuses
+//! every write, and changes only by records its leader ships
+//! ([`DurableEngine::ship`] there, [`DurableEngine::apply_shipped`] here).
+//! It logs them in its own directory, byte for byte at the same LSNs, so its
+//! applied LSN is its own last LSN, a restart resumes after it, and its
+//! event ids are the leader's. Its directory is marked with a `FOLLOWER`
+//! file, and [`DurableEngine::open`] refuses a marked directory: a leader
+//! there would write past its leader's log. Before shipping more, a leader
+//! checks the follower's last record against its own at that LSN
+//! ([`Fingerprint`]), so a follower of another history is refused. A gap, an epoch going back, or a sealed
+//! record stops it, fail closed: it keeps serving what it applied, reports
+//! unhealthy, and needs a rebuild.
 
 use crate::entity::{Entity, Labels, Namespace, visible};
 use crate::fence::{
@@ -23,12 +36,12 @@ use crate::keys::sekai_keys::{Dek, KeyId};
 use crate::keys::{self, KeyConfig, Keyring};
 use crate::metrics::{Gauges, Metrics};
 use crate::snapshot::{self, DataFile, Found, Part, SealInfo, SnapshotError};
-use crate::wal::{Entry, Op, Wal, WalError};
+use crate::wal::{Entry, Op, Record, Tail, TailError, Wal, WalError};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 #[derive(Debug, Clone)]
 pub struct DurabilityConfig {
@@ -89,6 +102,71 @@ pub enum DurableError {
         epoch: u64,
         directory: u64,
     },
+    /// The engine is a follower: only its leader's log changes it.
+    ReadOnly,
+    /// The directory belongs to a follower and may not be opened as a
+    /// leader.
+    FollowerDirectory,
+    /// Shipping between a leader and a follower cannot go on.
+    Replica(ReplicaError),
+}
+
+/// Why shipped records cannot be applied, or shipping cannot go on. A
+/// follower that meets any of these stops applying (fail closed) and needs
+/// a rebuild.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplicaError {
+    /// The leader no longer holds the records after this LSN: a snapshot
+    /// covered and dropped them, or a rebuild skipped past them.
+    Gone(u64),
+    /// The follower has applied past the leader's last durable LSN: it
+    /// followed another log.
+    Ahead { applied: u64, leader: u64 },
+    /// Shipped records do not continue the applied LSN.
+    Gap { applied: u64, next: u64 },
+    /// The follower's record at this LSN is not the leader's: it followed
+    /// another history.
+    Diverged(u64),
+    /// A record of an older epoch after one of a newer.
+    EpochBack { seen: u64, shipped: u64 },
+    /// A record of an encrypted namespace; followers hold no keys.
+    Sealed(String),
+    /// A shipped payload does not decode.
+    Damaged(String),
+    /// The leader refused to ship, for a reason that will not pass.
+    Leader(String),
+}
+
+impl std::fmt::Display for ReplicaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Gone(lsn) => write!(
+                f,
+                "the leader no longer holds the records after {lsn}; rebuild the follower"
+            ),
+            Self::Ahead { applied, leader } => write!(
+                f,
+                "the follower applied {applied}, past the leader's last {leader}"
+            ),
+            Self::Diverged(lsn) => write!(
+                f,
+                "the follower's record {lsn} differs from the leader's; rebuild the follower"
+            ),
+            Self::Gap { applied, next } => {
+                write!(f, "shipped record {next} does not follow applied {applied}")
+            }
+            Self::EpochBack { seen, shipped } => write!(
+                f,
+                "a record of epoch {shipped} after epoch {seen} was shipped"
+            ),
+            Self::Sealed(namespace) => write!(
+                f,
+                "namespace {namespace} is encrypted, and followers do not replicate encrypted namespaces"
+            ),
+            Self::Damaged(why) => write!(f, "a shipped record is damaged: {why}"),
+            Self::Leader(why) => write!(f, "the leader refused to ship: {why}"),
+        }
+    }
 }
 
 impl std::fmt::Display for DurableError {
@@ -119,6 +197,12 @@ impl std::fmt::Display for DurableError {
                 f,
                 "fenced: this engine is at epoch {epoch}, the directory at {directory}"
             ),
+            Self::ReadOnly => f.write_str("this node is a read-only follower; write to its leader"),
+            Self::FollowerDirectory => f.write_str(
+                "the data directory belongs to a follower (it holds FOLLOWER); open it as a \
+                 follower, or promote it once promotion exists (#42)",
+            ),
+            Self::Replica(error) => write!(f, "replication: {error}"),
         }
     }
 }
@@ -137,6 +221,11 @@ impl From<WalError> for DurableError {
             WalError::LegacyOwner => Self::LegacyOwner,
             error => Self::Wal(error),
         }
+    }
+}
+impl From<ReplicaError> for DurableError {
+    fn from(error: ReplicaError) -> Self {
+        Self::Replica(error)
     }
 }
 impl From<SnapshotError> for DurableError {
@@ -166,6 +255,11 @@ pub struct DurableEngine {
     events_floor: Option<EventId>,
     /// Counts publishes, so a subscriber waits for new events.
     published: tokio::sync::watch::Sender<u64>,
+    /// The last LSN known durable, which is as far as followers are
+    /// shipped; on a follower, the applied LSN.
+    durable: tokio::sync::watch::Sender<u64>,
+    /// Set on a follower.
+    following: Option<Following>,
     quotas: Quotas,
     config: DurabilityConfig,
     keyring: Keyring,
@@ -179,6 +273,60 @@ pub struct DurableEngine {
     _lock: File,
 }
 
+/// A follower's view of its leader, for health and metrics.
+#[derive(Default)]
+struct Following {
+    leader_lsn: AtomicU64,
+    connected: AtomicBool,
+    /// Why it stopped applying, fail closed.
+    stopped: Mutex<Option<String>>,
+}
+
+/// Where a follower stands, read for health and metrics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Replication {
+    /// The leader's last durable LSN, as last heard.
+    pub leader_lsn: u64,
+    pub applied_lsn: u64,
+    /// Whether a stream from the leader is open.
+    pub connected: bool,
+    /// Why the follower stopped applying, fail closed.
+    pub stopped: Option<String>,
+}
+
+impl Replication {
+    /// Records the leader holds that the follower has not applied.
+    pub fn lag(&self) -> u64 {
+        self.leader_lsn.saturating_sub(self.applied_lsn)
+    }
+}
+
+/// A leader's read position in its log for one follower; see
+/// [`DurableEngine::ship`].
+pub struct Shipping(Tail);
+
+/// What identifies a logged record across a leader and its followers: the
+/// CRC32 of its payload (which holds its LSN) and the epoch it was logged
+/// at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fingerprint {
+    pub crc32: u32,
+    pub epoch: u64,
+}
+
+/// A follower's data directory carries this file.
+const FOLLOWER: &str = "FOLLOWER";
+
+/// Committed records for a follower, all of one epoch, and the leader's
+/// last durable LSN when they were read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shipped {
+    pub epoch: u64,
+    /// Record payloads as logged, in LSN order.
+    pub records: Vec<Vec<u8>>,
+    pub leader_lsn: u64,
+}
+
 impl DurableEngine {
     /// Open or recover the engine in `config.dir`.
     pub fn open(
@@ -186,6 +334,35 @@ impl DurableEngine {
         quotas: Quotas,
         rebuild: Option<&dyn RebuildSource>,
         now_ms: i64,
+    ) -> Result<Self, DurableError> {
+        Self::open_as(config, quotas, rebuild, now_ms, None)
+    }
+
+    /// Open or recover a follower in `config.dir`, its own directory: it
+    /// serves reads and refuses writes, and its applied LSN is the last it
+    /// logged. A new directory starts before the leader's first record; one
+    /// seeded with a copy of a leader's snapshot set starts after it. It
+    /// takes no keys, as encrypted namespaces are not replicated, and no
+    /// rebuild source, as its leader is its source.
+    pub fn open_follower(
+        config: DurabilityConfig,
+        quotas: Quotas,
+        now_ms: i64,
+    ) -> Result<Self, DurableError> {
+        if config.keys.is_some() {
+            return Err(DurableError::Keys(
+                "a follower takes no keys: encrypted namespaces are not replicated".into(),
+            ));
+        }
+        Self::open_as(config, quotas, None, now_ms, Some(Following::default()))
+    }
+
+    fn open_as(
+        config: DurabilityConfig,
+        quotas: Quotas,
+        rebuild: Option<&dyn RebuildSource>,
+        now_ms: i64,
+        following: Option<Following>,
     ) -> Result<Self, DurableError> {
         let (wal_dir, snapshot_dir) = (config.dir.join("wal"), config.dir.join("snapshots"));
         create_dir_durably(&wal_dir).map_err(WalError::Io)?;
@@ -197,6 +374,24 @@ impl DurableEngine {
             .open(config.dir.join("LOCK"))
             .map_err(WalError::Io)?;
         lock.try_lock().map_err(|_| DurableError::Locked)?;
+        let marker = config.dir.join(FOLLOWER);
+        match &following {
+            None if marker.exists() => return Err(DurableError::FollowerDirectory),
+            None => {}
+            // Durable before anything is applied, so a follower's directory
+            // is never mistaken for a leader's.
+            Some(_) if marker.exists() => {}
+            Some(_) => {
+                let mut file = File::create_new(&marker).map_err(WalError::Io)?;
+                std::io::Write::write_all(
+                    &mut file,
+                    b"A follower's data directory; a leader refuses to open it.\n",
+                )
+                .map_err(WalError::Io)?;
+                file.sync_all().map_err(WalError::Io)?;
+                crate::wal::sync_dir(&config.dir).map_err(WalError::Io)?;
+            }
+        }
         // Taken only once the directory lock is held, so a held `OWNER`
         // always belongs to the directory's owner, never to an opener that
         // is about to fail on `LOCK`. A promotion in the gap between the two
@@ -321,6 +516,7 @@ impl DurableEngine {
             }
             carried = loaded.carried;
         }
+        let durable_lsn = wal.last_lsn();
         let mut replayed = 0;
         for record in records {
             if record.lsn <= base_lsn {
@@ -344,6 +540,14 @@ impl DurableEngine {
             replayed += 1;
         }
 
+        // A follower takes no keys, so a sealed namespace it recovered (from
+        // a seeded snapshot or its log) would be silently missing: refuse it,
+        // as a sealed record arriving by shipping does.
+        if following.is_some()
+            && let Some(namespace) = carried.keys().min()
+        {
+            return Err(ReplicaError::Sealed(namespace.clone()).into());
+        }
         let durable = Self {
             engine,
             // Replayed records still count toward the next snapshot.
@@ -357,6 +561,8 @@ impl DurableEngine {
             }),
             events: Mutex::new(events),
             published: tokio::sync::watch::Sender::new(0),
+            durable: tokio::sync::watch::Sender::new(durable_lsn),
+            following,
             events_floor,
             quotas,
             config,
@@ -367,8 +573,11 @@ impl DurableEngine {
             _owner: owner,
         };
         // Entities that expired while the engine was down release their
-        // quota now, through the log like any other removal.
-        durable.sweep_expired(now_ms)?;
+        // quota now, through the log like any other removal. A follower's
+        // removals come from its leader's log.
+        if durable.following.is_none() {
+            durable.sweep_expired(now_ms)?;
+        }
         if rebuilt {
             // Pin the re-synced state so the next recovery does not need it.
             durable.snapshot(now_ms)?;
@@ -597,6 +806,9 @@ impl DurableEngine {
         now_ms: i64,
         change: impl FnOnce(&Engine, &Fences, &mut Vec<Op>) -> T,
     ) -> Result<T, DurableError> {
+        if self.following.is_some() {
+            return Err(DurableError::ReadOnly);
+        }
         let mut writer = self.writer.lock().map_err(|_| DurableError::Failed)?;
         // Under the lock: a writer that waited behind a failed append must
         // not log after the damaged frame.
@@ -617,13 +829,20 @@ impl DurableEngine {
             return Err(error.into());
         }
         let result = applied?;
+        self.snapshot_if_due(&mut writer, now_ms)?;
+        Ok(result)
+    }
+
+    /// Snapshot when enough records were logged, or enough time passed,
+    /// since the last one.
+    fn snapshot_if_due(&self, writer: &mut Writer, now_ms: i64) -> Result<(), DurableError> {
         if writer.since_snapshot >= self.config.snapshot_every_records
             || (writer.since_snapshot > 0
                 && now_ms - writer.snapshot_at_ms >= self.config.snapshot_every_ms)
         {
-            self.snapshot_locked(&mut writer, now_ms)?;
+            self.snapshot_locked(writer, now_ms)?;
         }
-        Ok(result)
+        Ok(())
     }
 
     /// The fenced part of [`Self::write`]: `change` applied to the index,
@@ -657,6 +876,7 @@ impl DurableEngine {
                     return Err(error.into());
                 }
             };
+            self.durable.send_replace(last);
             writer.since_snapshot += ops.len() as u64;
             self.metrics.wrote(
                 ops.iter()
@@ -1051,6 +1271,9 @@ impl DurableEngine {
     /// Start a new current key for `ns`. New writes use it at once; the
     /// next snapshot re-seals older data under it and retires the old key.
     pub fn rotate_key(&self, ns: &Namespace) -> Result<(), DurableError> {
+        if self.following.is_some() {
+            return Err(DurableError::ReadOnly);
+        }
         let mut writer = self.writer.lock().map_err(|_| DurableError::Failed)?;
         if self.failed.load(Ordering::Acquire) {
             return Err(DurableError::Failed);
@@ -1069,6 +1292,222 @@ impl DurableEngine {
             .map_err(|sealed| DurableError::Sealed(sealed.0))
     }
 
+    /// A read position for a follower that applied through `after`.
+    ///
+    /// With `last`, the follower's fingerprint of its record at `after`,
+    /// that record is checked against this log's first:
+    /// [`ReplicaError::Diverged`] when it differs, [`ReplicaError::Gone`]
+    /// when this log no longer holds it. Without, nothing is checked; a
+    /// follower sends none only before its first record, or when seeded
+    /// from a snapshot copy.
+    pub fn shipping(
+        &self,
+        after: u64,
+        last: Option<Fingerprint>,
+    ) -> Result<Shipping, DurableError> {
+        let through = *self.durable.borrow();
+        if after > through {
+            return Err(ReplicaError::Ahead {
+                applied: after,
+                leader: through,
+            }
+            .into());
+        }
+        let wal = self.config.dir.join("wal");
+        let Some(last) = last.filter(|_| after > 0) else {
+            return Ok(Shipping(Tail::new(&wal, after)));
+        };
+        // Read through the durable horizon, not just `after`: a follower may
+        // have stopped inside one of this log's batches (shipping splits
+        // them), and the rest of the batch is shipped from this tail.
+        let mut tail = Tail::new(&wal, after - 1);
+        match fingerprint_at(&mut tail, after, through)? {
+            Some(held) if held == last => Ok(Shipping(tail)),
+            Some(_) => Err(ReplicaError::Diverged(after).into()),
+            None => Err(ReplicaError::Gone(after - 1).into()),
+        }
+    }
+
+    /// The fingerprint of this engine's logged record at `lsn`, `None` when
+    /// its log no longer holds it (or never did: a snapshot seeded it).
+    pub fn fingerprint(&self, lsn: u64) -> Result<Option<Fingerprint>, DurableError> {
+        if lsn == 0 {
+            return Ok(None);
+        }
+        let through = *self.durable.borrow();
+        fingerprint_at(
+            &mut Tail::new(&self.config.dir.join("wal"), lsn - 1),
+            lsn,
+            through,
+        )
+    }
+
+    /// The next committed records for the follower reading at `from`,
+    /// about `budget` bytes, never past the last durable LSN; none when it
+    /// has everything. A follower whose next record is gone, or that is
+    /// ahead of this log, gets [`DurableError::Replica`].
+    pub fn ship(&self, from: &mut Shipping, budget: usize) -> Result<Shipped, DurableError> {
+        let through = *self.durable.borrow();
+        let after = from.0.after();
+        if after > through {
+            return Err(ReplicaError::Ahead {
+                applied: after,
+                leader: through,
+            }
+            .into());
+        }
+        let (epoch, records) = from.0.next(through, budget).map_err(|error| match error {
+            TailError::Gone(lsn) => DurableError::Replica(ReplicaError::Gone(lsn)),
+            TailError::Wal(error) => error.into(),
+        })?;
+        Ok(Shipped {
+            epoch,
+            records: records.into_iter().map(|record| record.payload).collect(),
+            leader_lsn: through,
+        })
+    }
+
+    /// Changes whenever the last durable LSN does; a shipping leader waits
+    /// on it.
+    pub fn watch_durable(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.durable.subscribe()
+    }
+
+    /// Apply records the leader shipped: log them in this follower's
+    /// directory as they were logged there, then apply them as replay does,
+    /// raising the same events with the same ids. Records already applied
+    /// are skipped, so a resent batch changes nothing. Returns the applied
+    /// LSN. A gap, an epoch going back, a sealed or damaged record, or a
+    /// failure to log stops the follower for good (fail closed).
+    pub fn apply_shipped(&self, shipped: Shipped, now_ms: i64) -> Result<u64, DurableError> {
+        let Some(following) = &self.following else {
+            return Err(DurableError::ReadOnly);
+        };
+        following
+            .leader_lsn
+            .fetch_max(shipped.leader_lsn, Ordering::AcqRel);
+        let mut writer = self.writer.lock().map_err(|_| DurableError::Failed)?;
+        if self.failed.load(Ordering::Acquire) {
+            return Err(DurableError::Failed);
+        }
+        self.apply_locked(&mut writer, shipped, now_ms)
+            .map_err(|error| self.stop(following, error))
+    }
+
+    /// Stop this follower for good (fail closed) for `error`, and return
+    /// it; it keeps serving reads of what it applied.
+    pub fn stop_following(&self, error: ReplicaError) -> DurableError {
+        self.end_following(error.into())
+    }
+
+    /// Record `error` as why this follower stopped, unless a reason is
+    /// already recorded, and fail it; every terminal exit of following goes
+    /// through here so health never reports a follower that cannot apply.
+    pub fn end_following(&self, error: DurableError) -> DurableError {
+        match &self.following {
+            Some(following) => self.stop(following, error),
+            None => error,
+        }
+    }
+
+    fn stop(&self, following: &Following, error: DurableError) -> DurableError {
+        self.failed.store(true, Ordering::Release);
+        if let Ok(mut stopped) = following.stopped.lock() {
+            stopped.get_or_insert_with(|| error.to_string());
+        }
+        error
+    }
+
+    fn apply_locked(
+        &self,
+        writer: &mut Writer,
+        shipped: Shipped,
+        now_ms: i64,
+    ) -> Result<u64, DurableError> {
+        let applied = writer.wal.last_lsn();
+        let mut records = Vec::new();
+        for payload in shipped.records {
+            let (lsn, entry) = crate::wal::decode_payload(&payload)
+                .map_err(|error| ReplicaError::Damaged(error.to_string()))?;
+            let next = records.last().map_or(applied, |record: &Record| record.lsn) + 1;
+            if lsn < next {
+                continue;
+            }
+            if lsn > next {
+                return Err(ReplicaError::Gap {
+                    applied: next - 1,
+                    next: lsn,
+                }
+                .into());
+            }
+            if let Entry::Sealed { namespace, .. } = &entry {
+                return Err(ReplicaError::Sealed(namespace.as_str().to_string()).into());
+            }
+            records.push(Record {
+                lsn,
+                entry,
+                payload,
+            });
+        }
+        if records.is_empty() {
+            return Ok(applied);
+        }
+        let seen = writer.wal.epoch();
+        if shipped.epoch < seen {
+            return Err(ReplicaError::EpochBack {
+                seen,
+                shipped: shipped.epoch,
+            }
+            .into());
+        }
+        // Recorded before any record of the new epoch, as on the leader.
+        writer.wal.follow_epoch(shipped.epoch)?;
+        // Logged before the index changes: on a failure the log is ahead,
+        // and a reopen replays it.
+        let last = writer.wal.append_shipped(&records)?;
+        writer.since_snapshot += records.len() as u64;
+        let mut raised = Vec::new();
+        let mut wrote = 0;
+        for record in records {
+            if let Entry::Op(Op::Upsert(..) | Op::Delete { .. }) = &record.entry {
+                wrote += 1;
+            }
+            raised.extend(apply_entry(
+                &self.engine,
+                &mut writer.fences,
+                &self.keyring,
+                record.lsn,
+                record.entry,
+            )?);
+        }
+        self.metrics.wrote(wrote);
+        self.publish(raised)?;
+        self.durable.send_replace(last);
+        self.snapshot_if_due(writer, now_ms)?;
+        Ok(last)
+    }
+
+    /// Record whether a stream from the leader is open.
+    pub fn set_connected(&self, connected: bool) {
+        if let Some(following) = &self.following {
+            following.connected.store(connected, Ordering::Release);
+        }
+    }
+
+    /// Where this follower stands; `None` on a leader.
+    pub fn replication(&self) -> Option<Replication> {
+        let following = self.following.as_ref()?;
+        Some(Replication {
+            leader_lsn: following.leader_lsn.load(Ordering::Acquire),
+            applied_lsn: *self.durable.borrow(),
+            connected: following.connected.load(Ordering::Acquire),
+            stopped: following
+                .stopped
+                .lock()
+                .map_or_else(|_| Some("poisoned".into()), |stopped| stopped.clone()),
+        })
+    }
+
     /// Bytes the WAL holds now.
     pub fn wal_bytes(&self) -> Result<u64, DurableError> {
         let writer = self.writer.lock().map_err(|_| DurableError::Failed)?;
@@ -1079,7 +1518,8 @@ impl DurableEngine {
     /// since it opened, and not fenced, which is found here without waiting
     /// for a write (and stays failed). While a write is in flight, that
     /// write finds a fence instead; any other failure to check reports
-    /// unhealthy.
+    /// unhealthy. A follower is healthy while it can serve reads and go on
+    /// applying: not stopped fail closed.
     pub fn healthy(&self) -> bool {
         if self.failed.load(Ordering::Acquire) {
             return false;
@@ -1117,7 +1557,31 @@ impl DurableEngine {
             snapshot_age_seconds: now_ms.saturating_sub(snapshot_at_ms).max(0) as f64 / 1000.0,
             sealed_namespaces: self.keyring.sealed().len() as u64,
             healthy: self.healthy(),
+            replication: self.replication(),
         }))
+    }
+}
+
+/// The fingerprint of the record at `lsn`, read with `tail` positioned
+/// right before it and reading batches committed through `through`, or
+/// `None` when the log does not hold it. The tail is left right after it.
+fn fingerprint_at(
+    tail: &mut Tail,
+    lsn: u64,
+    through: u64,
+) -> Result<Option<Fingerprint>, DurableError> {
+    match tail.next(through, 0) {
+        Ok((epoch, records)) => {
+            Ok(records
+                .first()
+                .filter(|record| record.lsn == lsn)
+                .map(|record| Fingerprint {
+                    crc32: crc32fast::hash(&record.payload),
+                    epoch,
+                }))
+        }
+        Err(TailError::Gone(_)) => Ok(None),
+        Err(TailError::Wal(error)) => Err(error.into()),
     }
 }
 

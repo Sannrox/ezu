@@ -261,6 +261,9 @@ fn a_rebuild_restores_fences_and_memberships_without_events() {
     engine.upsert(&ns(), truck("t1", 10.0, 1_000), 0).unwrap();
     engine.snapshot(0).unwrap();
     engine.upsert(&ns(), truck("t1", 10.0, 2_000), 0).unwrap();
+    // A second snapshot drops the first segment (the first keeps the
+    // segment holding its LSN), so the log no longer starts at LSN 1.
+    engine.snapshot(0).unwrap();
     drop(engine);
     fs::remove_dir_all(dir.join("snapshots")).unwrap();
     let source = Source(vec![truck("t1", 10.0, 2_000)], vec![depot]);
