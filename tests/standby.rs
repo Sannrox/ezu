@@ -263,7 +263,7 @@ fn only_the_standbys_acknowledgement_at_the_leaders_epoch_releases_a_write() {
         leader.upsert(&ns(), vehicle(0, 0.0), 0),
         Err(DurableError::NoStandby)
     ));
-    assert!(leader.acknowledge(STANDBY, 0, 0));
+    assert!(leader.acknowledge(STANDBY, 0, 0, leader.stamp()));
     assert!(leader.healthy());
 
     let (done, outcome) = std::sync::mpsc::channel();
@@ -275,11 +275,11 @@ fn only_the_standbys_acknowledgement_at_the_leaders_epoch_releases_a_write() {
     assert!(outcome.recv_timeout(waiting).is_err(), "acknowledged early");
     // Another node, another epoch, or past the log: not counted.
     eventually_blocking(|| leader.last_lsn().unwrap() == 1);
-    assert!(!leader.acknowledge("other", 1, 0));
-    assert!(!leader.acknowledge(STANDBY, 1, 1));
-    assert!(!leader.acknowledge(STANDBY, 2, 0));
+    assert!(!leader.acknowledge("other", 1, 0, leader.stamp()));
+    assert!(!leader.acknowledge(STANDBY, 1, 1, leader.stamp()));
+    assert!(!leader.acknowledge(STANDBY, 2, 0, leader.stamp()));
     assert!(outcome.recv_timeout(waiting).is_err(), "acknowledged early");
-    assert!(leader.acknowledge(STANDBY, 1, 0));
+    assert!(leader.acknowledge(STANDBY, 1, 0, leader.stamp()));
     outcome
         .recv_timeout(Duration::from_secs(30))
         .unwrap()
@@ -352,7 +352,7 @@ fn a_restarted_leader_serves_nothing_until_the_standby_acknowledges() {
     let dir = scratch("restart");
     let standby = sync(Duration::from_millis(200), Duration::from_secs(30));
     let first = Arc::new(leader(&dir, standby.clone()));
-    first.acknowledge(STANDBY, 0, 0);
+    first.acknowledge(STANDBY, 0, 0, first.stamp());
     first.put_fence(&ns(), fence(), 0).unwrap_err();
     // The fence was logged; its acknowledgement never came.
     assert_eq!(first.last_lsn().unwrap(), 1);
@@ -366,7 +366,7 @@ fn a_restarted_leader_serves_nothing_until_the_standby_acknowledges() {
         restarted.events(&ns(), None, &[], None, 10),
         Err(DurableError::NoStandby)
     ));
-    assert!(restarted.acknowledge(STANDBY, 1, 0));
+    assert!(restarted.acknowledge(STANDBY, 1, 0, restarted.stamp()));
     assert!(restarted.healthy());
     assert!(restarted.get_fence(&ns(), "zone", None).unwrap().is_some());
 }
@@ -377,11 +377,11 @@ async fn events_are_served_only_up_to_the_acknowledged_lsn() {
         &scratch("events"),
         sync(Duration::from_secs(30), Duration::from_secs(30)),
     ));
-    assert!(leader.acknowledge(STANDBY, 0, 0));
+    assert!(leader.acknowledge(STANDBY, 0, 0, leader.stamp()));
     let fenced = leader.clone();
     let fencing = tokio::task::spawn_blocking(move || fenced.put_fence(&ns(), fence(), 0));
     eventually("the fence is logged", || leader.last_lsn().unwrap() == 1).await;
-    leader.acknowledge(STANDBY, 1, 0);
+    leader.acknowledge(STANDBY, 1, 0, leader.stamp());
     fencing.await.unwrap().unwrap();
 
     let auth: Arc<dyn Authenticator> = Arc::new(StaticToken::new(TOKEN, "t"));
@@ -406,7 +406,7 @@ async fn events_are_served_only_up_to_the_acknowledged_lsn() {
     );
 
     // Acknowledged: served, and the subscriber is woken.
-    assert!(leader.acknowledge(STANDBY, 2, 0));
+    assert!(leader.acknowledge(STANDBY, 2, 0, leader.stamp()));
     write.await.unwrap().unwrap();
     let event = tokio::time::timeout(Duration::from_secs(30), subscribed.recv())
         .await
@@ -479,7 +479,7 @@ async fn a_standby_at_a_higher_epoch_refuses_the_old_leader_which_acknowledges_n
     assert!(stopped.to_string().contains("epoch"), "{stopped}");
     assert_eq!(engine.last_lsn().unwrap(), 10);
     // Even an acknowledgement it sent would carry the higher epoch.
-    assert!(!old.acknowledge(STANDBY, 10, 1));
+    assert!(!old.acknowledge(STANDBY, 10, 1, old.stamp()));
     assert!(!old.healthy());
     assert_eq!(health(&old_url).await, 503);
     let mut client = EzuClient::connect(old_url).await.unwrap();
@@ -527,7 +527,7 @@ fn a_snapshot_keeps_the_log_the_standby_has_not_acknowledged() {
         &scratch("retain"),
         sync(Duration::from_secs(30), Duration::from_secs(30)),
     ));
-    assert!(leader.acknowledge(STANDBY, 0, 0));
+    assert!(leader.acknowledge(STANDBY, 0, 0, leader.stamp()));
     // Two unacknowledged batches, the second in a segment of its own (the
     // first fills the 64 KiB segment), then a snapshot.
     let write = |from: u64| {
@@ -550,7 +550,7 @@ fn a_snapshot_keeps_the_log_the_standby_has_not_acknowledged() {
         let applied = standby
             .apply_shipped(leader.ship(&mut from, 1 << 20).unwrap(), 0)
             .unwrap();
-        leader.acknowledge(STANDBY, applied, 0);
+        leader.acknowledge(STANDBY, applied, 0, leader.stamp());
     }
     first.join().unwrap().unwrap();
     second.join().unwrap().unwrap();
@@ -580,11 +580,11 @@ fn a_resume_point_never_passes_the_acknowledged_lsn() {
         .unwrap()
     };
     let leader = Arc::new(open());
-    assert!(leader.acknowledge(STANDBY, 0, 0));
+    assert!(leader.acknowledge(STANDBY, 0, 0, leader.stamp()));
     let fenced = leader.clone();
     let fencing = std::thread::spawn(move || fenced.put_fence(&ns(), fence(), 0));
     eventually_blocking(|| leader.last_lsn().unwrap() == 1);
-    leader.acknowledge(STANDBY, 1, 0);
+    leader.acknowledge(STANDBY, 1, 0, leader.stamp());
     fencing.join().unwrap().unwrap();
 
     // One batch raising more events than are retained, not acknowledged.
@@ -599,7 +599,7 @@ fn a_resume_point_never_passes_the_acknowledged_lsn() {
     assert!(page.through.0 <= 1, "{page:?}");
 
     // Acknowledged, a reader pages forward from there through every event.
-    leader.acknowledge(STANDBY, 11, 0);
+    leader.acknowledge(STANDBY, 11, 0, leader.stamp());
     batch.join().unwrap().unwrap();
     let (mut cursor, mut read) = (page.through, Vec::new());
     loop {
@@ -629,12 +629,12 @@ fn unacknowledged_events_outlive_a_leader_restart() {
         .unwrap()
     };
     let leader = open(Duration::from_millis(200));
-    assert!(leader.acknowledge(STANDBY, 0, 0));
+    assert!(leader.acknowledge(STANDBY, 0, 0, leader.stamp()));
     assert!(matches!(
         leader.put_fence(&ns(), fence(), 0),
         Err(DurableError::Unacknowledged(1))
     ));
-    leader.acknowledge(STANDBY, 1, 0);
+    leader.acknowledge(STANDBY, 1, 0, leader.stamp());
     // A batch raising more events than are retained, never acknowledged
     // before the leader goes down.
     let entering = (0..10).map(|i| vehicle(i, 0.0)).collect();
@@ -649,7 +649,7 @@ fn unacknowledged_events_outlive_a_leader_restart() {
     // Restarted, the standby catches up, and a reader resuming from its
     // cursor gets every event.
     let restarted = open(Duration::from_secs(30));
-    assert!(restarted.acknowledge(STANDBY, 11, 0));
+    assert!(restarted.acknowledge(STANDBY, 11, 0, restarted.stamp()));
     let page = restarted
         .events(&ns(), Some(cursor), &[], None, 100)
         .unwrap();

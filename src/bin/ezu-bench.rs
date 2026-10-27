@@ -180,7 +180,7 @@ fn sync_standby(dir: &Path, count: u64) -> Result<Value, String> {
     let standby = DurableEngine::open_follower(config(&dir.join("standby"), true), quotas(), 0)
         .map_err(|error| error.to_string())?;
     // The lease starts with the standby's first acknowledgement.
-    leader.acknowledge(NODE, 0, 0);
+    leader.acknowledge(NODE, 0, 0, leader.stamp());
     let done = Arc::new(AtomicBool::new(false));
     let tailing = {
         let (leader, done) = (leader.clone(), done.clone());
@@ -209,11 +209,12 @@ fn sync_standby(dir: &Path, count: u64) -> Result<Value, String> {
                     });
                     continue;
                 }
+                let stamp = shipped.stamp;
                 let applied = standby
                     .apply_shipped(shipped, 0)
                     .map_err(|error| error.to_string())?;
                 let epoch = standby.epoch().map_err(|error| error.to_string())?;
-                leader.acknowledge(NODE, applied, epoch);
+                leader.acknowledge(NODE, applied, epoch, stamp);
             }
         })
     };

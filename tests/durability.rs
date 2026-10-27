@@ -499,14 +499,22 @@ fn a_promotion_fences_the_old_owner_and_outlives_restarts_and_snapshots() {
     drop(engine);
 
     // A restart keeps the epoch, and so does dropping every segment that
-    // recorded the promotion.
+    // recorded the promotion. The lineage holds where the epoch started: the
+    // old owner's last record, taken by the first open after the raise.
+    let started = [ezu::EpochStart {
+        epoch: 1,
+        start_lsn: 5,
+        node_id: String::new(),
+    }];
     let engine = DurableEngine::open(config(&dir, u64::MAX), quotas(), None, 0).unwrap();
     assert_eq!(engine.epoch().unwrap(), 1);
+    assert_eq!(engine.lineage(), started);
     engine.snapshot(0).unwrap();
     drop(engine);
     let engine = DurableEngine::open(config(&dir, u64::MAX), quotas(), None, 0).unwrap();
     assert_eq!(engine.epoch().unwrap(), 1);
     assert_eq!(contents(&engine).len(), 6);
+    assert_eq!(engine.lineage(), started);
     drop(engine);
     // The log itself carries the epoch, should the epoch file go missing.
     fs::remove_file(dir.join("wal").join("EPOCH")).unwrap();

@@ -32,6 +32,20 @@
 //! lock is released, so concurrent writes share one round trip. Without an
 //! acknowledgement for the lease it refuses reads and writes and reports
 //! unhealthy, and it serves fence events only up to the acknowledged LSN.
+//! Its other followers are shipped only what the standby acknowledged, so
+//! none holds a write the standby lacks.
+//!
+//! [`DurableEngine::promote_follower`] turns a follower into a leader in
+//! place: it stops following, waits out its old leader's lease, records the
+//! intent in `FOLLOWER`, raises the epoch past the highest it followed with
+//! a new start in the log's lineage (`wal/LINEAGE`, see [`crate::wal`]), and
+//! drops the mark. LSNs, and so event ids, continue after the applied LSN.
+//! Without force only the leader's sync standby promotes, as it holds every
+//! acknowledged write. A crash in between is completed by the next open as
+//! a leader. A follower switching to another leader is checked against that
+//! leader's lineage ([`DurableEngine::check_lineage`]) as well as its last
+//! record, so a log promoted differently is refused even when its last
+//! record is the same.
 
 use crate::entity::{Entity, Labels, Namespace, visible};
 use crate::fence::{
@@ -43,6 +57,7 @@ use crate::keys::sekai_keys::{Dek, KeyId};
 use crate::keys::{self, KeyConfig, Keyring};
 use crate::metrics::{Gauges, Metrics};
 use crate::snapshot::{self, DataFile, Found, Part, SealInfo, SnapshotError};
+pub use crate::wal::EpochStart;
 use crate::wal::{Entry, Op, Record, Tail, TailError, Wal, WalError};
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -131,6 +146,13 @@ pub enum DurableError {
         after: u64,
         last: u64,
     },
+    /// The follower directory holds a promotion that did not finish: open it
+    /// as a leader, which completes it.
+    PromotionPending,
+    /// This follower stopped following: it is being promoted, or was.
+    Promoted,
+    /// A promotion was refused; nothing changed.
+    NotPromotable(String),
 }
 
 /// Why shipped records cannot be applied, or shipping cannot go on. A
@@ -157,6 +179,9 @@ pub enum ReplicaError {
     Damaged(String),
     /// The leader refused to ship, for a reason that will not pass.
     Leader(String),
+    /// The follower's lineage through this LSN is not the leader's: one of
+    /// them was promoted where the other was not.
+    Lineage(u64),
 }
 
 impl std::fmt::Display for ReplicaError {
@@ -187,6 +212,11 @@ impl std::fmt::Display for ReplicaError {
             ),
             Self::Damaged(why) => write!(f, "a shipped record is damaged: {why}"),
             Self::Leader(why) => write!(f, "the leader refused to ship: {why}"),
+            Self::Lineage(lsn) => write!(
+                f,
+                "the follower's epoch history through {lsn} is not the leader's (a promotion \
+                 differs); rebuild the follower"
+            ),
         }
     }
 }
@@ -222,7 +252,7 @@ impl std::fmt::Display for DurableError {
             Self::ReadOnly => f.write_str("this node is a read-only follower; write to its leader"),
             Self::FollowerDirectory => f.write_str(
                 "the data directory belongs to a follower (it holds FOLLOWER); open it as a \
-                 follower, or promote it once promotion exists (#42)",
+                 follower, or promote it (Replication.Promote)",
             ),
             Self::Replica(error) => write!(f, "replication: {error}"),
             Self::NoStandby => f.write_str(
@@ -239,6 +269,12 @@ impl std::fmt::Display for DurableError {
                 "resume point {after} is past this leader's last LSN {last}; it was read \
                  from another history"
             ),
+            Self::PromotionPending => f.write_str(
+                "a promotion of this follower did not finish; start it as a leader (without \
+                 EZU_FOLLOW) to complete it",
+            ),
+            Self::Promoted => f.write_str("this node stopped following to be promoted"),
+            Self::NotPromotable(why) => write!(f, "promotion refused: {why}"),
         }
     }
 }
@@ -298,6 +334,9 @@ pub struct DurableEngine {
     following: Option<Following>,
     /// Set on a leader with a sync standby.
     sync: Option<SyncState>,
+    /// The log's lineage, as shipped to followers and checked against
+    /// theirs; it changes only with the epoch.
+    lineage: Mutex<Vec<EpochStart>>,
     quotas: Quotas,
     config: DurabilityConfig,
     keyring: Keyring,
@@ -311,13 +350,61 @@ pub struct DurableEngine {
     _lock: File,
 }
 
-/// A follower's view of its leader, for health and metrics.
+/// A follower's view of its leader, for health and metrics, and its
+/// promotion.
 #[derive(Default)]
 struct Following {
     leader_lsn: AtomicU64,
     connected: AtomicBool,
     /// Why it stopped applying, fail closed.
     stopped: Mutex<Option<String>>,
+    /// It stopped for a reason other than its leader's log (durability was
+    /// lost), so it cannot be promoted in place.
+    lost: AtomicBool,
+    /// Its leader said it is the sync standby; kept in `FOLLOWER`.
+    designated: AtomicBool,
+    contact: Mutex<Contact>,
+    /// Promoted in place: a leader from then on.
+    promoted: AtomicBool,
+}
+
+/// A follower's acknowledgements, ordered against a promotion.
+struct Contact {
+    /// When the last acknowledgement was let out; when the engine opened
+    /// before its first, as an acknowledgement sent by an earlier process is
+    /// unknown.
+    acknowledged: Instant,
+    /// A promotion began: no acknowledgement leaves any more.
+    promoting: bool,
+    /// This process let out a stamped acknowledgement: its leader runs its
+    /// lease from stamps, so no unstamped one (of an earlier process of
+    /// this node) is counted any more.
+    stamped: bool,
+}
+
+impl Default for Contact {
+    fn default() -> Self {
+        Self {
+            acknowledged: Instant::now(),
+            promoting: false,
+            stamped: false,
+        }
+    }
+}
+
+/// How long a leader without an acknowledgement from its sync standby goes
+/// on serving (its lease), and so how long a promotion waits after the last
+/// acknowledgement before taking writes.
+pub const LEASE: Duration = Duration::from_secs(10);
+
+/// How long a promotion waits after the follower's last acknowledgement, for
+/// an old leader's `lease`. The old leader's lease runs from when it sent
+/// what that acknowledgement echoes (see [`DurableEngine::acknowledge`]),
+/// which was before the acknowledgement left, however late it arrives. The
+/// two clocks need not agree on the time, only on its rate: the twentieth
+/// added covers rates up to 5% apart.
+fn promotion_wait(lease: Duration) -> Duration {
+    lease + lease / 20
 }
 
 /// A sync standby, as a leader is configured with it.
@@ -342,6 +429,8 @@ struct SyncState {
     advanced: Condvar,
     /// The acknowledged LSN, for async waits ([`DurableEngine::acknowledged`]).
     acked_lsn: tokio::sync::watch::Sender<u64>,
+    /// What stamps count from ([`DurableEngine::stamp`]).
+    origin: Instant,
 }
 
 thread_local! {
@@ -367,6 +456,16 @@ struct Acked {
     lsn: u64,
     /// When the standby last acknowledged anything; `None` before its first.
     at: Option<Instant>,
+    /// The last acknowledgement carried no stamp: a standby from before
+    /// promotion.
+    unstamped: bool,
+    /// The newest stamp acknowledged; 0 before the first. From the first
+    /// on, unstamped acknowledgements are refused for good.
+    stamp: u64,
+    /// Unstamped acknowledgements refused after a stamped one.
+    refused_unstamped: u64,
+    /// The standby's current sync stream ([`DurableEngine::sync_session`]).
+    session: u64,
 }
 
 /// Where a leader's sync standby stands, read for health and metrics.
@@ -375,6 +474,12 @@ pub struct Standby {
     pub acked_lsn: u64,
     /// Whether an acknowledgement arrived within the lease.
     pub lease_held: bool,
+    /// Whether the last acknowledgement carried no stamp (a standby from
+    /// before promotion, whose lease renews from receipt).
+    pub unstamped: bool,
+    /// Unstamped acknowledgements refused after a stamped one: from a
+    /// standby process older than the one now acknowledging.
+    pub refused_unstamped: u64,
 }
 
 /// Where a follower stands, read for health and metrics.
@@ -398,7 +503,23 @@ impl Replication {
 
 /// A leader's read position in its log for one follower; see
 /// [`DurableEngine::ship`].
-pub struct Shipping(Tail);
+pub struct Shipping {
+    tail: Tail,
+    /// Ship only what the sync standby acknowledged.
+    acknowledged: bool,
+}
+
+impl Shipping {
+    /// Ship only records the sync standby acknowledged (all without one):
+    /// for every follower but the standby, so none ever holds a write the
+    /// standby lacks, and each can follow the standby once it is promoted.
+    pub fn acknowledged_only(self) -> Self {
+        Self {
+            acknowledged: true,
+            ..self
+        }
+    }
+}
 
 /// What identifies a logged record across a leader and its followers: the
 /// CRC32 of its payload (which holds its LSN) and the epoch it was logged
@@ -411,15 +532,115 @@ pub struct Fingerprint {
 
 /// A follower's data directory carries this file.
 const FOLLOWER: &str = "FOLLOWER";
+const FOLLOWER_TEXT: &str = "A follower's data directory; a leader refuses to open it.";
 
-/// Committed records for a follower, all of one epoch, and the leader's
-/// last durable LSN when they were read.
+/// What a follower's `FOLLOWER` file records besides marking the directory,
+/// one line each after the text: `standby`, and `promoting <epoch>
+/// <start lsn> <node id>`. Releases before promotion only check the file
+/// exists.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct Marker {
+    /// The leader said this node is its sync standby.
+    standby: bool,
+    /// A promotion began: it starts this epoch.
+    promoting: Option<EpochStart>,
+}
+
+impl Marker {
+    /// The marker in `dir`, `None` without one.
+    fn read(dir: &std::path::Path) -> Result<Option<Self>, DurableError> {
+        let text = match fs::read_to_string(dir.join(FOLLOWER)) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(WalError::Io(error).into()),
+        };
+        let damaged = || DurableError::Wal(WalError::Corrupt("FOLLOWER: damaged".into()));
+        let mut marker = Self::default();
+        for line in text.lines() {
+            if line == "standby" {
+                marker.standby = true;
+            } else if let Some(intent) = line.strip_prefix("promoting ") {
+                let mut fields = intent.splitn(3, ' ');
+                let mut number = || fields.next().and_then(|field| field.parse().ok());
+                let (Some(epoch), Some(start_lsn)) = (number(), number()) else {
+                    return Err(damaged());
+                };
+                let node_id = fields.next().ok_or_else(damaged)?.to_string();
+                marker.promoting = Some(EpochStart {
+                    epoch,
+                    start_lsn,
+                    node_id,
+                });
+            }
+        }
+        Ok(Some(marker))
+    }
+
+    /// Write this marker into `dir`, durably and whole.
+    fn write(&self, dir: &std::path::Path) -> Result<(), DurableError> {
+        let mut text = format!("{FOLLOWER_TEXT}\n");
+        if self.standby {
+            text.push_str("standby\n");
+        }
+        if let Some(start) = &self.promoting {
+            text.push_str(&format!(
+                "promoting {} {} {}\n",
+                start.epoch, start.start_lsn, start.node_id
+            ));
+        }
+        let fresh = dir.join("FOLLOWER.new");
+        let written = (|| {
+            let mut file = File::create(&fresh)?;
+            std::io::Write::write_all(&mut file, text.as_bytes())?;
+            file.sync_all()?;
+            fs::rename(&fresh, dir.join(FOLLOWER))?;
+            crate::wal::sync_dir(dir)
+        })();
+        written.map_err(|error| WalError::Io(error).into())
+    }
+
+    /// Unmark `dir`: it is a leader's from now on.
+    fn remove(dir: &std::path::Path) -> Result<(), DurableError> {
+        fs::remove_file(dir.join(FOLLOWER))
+            .and_then(|()| crate::wal::sync_dir(dir))
+            .map_err(|error| WalError::Io(error).into())
+    }
+}
+
+/// Complete in `wal` the promotion `intent` names, as far as it got: the
+/// raise to its epoch, starting after the log's last LSN. Anything else in
+/// the log than that promotion left is refused.
+fn finish_promotion(wal: &mut Wal, intent: &EpochStart) -> Result<(), DurableError> {
+    if wal.epoch() == intent.epoch && wal.lineage().last() == Some(intent) {
+        return Ok(());
+    }
+    if wal.epoch() + 1 != intent.epoch || wal.last_lsn() != intent.start_lsn {
+        return Err(WalError::Corrupt(format!(
+            "FOLLOWER: a promotion to epoch {} after LSN {} does not continue this log at \
+             epoch {}, LSN {}",
+            intent.epoch,
+            intent.start_lsn,
+            wal.epoch(),
+            wal.last_lsn()
+        ))
+        .into());
+    }
+    Ok(wal.raise(intent.epoch, vec![intent.clone()])?)
+}
+
+/// Committed records for a follower, all of one epoch, the leader's last
+/// LSN it may be shipped when they were read, and the leader's lineage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Shipped {
     pub epoch: u64,
     /// Record payloads as logged, in LSN order.
     pub records: Vec<Vec<u8>>,
     pub leader_lsn: u64,
+    /// The leader's epoch starts, which a follower takes with its epochs.
+    pub lineage: Vec<EpochStart>,
+    /// The leader's [`DurableEngine::stamp`] taken before the read, which
+    /// the follower's acknowledgement echoes.
+    pub stamp: u64,
 }
 
 impl DurableEngine {
@@ -502,24 +723,37 @@ impl DurableEngine {
             .open(config.dir.join("LOCK"))
             .map_err(WalError::Io)?;
         lock.try_lock().map_err(|_| DurableError::Locked)?;
-        let marker = config.dir.join(FOLLOWER);
-        match &following {
-            None if marker.exists() => return Err(DurableError::FollowerDirectory),
-            None => {}
+        // A follower's directory opens as a leader's only to complete a
+        // promotion, and then no longer as a follower's.
+        let promoting = match (&following, Marker::read(&config.dir)?) {
+            (
+                None,
+                Some(Marker {
+                    promoting: Some(intent),
+                    ..
+                }),
+            ) => Some(intent),
+            (None, Some(_)) => return Err(DurableError::FollowerDirectory),
+            (
+                Some(_),
+                Some(Marker {
+                    promoting: Some(_), ..
+                }),
+            ) => return Err(DurableError::PromotionPending),
+            (Some(following), Some(marker)) => {
+                following
+                    .designated
+                    .store(marker.standby, Ordering::Release);
+                None
+            }
             // Durable before anything is applied, so a follower's directory
             // is never mistaken for a leader's.
-            Some(_) if marker.exists() => {}
-            Some(_) => {
-                let mut file = File::create_new(&marker).map_err(WalError::Io)?;
-                std::io::Write::write_all(
-                    &mut file,
-                    b"A follower's data directory; a leader refuses to open it.\n",
-                )
-                .map_err(WalError::Io)?;
-                file.sync_all().map_err(WalError::Io)?;
-                crate::wal::sync_dir(&config.dir).map_err(WalError::Io)?;
+            (Some(_), None) => {
+                Marker::default().write(&config.dir)?;
+                None
             }
-        }
+            (None, None) => None,
+        };
         // Taken only once the directory lock is held, so a held `OWNER`
         // always belongs to the directory's owner, never to an opener that
         // is about to fail on `LOCK`. A promotion in the gap between the two
@@ -590,13 +824,17 @@ impl DurableEngine {
         } else {
             base_lsn
         };
-        let (wal, records) = Wal::open(
+        let (mut wal, records) = Wal::open(
             &wal_dir,
             floor,
             config.segment_bytes,
             config.fsync,
             !rebuilt,
         )?;
+        if let Some(intent) = &promoting {
+            finish_promotion(&mut wal, intent)?;
+            Marker::remove(&config.dir)?;
+        }
         if rebuilt {
             // Every event before the rebuild is gone; new writes take LSNs
             // past every discarded record, so every id before them is.
@@ -646,6 +884,7 @@ impl DurableEngine {
         }
         let durable_lsn = wal.last_lsn();
         let epoch = wal.epoch();
+        let lineage = wal.lineage().to_vec();
         let mut replayed = 0;
         for record in records {
             if record.lsn <= base_lsn {
@@ -698,7 +937,9 @@ impl DurableEngine {
                 acked: Mutex::new(Acked::default()),
                 advanced: Condvar::new(),
                 acked_lsn: tokio::sync::watch::Sender::new(0),
+                origin: Instant::now(),
             }),
+            lineage: Mutex::new(lineage),
             events_floor,
             quotas,
             config,
@@ -712,7 +953,7 @@ impl DurableEngine {
         // quota now, through the log like any other removal. A follower's
         // removals come from its leader's log. One that waits for a standby
         // has none yet; its periodic sweep catches up once it has.
-        if durable.following.is_none() && durable.sync.is_none() {
+        if durable.follower().is_none() && durable.sync.is_none() {
             durable.sweep_expired(now_ms)?;
         }
         if rebuilt {
@@ -723,11 +964,66 @@ impl DurableEngine {
     }
 
     /// Count an acknowledgement from the follower `node_id`: it holds this
-    /// log through `lsn`, synced, and follows `epoch`. Only the sync
-    /// standby's counts, only at this leader's epoch, and never past this
-    /// log's last durable LSN; acknowledgements are cumulative, so an older
-    /// one changes nothing but the lease. Returns whether it counted.
-    pub fn acknowledge(&self, node_id: &str, lsn: u64, epoch: u64) -> bool {
+    /// log through `lsn`, synced, and follows `epoch`, and it echoes `stamp`,
+    /// the newest [`Self::stamp`] it was shipped (0: none). Only the sync standby's
+    /// counts, only at this leader's epoch, and never past this log's last
+    /// durable LSN; acknowledgements are cumulative, so an older one changes
+    /// nothing but the lease. The lease runs from when the stamp was taken,
+    /// not from when the acknowledgement arrived: one delayed in transit
+    /// cannot keep this leader serving past a promotion of its standby,
+    /// which waits from when it let the acknowledgement out. An unstamped
+    /// acknowledgement, from a standby of a release before promotion, renews
+    /// it from receipt, as that release did ([`Standby::unstamped`]), but
+    /// only until the first stamped one: from then on, for this engine's
+    /// life, unstamped ones are refused ([`Standby::refused_unstamped`]),
+    /// and the lease is the newest stamp's alone. Returns whether it
+    /// counted.
+    pub fn acknowledge(&self, node_id: &str, lsn: u64, epoch: u64, stamp: u64) -> bool {
+        self.count_acknowledgement(None, node_id, lsn, epoch, stamp)
+    }
+
+    /// Open a sync stream for the follower `node_id` and return its session
+    /// when it is this leader's standby: every older stream of it is
+    /// superseded, and what still arrives on one is not counted.
+    pub fn sync_session(&self, node_id: &str) -> Option<u64> {
+        let sync = self
+            .sync
+            .as_ref()
+            .filter(|_| self.is_sync_standby(node_id))?;
+        let mut acked = sync.acked.lock().ok()?;
+        acked.session += 1;
+        Some(acked.session)
+    }
+
+    /// Whether `session` is still the standby's current sync stream.
+    pub fn session_current(&self, session: u64) -> bool {
+        self.sync
+            .as_ref()
+            .and_then(|sync| sync.acked.lock().ok())
+            .is_some_and(|acked| acked.session == session)
+    }
+
+    /// [`Self::acknowledge`] arriving on the sync stream `session`; not
+    /// counted once a newer stream of the standby opened.
+    pub fn acknowledge_on(
+        &self,
+        session: u64,
+        node_id: &str,
+        lsn: u64,
+        epoch: u64,
+        stamp: u64,
+    ) -> bool {
+        self.count_acknowledgement(Some(session), node_id, lsn, epoch, stamp)
+    }
+
+    fn count_acknowledgement(
+        &self,
+        session: Option<u64>,
+        node_id: &str,
+        lsn: u64,
+        epoch: u64,
+        stamp: u64,
+    ) -> bool {
         let Some(sync) = &self.sync else {
             return false;
         };
@@ -737,7 +1033,34 @@ impl DurableEngine {
         let Ok(mut acked) = sync.acked.lock() else {
             return false;
         };
-        acked.at = Some(Instant::now());
+        if session.is_some_and(|session| session != acked.session) {
+            return false;
+        }
+        let now = Instant::now();
+        match stamp {
+            // A standby process from before stamps, after one that stamps:
+            // a stale acknowledgement, never counted.
+            0 if acked.stamp > 0 => {
+                acked.refused_unstamped += 1;
+                return false;
+            }
+            // A standby from before promotion, which cannot be promoted
+            // while it sends none: the lease renews from receipt.
+            0 => {
+                acked.unstamped = true;
+                acked.at = Some(acked.at.map_or(now, |at| at.max(now)));
+            }
+            stamp => {
+                acked.unstamped = false;
+                if stamp > acked.stamp {
+                    acked.stamp = stamp;
+                    // A stamp from the future was never sent; it counts as
+                    // sent now. Assigned, not raised: no renewal from a
+                    // receipt outlasts the first stamp.
+                    acked.at = Some((sync.origin + Duration::from_micros(stamp - 1)).min(now));
+                }
+            }
+        }
         if lsn <= acked.lsn {
             return true;
         }
@@ -753,10 +1076,76 @@ impl DurableEngine {
             }
             advanced
         });
-        // Events up to the new LSN may now be served.
+        // Events up to the new LSN may now be served, and records up to it
+        // shipped to the other followers.
         self.published
             .send_modify(|count| *count = count.wrapping_add(1));
+        self.durable.send_modify(|_| {});
         true
+    }
+
+    /// The follower state, while this engine follows (not once promoted).
+    fn follower(&self) -> Option<&Following> {
+        self.following
+            .as_ref()
+            .filter(|following| !following.promoted.load(Ordering::Acquire))
+    }
+
+    /// The follower state, to apply what the leader ships: refused on a
+    /// leader, and once promoted.
+    fn applying(&self) -> Result<&Following, DurableError> {
+        match &self.following {
+            None => Err(DurableError::ReadOnly),
+            Some(following) if following.promoted.load(Ordering::Acquire) => {
+                Err(DurableError::Promoted)
+            }
+            Some(following) => Ok(following),
+        }
+    }
+
+    /// The log's lineage: where each epoch started, oldest first.
+    pub fn lineage(&self) -> Vec<EpochStart> {
+        self.lineage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Refuse a follower whose `lineage` through `after`, its applied LSN,
+    /// is not this log's: it must be a prefix of this lineage that holds
+    /// every epoch start before `after`. With the last record's fingerprint
+    /// ([`Self::shipping`]), this proves the follower's history is this
+    /// log's: within one epoch start, one node wrote the log.
+    pub fn check_lineage(&self, after: u64, lineage: &[EpochStart]) -> Result<(), DurableError> {
+        let ours = self.lineage();
+        let shared = ours.get(..lineage.len()) == Some(lineage);
+        let rest = ours.get(lineage.len()..).unwrap_or_default();
+        match shared
+            && lineage.iter().all(|start| start.start_lsn <= after)
+            && rest.iter().all(|start| start.start_lsn >= after)
+        {
+            true => Ok(()),
+            false => Err(ReplicaError::Lineage(after).into()),
+        }
+    }
+
+    /// Whether this is the node id of this leader's sync standby.
+    pub fn is_sync_standby(&self, node_id: &str) -> bool {
+        self.sync
+            .as_ref()
+            .is_some_and(|sync| sync.standby.node_id == node_id)
+    }
+
+    /// This leader's clock, for a shipped batch to carry and its
+    /// acknowledgement to echo: the lease runs from it. One more than the
+    /// microseconds since it opened, so it is never 0, which is no stamp. 0
+    /// without a sync standby.
+    pub fn stamp(&self) -> u64 {
+        self.sync.as_ref().map_or(0, |sync| {
+            u64::try_from(sync.origin.elapsed().as_micros())
+                .unwrap_or(u64::MAX - 1)
+                .saturating_add(1)
+        })
     }
 
     /// Where the sync standby stands; `None` without one.
@@ -766,6 +1155,8 @@ impl DurableEngine {
         Some(Standby {
             acked_lsn: acked.lsn,
             lease_held: lease_held(&acked, sync.standby.lease),
+            unstamped: acked.unstamped,
+            refused_unstamped: acked.refused_unstamped,
         })
     }
 
@@ -1091,7 +1482,7 @@ impl DurableEngine {
         now_ms: i64,
         change: impl FnOnce(&Engine, &Fences, &mut Vec<Op>) -> T,
     ) -> Result<T, DurableError> {
-        if self.following.is_some() {
+        if self.follower().is_some() {
             return Err(DurableError::ReadOnly);
         }
         self.check_lease()?;
@@ -1449,9 +1840,9 @@ impl DurableEngine {
     /// `None`), of the given fences (all when empty), oldest first, at most
     /// `limit`, and the id read through. A reader whose `after` is older
     /// than the newest dropped event, or than history the store kept, gets
-    /// [`DurableError::Expired`]: it has missed events. With a sync standby,
-    /// only events of writes the standby acknowledged are read, and a
-    /// reader past this log's last LSN gets [`DurableError::ResumeAhead`].
+    /// [`DurableError::Expired`]: it has missed events. On a leader, a reader
+    /// past this log's last LSN gets [`DurableError::ResumeAhead`]. With a
+    /// sync standby, only events of writes the standby acknowledged are read.
     pub fn events(
         &self,
         ns: &Namespace,
@@ -1467,18 +1858,15 @@ impl DurableEngine {
         {
             return Err(DurableError::Expired(Expired { dropped: floor }));
         }
-        let horizon = match &self.sync {
-            None => u64::MAX,
-            Some(_) => {
-                let last = *self.durable.borrow();
-                if let Some((lsn, _)) = after
-                    && lsn > last
-                {
-                    return Err(DurableError::ResumeAhead { after: lsn, last });
-                }
-                self.acked_horizon()?
-            }
-        };
+        // A follower may be behind the reader; a leader holds everything.
+        let last = *self.durable.borrow();
+        if self.follower().is_none()
+            && let Some((lsn, _)) = after
+            && lsn > last
+        {
+            return Err(DurableError::ResumeAhead { after: lsn, last });
+        }
+        let horizon = self.acked_horizon()?;
         let events = self.events.lock().map_err(|_| DurableError::Failed)?;
         let mut page = match events.get(ns) {
             Some(recent) => recent
@@ -1603,7 +1991,7 @@ impl DurableEngine {
     /// Start a new current key for `ns`. New writes use it at once; the
     /// next snapshot re-seals older data under it and retires the old key.
     pub fn rotate_key(&self, ns: &Namespace) -> Result<(), DurableError> {
-        if self.following.is_some() {
+        if self.follower().is_some() {
             return Err(DurableError::ReadOnly);
         }
         let mut writer = self.writer.lock().map_err(|_| DurableError::Failed)?;
@@ -1646,15 +2034,19 @@ impl DurableEngine {
             .into());
         }
         let wal = self.config.dir.join("wal");
+        let shipping = |tail| Shipping {
+            tail,
+            acknowledged: false,
+        };
         let Some(last) = last.filter(|_| after > 0) else {
-            return Ok(Shipping(Tail::new(&wal, after)));
+            return Ok(shipping(Tail::new(&wal, after)));
         };
         // Read through the durable horizon, not just `after`: a follower may
         // have stopped inside one of this log's batches (shipping splits
         // them), and the rest of the batch is shipped from this tail.
         let mut tail = Tail::new(&wal, after - 1);
         match fingerprint_at(&mut tail, after, through)? {
-            Some(held) if held == last => Ok(Shipping(tail)),
+            Some(held) if held == last => Ok(shipping(tail)),
             Some(_) => Err(ReplicaError::Diverged(after).into()),
             None => Err(ReplicaError::Gone(after - 1).into()),
         }
@@ -1675,27 +2067,38 @@ impl DurableEngine {
     }
 
     /// The next committed records for the follower reading at `from`,
-    /// about `budget` bytes, never past the last durable LSN; none when it
+    /// about `budget` bytes, never past the last durable LSN (or the
+    /// acknowledged one, see [`Shipping::acknowledged_only`]); none when it
     /// has everything. A follower whose next record is gone, or that is
     /// ahead of this log, gets [`DurableError::Replica`].
     pub fn ship(&self, from: &mut Shipping, budget: usize) -> Result<Shipped, DurableError> {
-        let through = *self.durable.borrow();
-        let after = from.0.after();
-        if after > through {
+        let stamp = self.stamp();
+        let durable = *self.durable.borrow();
+        let after = from.tail.after();
+        if after > durable {
             return Err(ReplicaError::Ahead {
                 applied: after,
-                leader: through,
+                leader: durable,
             }
             .into());
         }
-        let (epoch, records) = from.0.next(through, budget).map_err(|error| match error {
-            TailError::Gone(lsn) => DurableError::Replica(ReplicaError::Gone(lsn)),
-            TailError::Wal(error) => error.into(),
-        })?;
+        let through = match from.acknowledged {
+            true => durable.min(self.acked_horizon()?),
+            false => durable,
+        };
+        let (epoch, records) = from
+            .tail
+            .next(through, budget)
+            .map_err(|error| match error {
+                TailError::Gone(lsn) => DurableError::Replica(ReplicaError::Gone(lsn)),
+                TailError::Wal(error) => error.into(),
+            })?;
         Ok(Shipped {
             epoch,
             records: records.into_iter().map(|record| record.payload).collect(),
             leader_lsn: through,
+            lineage: self.lineage(),
+            stamp,
         })
     }
 
@@ -1712,13 +2115,16 @@ impl DurableEngine {
     /// LSN. A gap, an epoch going back, a sealed or damaged record, or a
     /// failure to log stops the follower for good (fail closed).
     pub fn apply_shipped(&self, shipped: Shipped, now_ms: i64) -> Result<u64, DurableError> {
-        let Some(following) = &self.following else {
-            return Err(DurableError::ReadOnly);
-        };
+        let following = self.applying()?;
         following
             .leader_lsn
             .fetch_max(shipped.leader_lsn, Ordering::AcqRel);
         let mut writer = self.writer.lock().map_err(|_| DurableError::Failed)?;
+        // Under the writer lock, which a promotion takes after it began: it
+        // applies nothing after.
+        if promoting(following)? {
+            return Err(DurableError::Promoted);
+        }
         if self.failed.load(Ordering::Acquire) {
             return Err(DurableError::Failed);
         }
@@ -1743,6 +2149,15 @@ impl DurableEngine {
     }
 
     fn stop(&self, following: &Following, error: DurableError) -> DurableError {
+        // Following ends for a promotion without failing anything; any other
+        // reason, also during a promotion, fails it as always. Once promoted,
+        // what the old following reports no longer concerns this leader.
+        if matches!(error, DurableError::Promoted) || following.promoted.load(Ordering::Acquire) {
+            return error;
+        }
+        if !matches!(error, DurableError::Replica(_)) {
+            following.lost.store(true, Ordering::Release);
+        }
         self.failed.store(true, Ordering::Release);
         if let Ok(mut stopped) = following.stopped.lock() {
             stopped.get_or_insert_with(|| error.to_string());
@@ -1793,7 +2208,7 @@ impl DurableEngine {
             .into());
         }
         // Recorded before any record of the new epoch, as on the leader.
-        writer.wal.follow_epoch(shipped.epoch)?;
+        self.follow_epoch(writer, shipped.epoch, &shipped.lineage)?;
         // Logged before the index changes: on a failure the log is ahead,
         // and a reopen replays it.
         let last = writer.wal.append_shipped(&records)?;
@@ -1821,39 +2236,264 @@ impl DurableEngine {
 
     /// Take `epoch`, the leader's, as a sync standby hears it in a heartbeat
     /// once it holds everything shipped, so it acknowledges at the leader's
-    /// epoch even before a record of it arrives. A leader at an older epoch
-    /// than this follower's is refused, and the follower stops (fail closed):
-    /// an old leader never gets an acknowledgement from it.
-    pub fn follow_leader_epoch(&self, epoch: u64) -> Result<(), DurableError> {
-        let Some(following) = &self.following else {
-            return Err(DurableError::ReadOnly);
-        };
+    /// epoch even before a record of it arrives; with it, the leader's
+    /// epoch starts from its `lineage`. An epoch starting past this
+    /// follower's last record is left until the records up to its start
+    /// arrive, which take it then. A leader at an older epoch than this
+    /// follower's is refused, and the follower stops (fail closed): an old
+    /// leader never gets an acknowledgement from it.
+    pub fn follow_leader_epoch(
+        &self,
+        epoch: u64,
+        lineage: &[EpochStart],
+    ) -> Result<(), DurableError> {
+        let following = self.applying()?;
         let mut writer = self.writer.lock().map_err(|_| DurableError::Failed)?;
+        if promoting(following)? {
+            return Err(DurableError::Promoted);
+        }
         if self.failed.load(Ordering::Acquire) {
             return Err(DurableError::Failed);
         }
-        let seen = writer.wal.epoch();
+        let (seen, last) = (writer.wal.epoch(), writer.wal.last_lsn());
+        // An epoch that starts past what this follower holds (a leader that
+        // ships it only what its standby acknowledged, behind the promotion
+        // point) is taken later, with the records before its start.
+        let ahead = lineage
+            .iter()
+            .any(|start| start.epoch > seen && start.epoch <= epoch && start.start_lsn > last);
         let followed = match epoch < seen {
             true => Err(ReplicaError::EpochBack {
                 seen,
                 shipped: epoch,
             }
             .into()),
-            false => writer.wal.follow_epoch(epoch).map_err(DurableError::from),
+            false if ahead => Ok(()),
+            false => self.follow_epoch(&mut writer, epoch, lineage),
         };
         followed.map_err(|error| self.stop(following, error))
     }
 
+    /// Take `epoch`, when past this follower's, with the starts of the epochs
+    /// up to it from the leader's `lineage` (none for epochs the leader has no
+    /// start of). A start past what this follower holds is not its history,
+    /// and neither is the epoch it is at when the leader's started elsewhere.
+    fn follow_epoch(
+        &self,
+        writer: &mut Writer,
+        epoch: u64,
+        lineage: &[EpochStart],
+    ) -> Result<(), DurableError> {
+        let (seen, last) = (writer.wal.epoch(), writer.wal.last_lsn());
+        if epoch < seen {
+            return Ok(());
+        }
+        if epoch == seen {
+            // The epoch this follower is at must have started where the
+            // leader's did: two nodes promoted to one epoch are two histories.
+            // A leader without a lineage (an earlier release) is not checked.
+            let start =
+                |lineage: &[EpochStart]| lineage.iter().find(|start| start.epoch == seen).cloned();
+            if seen > 0 && !lineage.is_empty() && start(lineage) != start(writer.wal.lineage()) {
+                return Err(ReplicaError::Lineage(last).into());
+            }
+            return Ok(());
+        }
+        let starts: Vec<EpochStart> = lineage
+            .iter()
+            .filter(|start| start.epoch > seen && start.epoch <= epoch)
+            .cloned()
+            .collect();
+        if let Some(ahead) = starts.iter().find(|start| start.start_lsn > last) {
+            return Err(ReplicaError::Lineage(ahead.start_lsn).into());
+        }
+        writer.wal.follow_epoch(epoch, starts)?;
+        self.set_lineage(writer.wal.lineage());
+        Ok(())
+    }
+
+    fn set_lineage(&self, lineage: &[EpochStart]) {
+        let mut held = self
+            .lineage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *held = lineage.to_vec();
+    }
+
+    /// Record whether this follower's leader says it is its sync standby,
+    /// durably in `FOLLOWER`, so a promotion without force knows it. Only a
+    /// change is written.
+    pub fn designate(&self, standby: bool) -> Result<(), DurableError> {
+        let following = self.applying()?;
+        if following.designated.load(Ordering::Acquire) == standby {
+            return Ok(());
+        }
+        // Under the writer lock, as a promotion writes the file under it.
+        let _writer = self.writer.lock().map_err(|_| DurableError::Failed)?;
+        if promoting(following)? {
+            return Err(DurableError::Promoted);
+        }
+        Marker {
+            standby,
+            promoting: None,
+        }
+        .write(&self.config.dir)?;
+        following.designated.store(standby, Ordering::Release);
+        Ok(())
+    }
+
+    /// Whether this follower may let out an acknowledgement of what it
+    /// applied, noting when: not once a promotion began, which so knows the
+    /// last acknowledgement its old leader can have counted.
+    pub fn may_acknowledge(&self, stamped: bool) -> bool {
+        let Some(following) = self.follower() else {
+            return false;
+        };
+        let Ok(mut contact) = following.contact.lock() else {
+            return false;
+        };
+        if contact.promoting {
+            return false;
+        }
+        contact.acknowledged = Instant::now();
+        contact.stamped |= stamped;
+        true
+    }
+
+    /// Promote this follower to a leader in place, as the node `node_id`,
+    /// and return its new epoch. Without `force`, only the leader's sync
+    /// standby is promoted: it holds every acknowledged write. Forcing
+    /// another follower is for a leader and standby known to be gone; it
+    /// loses what the standby had that this follower lacks.
+    ///
+    /// It stops following, so no acknowledgement leaves after, and waits
+    /// until `lease` (the old leader's, with a margin for clock rates, see
+    /// [`promotion_wait`]) passed since its last one, or since it opened when
+    /// it sent none since, so the old leader serves nothing once this one
+    /// takes writes. Under the writer
+    /// lock it then writes the intent into `FOLLOWER`, raises the epoch past
+    /// the highest it followed with a start of its own in the lineage (a new
+    /// segment begins with the promotion frame), and removes `FOLLOWER`. The
+    /// next write takes the LSN after the applied one, so event ids go on
+    /// without a gap. A crash in between is completed by the next open as a
+    /// leader ([`Self::open`]); [`Self::open_follower`] refuses the
+    /// directory. Asked again, it returns the same epoch, also after a
+    /// restart as a leader. Blocks for the wait.
+    pub fn promote_follower(
+        &self,
+        node_id: &str,
+        force: bool,
+        lease: Duration,
+    ) -> Result<u64, DurableError> {
+        if node_id.is_empty() || node_id.chars().any(char::is_control) {
+            return Err(DurableError::NotPromotable(
+                "a promotion needs this node's id (EZU_NODE_ID) to record in the lineage".into(),
+            ));
+        }
+        let Some(following) = &self.following else {
+            let writer = self.writer.lock().map_err(|_| DurableError::Failed)?;
+            return match writer.wal.lineage().last() {
+                // This node's own promotion, asked again after a restart.
+                Some(start) if start.node_id == node_id && start.epoch == writer.wal.epoch() => {
+                    Ok(start.epoch)
+                }
+                _ => Err(DurableError::NotPromotable(
+                    "this node is not a follower".into(),
+                )),
+            };
+        };
+        if following.promoted.load(Ordering::Acquire) {
+            return self.epoch();
+        }
+        if !force && !following.designated.load(Ordering::Acquire) {
+            return Err(DurableError::NotPromotable(
+                "this follower is not its leader's sync standby; force it only once the leader \
+                 and its standby are gone"
+                    .into(),
+            ));
+        }
+        self.refuse_failed(following)?;
+        let acknowledged = {
+            let mut contact = following.contact.lock().map_err(|_| DurableError::Failed)?;
+            // An acknowledgement from this node's process before, unstamped,
+            // could still renew the old leader's lease from its receipt;
+            // after a stamped one from this process, the leader counts none.
+            if !force && !contact.stamped {
+                return Err(DurableError::NotPromotable(
+                    "this standby has not acknowledged its leader with a lease stamp since it \
+                     started; wait until it follows a leader of this release, or force it"
+                        .into(),
+                ));
+            }
+            contact.promoting = true;
+            contact.acknowledged
+        };
+        let until = acknowledged + promotion_wait(lease);
+        std::thread::sleep(until.saturating_duration_since(Instant::now()));
+        let mut writer = self.writer.lock().map_err(|_| DurableError::Failed)?;
+        if following.promoted.load(Ordering::Acquire) {
+            return Ok(writer.wal.epoch());
+        }
+        // A failure while this waited (an apply under way when it began) is
+        // not hidden by the promotion.
+        self.refuse_failed(following)?;
+        let intent = EpochStart {
+            epoch: writer.wal.epoch() + 1,
+            start_lsn: writer.wal.last_lsn(),
+            node_id: node_id.to_string(),
+        };
+        let marker = Marker {
+            standby: following.designated.load(Ordering::Acquire),
+            promoting: Some(intent.clone()),
+        };
+        let promoted = marker
+            .write(&self.config.dir)
+            .and_then(|()| Ok(writer.wal.raise(intent.epoch, vec![intent.clone()])?))
+            .and_then(|()| Marker::remove(&self.config.dir));
+        if let Err(error) = promoted {
+            // The intent may be on disk: a restart as a leader completes it.
+            following.lost.store(true, Ordering::Release);
+            self.failed.store(true, Ordering::Release);
+            return Err(error);
+        }
+        self.set_lineage(writer.wal.lineage());
+        following.connected.store(false, Ordering::Release);
+        following.promoted.store(true, Ordering::Release);
+        // Only a follower stopped by its leader's log gets here failed (see
+        // `refuse_failed`): it holds a consistent log.
+        self.failed.store(false, Ordering::Release);
+        Ok(intent.epoch)
+    }
+
+    /// Refuse to promote a follower that failed other than by its leader's
+    /// log refusing it (a gap, an epoch going back, a refusal): after a
+    /// durability failure its index may be ahead of its log, and it needs a
+    /// restart or a rebuild.
+    fn refuse_failed(&self, following: &Following) -> Result<(), DurableError> {
+        let refused_by_leader = !following.lost.load(Ordering::Acquire)
+            && following
+                .stopped
+                .lock()
+                .map_err(|_| DurableError::Failed)?
+                .is_some();
+        match self.failed() && !refused_by_leader {
+            true => Err(DurableError::NotPromotable(
+                "it failed (durability was lost); restart it, then promote".into(),
+            )),
+            false => Ok(()),
+        }
+    }
+
     /// Record whether a stream from the leader is open.
     pub fn set_connected(&self, connected: bool) {
-        if let Some(following) = &self.following {
+        if let Some(following) = self.follower() {
             following.connected.store(connected, Ordering::Release);
         }
     }
 
-    /// Where this follower stands; `None` on a leader.
+    /// Where this follower stands; `None` on a leader, also once promoted.
     pub fn replication(&self) -> Option<Replication> {
-        let following = self.following.as_ref()?;
+        let following = self.follower()?;
         Some(Replication {
             leader_lsn: following.leader_lsn.load(Ordering::Acquire),
             applied_lsn: *self.durable.borrow(),
@@ -1924,6 +2564,15 @@ impl DurableEngine {
             standby: self.standby(),
         }))
     }
+}
+
+/// Whether a promotion of this follower began.
+fn promoting(following: &Following) -> Result<bool, DurableError> {
+    Ok(following
+        .contact
+        .lock()
+        .map_err(|_| DurableError::Failed)?
+        .promoting)
 }
 
 /// Whether the standby acknowledged anything within `lease`.

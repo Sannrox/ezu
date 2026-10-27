@@ -32,6 +32,14 @@
 //! shipping to a follower, without ever cutting anything off. A follower
 //! logs them again with [`Wal::append_shipped`], at the same LSNs, and
 //! takes its leader's epochs with [`Wal::follow_epoch`].
+//!
+//! `wal/LINEAGE` is the log's lineage: where each epoch started
+//! ([`EpochStart`]), kept whatever a snapshot drops. A raise writes it before
+//! `EPOCH`, so an open that finds a start past the epoch completes the raise.
+//! A directory-local [`Wal::promote`] does not know where the old owner
+//! stops and records its start as pending; the next open fills in its last
+//! LSN. Epochs raised by a release without lineage have no start. Releases
+//! without lineage ignore the file.
 
 use crate::codec::{
     CodecError, Reader, Writer, decode_entity, decode_labels, encode_entity, encode_labels,
@@ -318,6 +326,79 @@ fn sealed_payload(lsn: u64, namespace: &str, dek_id: &str, body: &[u8]) -> Vec<u
 /// sealed body, or `None` to log it in plaintext.
 pub type Sealer<'a> = dyn FnMut(u64, &Op, &[u8]) -> Result<Option<(String, Vec<u8>)>, String> + 'a;
 
+/// Where an epoch started in a log's history: its records follow
+/// `start_lsn`, and `node_id` started it (empty when no node id is known: a
+/// directory-local promotion). Two logs share their history through an LSN
+/// only if they share every epoch start before it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpochStart {
+    pub epoch: u64,
+    pub start_lsn: u64,
+    pub node_id: String,
+}
+
+const LINEAGE: &str = "LINEAGE";
+const LINEAGE_MAGIC: &[u8; 4] = b"EZUL";
+const LINEAGE_VERSION: u32 = 1;
+/// The start a directory-local promotion records; the next open fills in
+/// the log's last LSN.
+const PENDING: u64 = u64::MAX;
+
+/// The lineage in `dir`, empty without one.
+fn read_lineage(dir: &Path) -> Result<Vec<EpochStart>, WalError> {
+    let bytes = match fs::read(dir.join(LINEAGE)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let damaged = || WalError::Corrupt("LINEAGE: damaged".into());
+    let (body, crc) = bytes.split_last_chunk::<4>().ok_or_else(damaged)?;
+    if crc32fast::hash(body).to_le_bytes() != *crc {
+        return Err(damaged());
+    }
+    let mut input = Reader(body);
+    let decoded = (|| {
+        if input.u32()?.to_le_bytes() != *LINEAGE_MAGIC || input.u32()? != LINEAGE_VERSION {
+            return Err(CodecError("header"));
+        }
+        let lineage = (0..input.u32()?)
+            .map(|_| {
+                Ok(EpochStart {
+                    epoch: input.u64()?,
+                    start_lsn: input.u64()?,
+                    node_id: input.str()?,
+                })
+            })
+            .collect::<Result<Vec<_>, CodecError>>()?;
+        input.done()?;
+        Ok(lineage)
+    })();
+    decoded.map_err(|_| damaged())
+}
+
+/// Replace the lineage in `dir` with `lineage`, durably and whole: a new file
+/// is synced and renamed over the old one.
+fn write_lineage(dir: &Path, lineage: &[EpochStart]) -> Result<(), WalError> {
+    let mut out = Writer::default();
+    out.u32(u32::from_le_bytes(*LINEAGE_MAGIC));
+    out.u32(LINEAGE_VERSION);
+    out.u32(lineage.len() as u32);
+    for start in lineage {
+        out.u64(start.epoch);
+        out.u64(start.start_lsn);
+        out.str(&start.node_id);
+    }
+    let crc = crc32fast::hash(&out.0);
+    out.0.extend_from_slice(&crc.to_le_bytes());
+    let fresh = dir.join("LINEAGE.new");
+    let mut file = File::create(&fresh)?;
+    file.write_all(&out.0)?;
+    file.sync_all()?;
+    fs::rename(&fresh, dir.join(LINEAGE))?;
+    sync_dir(dir)?;
+    Ok(())
+}
+
 /// Sync a directory so a created, renamed or removed entry is durable.
 pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
@@ -421,6 +502,8 @@ pub struct Wal {
     epochs: EpochFile,
     /// Whether this writer holds the epoch file's shared lock, checked.
     fence_held: bool,
+    /// `wal/LINEAGE` as this writer last wrote or read it.
+    lineage: Vec<EpochStart>,
 }
 
 impl Wal {
@@ -431,8 +514,9 @@ impl Wal {
     /// not read: appends start past every LSN the existing segments could
     /// hold (bounded by their sizes), so no discarded LSN is reused, and the
     /// next snapshot's drop removes the old ones. The writer takes the log's
-    /// epoch, or the highest a promotion frame records if the epoch file
-    /// lost it.
+    /// epoch, or the highest a promotion frame or the lineage records if the
+    /// epoch file lost it (or a raise stopped before writing it). A pending
+    /// epoch start takes the last LSN.
     pub fn open(
         dir: &Path,
         floor: u64,
@@ -479,6 +563,25 @@ impl Wal {
             epochs.write(logged)?;
             epoch = logged;
         }
+        let mut lineage = read_lineage(dir)?;
+        let pending = lineage.iter().any(|start| start.start_lsn == PENDING);
+        for start in &mut lineage {
+            if start.start_lsn == PENDING {
+                // The old owner is gone (this open holds the directory), so
+                // its last record is where the raise took effect.
+                start.start_lsn = next_lsn - 1;
+            }
+        }
+        if pending {
+            write_lineage(dir, &lineage)?;
+        }
+        let started = lineage.last().map_or(0, |start| start.epoch);
+        if started > epoch {
+            // A raise recorded its start, then stopped before the epoch.
+            mark_promoted(dir)?;
+            epochs.write(started)?;
+            epoch = started;
+        }
         let (file, written) = new_segment(dir, next_lsn, epoch)?;
         let wal = Self {
             dir: dir.to_path_buf(),
@@ -490,6 +593,7 @@ impl Wal {
             epoch,
             epochs,
             fence_held: false,
+            lineage,
         };
         wal.epochs.0.unlock()?;
         Ok((wal, records))
@@ -525,6 +629,15 @@ impl Wal {
         // in between leaves a marked log at the old epoch.
         mark_promoted(dir)?;
         refuse_legacy_owner(dir, owner_lock)?;
+        // Its start is known once the old owner is gone: the next open.
+        let mut lineage = read_lineage(dir)?;
+        lineage.retain(|start| start.epoch < epoch);
+        lineage.push(EpochStart {
+            epoch,
+            start_lsn: PENDING,
+            node_id: String::new(),
+        });
+        write_lineage(dir, &lineage)?;
         epochs.write(epoch)?;
         epochs.0.unlock()?;
         Ok(epoch)
@@ -558,6 +671,11 @@ impl Wal {
     /// The epoch this writer holds.
     pub fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    /// Where each epoch of this log started, oldest first.
+    pub fn lineage(&self) -> &[EpochStart] {
+        &self.lineage
     }
 
     /// The LSN the last appended record took.
@@ -654,13 +772,22 @@ impl Wal {
     }
 
     /// Take `epoch`, past this writer's, as the log's: a follower following
-    /// its leader's promotion. The log is marked as the epoch format, the
-    /// epoch recorded in `EPOCH`, and a new segment begun, whose promotion
-    /// frame records it in the log.
-    pub fn follow_epoch(&mut self, epoch: u64) -> Result<(), WalError> {
+    /// its leader's promotion, with the leader's `starts` of the epochs it
+    /// skips to (none when the leader recorded none). See [`Self::raise`].
+    pub fn follow_epoch(&mut self, epoch: u64, starts: Vec<EpochStart>) -> Result<(), WalError> {
         if epoch <= self.epoch {
             return Ok(());
         }
+        self.raise(epoch, starts)
+    }
+
+    /// Raise this log to `epoch`, past this writer's, adding `starts` to its
+    /// lineage: the lineage is written first, then the log is marked as the
+    /// epoch format, the epoch recorded in `EPOCH`, and a new segment begun,
+    /// whose promotion frame records it in the log. An open after a crash in
+    /// between completes the raise from the lineage. Refused when the log
+    /// was raised by another writer.
+    pub fn raise(&mut self, epoch: u64, starts: Vec<EpochStart>) -> Result<(), WalError> {
         self.epochs.0.lock()?;
         let raised = (|| {
             let directory = self.epochs.read()?;
@@ -669,6 +796,17 @@ impl Wal {
                     epoch: self.epoch,
                     directory,
                 });
+            }
+            if epoch <= self.epoch {
+                return Err(WalError::Corrupt(format!(
+                    "epoch {epoch} is not past {}",
+                    self.epoch
+                )));
+            }
+            if !starts.is_empty() {
+                let lineage = [self.lineage.as_slice(), &starts].concat();
+                write_lineage(&self.dir, &lineage)?;
+                self.lineage = lineage;
             }
             mark_promoted(&self.dir)?;
             self.epochs.write(epoch)

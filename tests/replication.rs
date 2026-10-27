@@ -323,6 +323,8 @@ fn a_gap_an_older_epoch_and_a_sealed_record_stop_the_follower_fail_closed() {
         epoch,
         records: records.to_vec(),
         leader_lsn: 10,
+        lineage: Vec::new(),
+        stamp: 0,
     };
     assert_eq!(epochs.apply_shipped(at(2, first), 0).unwrap(), 5);
     assert_eq!(epochs.apply_shipped(at(2, first), 0).unwrap(), 5);

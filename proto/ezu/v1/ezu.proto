@@ -21,7 +21,8 @@ service Ezu {
   rpc ListEvents(ListEventsRequest) returns (ListEventsResponse);
   // Fence events from a resume point, then live as they are raised. Fails
   // with OUT_OF_RANGE when events after the resume point are no longer
-  // kept. Delivery is at least once: the event id is the idempotency key.
+  // kept, or on a leader when the resume point is past its log. Delivery is
+  // at least once: the event id is the idempotency key.
   rpc Subscribe(SubscribeRequest) returns (stream FenceEvent);
 }
 
@@ -33,14 +34,22 @@ service Replication {
   // records after the LSN are no longer held (the follower needs a
   // rebuild), FAILED_PRECONDITION when the follower is ahead of this log,
   // DATA_LOSS when the follower's last record is not this log's record
-  // at that LSN (it followed another history).
+  // at that LSN, or its lineage through it is not this log's (it followed
+  // another history). With a sync standby, only what the standby
+  // acknowledged is shipped.
   rpc Follow(FollowRequest) returns (stream FollowBatch);
   // Follow, acknowledging what was applied: for a sync standby. The first
   // message is a SyncStart, every later one a SyncAck. Batches and errors
   // are those of Follow, except that a heartbeat carries the leader's
   // epoch. A leader with a sync standby counts only that node's
-  // acknowledgements, and only at its own epoch.
+  // acknowledgements, and only at its own epoch, and ships that node
+  // everything durable.
   rpc Sync(stream SyncRequest) returns (stream FollowBatch);
+  // Promote this follower to a leader at the next epoch, in place. It stops
+  // following, waits out its old leader's lease, and takes writes. Without
+  // force only its leader's sync standby is promoted (FAILED_PRECONDITION
+  // otherwise). Asked again, it answers the same epoch.
+  rpc Promote(PromoteRequest) returns (PromoteResponse);
 }
 
 // Longitude and latitude in WGS 84 degrees.
@@ -319,6 +328,16 @@ message FollowRequest {
   // before anything is shipped. Absent before the first record, or when
   // the follower was seeded from a snapshot copy and holds no record.
   RecordFingerprint last = 2;
+  // Where each epoch of the follower's log started, checked with `last`.
+  repeated EpochStart lineage = 3;
+}
+
+// Where an epoch started in a log: its records follow start_lsn, and the
+// node node_id started it (empty when unknown).
+message EpochStart {
+  uint64 epoch = 1;
+  uint64 start_lsn = 2;
+  string node_id = 3;
 }
 
 message RecordFingerprint {
@@ -335,8 +354,16 @@ message FollowBatch {
   // Record payloads as logged, continuing the previous batch (or
   // after_lsn) without a gap. Empty in a heartbeat.
   repeated bytes records = 2;
-  // The leader's last durable LSN when the batch was read.
+  // The leader's last LSN this follower may be shipped when the batch was
+  // read.
   uint64 leader_lsn = 3;
+  // On a Sync stream: whether the follower is the leader's sync standby.
+  bool sync_standby = 4;
+  // The leader's lineage, which a follower takes with the leader's epochs.
+  repeated EpochStart lineage = 5;
+  // On a Sync stream: the leader's clock when it read the batch, opaque to
+  // the follower, which echoes the newest in its acknowledgements.
+  uint64 stamp = 6;
 }
 
 message SyncRequest {
@@ -358,4 +385,20 @@ message SyncStart {
 message SyncAck {
   uint64 lsn = 1;
   uint64 epoch = 2;
+  // The newest FollowBatch.stamp the follower was shipped. The leader's
+  // lease runs from when it took that stamp, not from when the
+  // acknowledgement arrived.
+  uint64 stamp = 3;
+}
+
+message PromoteRequest {
+  // Promote a follower that is not its leader's sync standby. Only once the
+  // leader and its standby are known to be gone: writes the standby
+  // acknowledged that this follower lacks are lost.
+  bool force = 1;
+}
+
+message PromoteResponse {
+  // The epoch this node leads at.
+  uint64 epoch = 1;
 }

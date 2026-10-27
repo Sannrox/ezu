@@ -153,6 +153,18 @@ impl Metrics {
                 "1 while the sync standby acknowledged within the lease.",
                 u8::from(standby.lease_held).to_string(),
             );
+            series(
+                "ezu_sync_unstamped",
+                "gauge",
+                "1 while the sync standby's acknowledgements carry no lease stamp (a standby from before promotion; upgrade it).",
+                u8::from(standby.unstamped).to_string(),
+            );
+            series(
+                "ezu_sync_unstamped_refused",
+                "gauge",
+                "Unstamped acknowledgements refused after a stamped one (from an earlier standby process).",
+                standby.refused_unstamped.to_string(),
+            );
         }
         let _ = writeln!(
             out,
