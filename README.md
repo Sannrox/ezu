@@ -41,6 +41,18 @@ mutual TLS. The server needs `EZU_DATA_DIR` and listens on `EZU_LISTEN`
 
 - `GET /healthz` answers 200 while the engine accepts writes and 503 after a
   durability failure (reopen to recover).
+- `DurableEngine::promote(dir)` raises the data directory's epoch, kept in
+  `wal/EPOCH` and recorded in the log. An engine still holding the directory
+  at an older epoch refuses every later write and reports unhealthy, even
+  while idle. An owner of a release without epochs cannot be fenced, so
+  the promotion is refused while one runs. Once the old process is gone,
+  the next open continues the log and event ids without a gap. Logs from
+  before epochs still open. A directory that was never promoted keeps writing WAL
+  format version 2, so an older release can still open it; after the first
+  promotion, segments are version 3 and older releases refuse the directory.
+  Rolling back past a promotion is not supported: an older release that
+  recovers from a rebuild source skips reading segments, so it would not see
+  that refusal. Roll back only directories that were never promoted.
 - `GET /metrics` serves Prometheus text:
   - entity count, logged writes and fence events;
   - query latency as a histogram;

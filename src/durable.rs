@@ -9,6 +9,9 @@
 //!
 //! One process owns a directory at a time: `LOCK` is held for the engine's
 //! life, so a second instance fails to open instead of writing alongside.
+//! [`DurableEngine::promote`] fences an owner that may still run: it refuses
+//! every write after. A new owner opens the directory once the old process
+//! is gone.
 
 use crate::entity::{Entity, Labels, Namespace, visible};
 use crate::fence::{
@@ -77,6 +80,15 @@ pub enum DurableError {
     /// A write could not be made durable after it reached the index; the
     /// engine refuses further writes until it is reopened.
     Failed,
+    /// The directory's owner runs a release that ignores epochs, so it could
+    /// not be fenced; nothing was promoted.
+    LegacyOwner,
+    /// The directory was promoted past this engine's epoch: another owner
+    /// took over, and this engine refuses every write from now on.
+    Fenced {
+        epoch: u64,
+        directory: u64,
+    },
 }
 
 impl std::fmt::Display for DurableError {
@@ -100,6 +112,13 @@ impl std::fmt::Display for DurableError {
             Self::Failed => {
                 f.write_str("durability was lost after a failed write; reopen to recover")
             }
+            Self::LegacyOwner => {
+                f.write_str("the directory's owner does not honor epochs; stop it first")
+            }
+            Self::Fenced { epoch, directory } => write!(
+                f,
+                "fenced: this engine is at epoch {epoch}, the directory at {directory}"
+            ),
         }
     }
 }
@@ -113,7 +132,11 @@ impl From<IndexError> for DurableError {
 }
 impl From<WalError> for DurableError {
     fn from(error: WalError) -> Self {
-        Self::Wal(error)
+        match error {
+            WalError::Fenced { epoch, directory } => Self::Fenced { epoch, directory },
+            WalError::LegacyOwner => Self::LegacyOwner,
+            error => Self::Wal(error),
+        }
     }
 }
 impl From<SnapshotError> for DurableError {
@@ -148,6 +171,11 @@ pub struct DurableEngine {
     keyring: Keyring,
     failed: AtomicBool,
     metrics: Metrics,
+    /// Shared on `wal/OWNER`, telling a promotion this owner honors epochs.
+    /// Declared before `_lock`, so it is released first: fields drop in
+    /// order, and `OWNER` held without `LOCK` would let a release without
+    /// epochs take `LOCK` and pass for this owner.
+    _owner: File,
     _lock: File,
 }
 
@@ -169,6 +197,11 @@ impl DurableEngine {
             .open(config.dir.join("LOCK"))
             .map_err(WalError::Io)?;
         lock.try_lock().map_err(|_| DurableError::Locked)?;
+        // Taken only once the directory lock is held, so a held `OWNER`
+        // always belongs to the directory's owner, never to an opener that
+        // is about to fail on `LOCK`. A promotion in the gap between the two
+        // sees no `OWNER` and refuses, which fails closed.
+        let owner = Wal::hold_owner(&wal_dir)?;
 
         create_dir_durably(&config.dir.join("keys")).map_err(WalError::Io)?;
         let keyring = Keyring::open(&config.dir.join("keys"), config.keys.clone())
@@ -331,6 +364,7 @@ impl DurableEngine {
             failed: AtomicBool::new(false),
             metrics: Metrics::default(),
             _lock: lock,
+            _owner: owner,
         };
         // Entities that expired while the engine was down release their
         // quota now, through the log like any other removal.
@@ -340,6 +374,19 @@ impl DurableEngine {
             durable.snapshot(now_ms)?;
         }
         Ok(durable)
+    }
+
+    /// Raise the epoch of the data directory `dir` and return it. An engine
+    /// that has it open, in this process or another, is fenced: its next
+    /// write is refused, and it stays failed. The next open, once that
+    /// engine is gone, takes the new epoch. A write that passed its fence
+    /// check finishes, index change and log append both, before the raise,
+    /// so the next open sees it. An owner of a release without
+    /// epochs cannot be fenced: [`DurableError::LegacyOwner`].
+    pub fn promote(dir: &std::path::Path) -> Result<u64, DurableError> {
+        let wal_dir = dir.join("wal");
+        create_dir_durably(&wal_dir).map_err(WalError::Io)?;
+        Ok(Wal::promote(&wal_dir, &dir.join("LOCK"))?)
     }
 
     /// No snapshot to load: the WAL alone suffices only if it still starts
@@ -434,6 +481,12 @@ impl DurableEngine {
         Ok(self
             .engine
             .visit_region(ns, collection, window, readable, now_ms, visit)?)
+    }
+
+    /// The epoch this engine writes at.
+    pub fn epoch(&self) -> Result<u64, DurableError> {
+        let writer = self.writer.lock().map_err(|_| DurableError::Failed)?;
+        Ok(writer.wal.epoch())
     }
 
     /// The LSN the last logged write took.
@@ -550,6 +603,37 @@ impl DurableEngine {
         if self.failed.load(Ordering::Acquire) {
             return Err(DurableError::Failed);
         }
+        // Every write, even one that logs nothing, is refused once fenced.
+        // The fence is held from the check through the index change and the
+        // append, so a promotion cannot land between them and leave the
+        // index ahead of the log.
+        if let Err(error) = writer.wal.hold_fence() {
+            self.failed.store(true, Ordering::Release);
+            return Err(error.into());
+        }
+        let applied = self.apply_and_log(&mut writer, ns, change);
+        if let Err(error) = writer.wal.release_fence() {
+            self.failed.store(true, Ordering::Release);
+            return Err(error.into());
+        }
+        let result = applied?;
+        if writer.since_snapshot >= self.config.snapshot_every_records
+            || (writer.since_snapshot > 0
+                && now_ms - writer.snapshot_at_ms >= self.config.snapshot_every_ms)
+        {
+            self.snapshot_locked(&mut writer, now_ms)?;
+        }
+        Ok(result)
+    }
+
+    /// The fenced part of [`Self::write`]: `change` applied to the index,
+    /// and what it applied logged and synced.
+    fn apply_and_log<T>(
+        &self,
+        writer: &mut Writer,
+        ns: Option<&Namespace>,
+        change: impl FnOnce(&Engine, &Fences, &mut Vec<Op>) -> T,
+    ) -> Result<T, DurableError> {
         if let Some(ns) = ns {
             self.keyring
                 .current(ns.as_str())
@@ -587,12 +671,6 @@ impl DurableEngine {
                 raised.extend(apply_fences(&mut writer.fences, op, lsn));
             }
             self.publish(raised)?;
-        }
-        if writer.since_snapshot >= self.config.snapshot_every_records
-            || (writer.since_snapshot > 0
-                && now_ms - writer.snapshot_at_ms >= self.config.snapshot_every_ms)
-        {
-            self.snapshot_locked(&mut writer, now_ms)?;
         }
         Ok(result)
     }
@@ -973,9 +1051,20 @@ impl DurableEngine {
     /// Start a new current key for `ns`. New writes use it at once; the
     /// next snapshot re-seals older data under it and retires the old key.
     pub fn rotate_key(&self, ns: &Namespace) -> Result<(), DurableError> {
-        let _writer = self.writer.lock().map_err(|_| DurableError::Failed)?;
-        self.keyring
-            .rotate(ns.as_str())
+        let mut writer = self.writer.lock().map_err(|_| DurableError::Failed)?;
+        if self.failed.load(Ordering::Acquire) {
+            return Err(DurableError::Failed);
+        }
+        // A fenced owner mints no keys: the rotation runs under the fence.
+        let rotated = writer
+            .wal
+            .under_fence(|| self.keyring.rotate(ns.as_str()))
+            .inspect_err(|error| {
+                if matches!(error, WalError::Fenced { .. }) {
+                    self.failed.store(true, Ordering::Release);
+                }
+            })?;
+        rotated
             .map(|_| ())
             .map_err(|sealed| DurableError::Sealed(sealed.0))
     }
@@ -987,9 +1076,27 @@ impl DurableEngine {
     }
 
     /// Whether the engine can still take writes: no durability failure
-    /// since it opened.
+    /// since it opened, and not fenced, which is found here without waiting
+    /// for a write (and stays failed). While a write is in flight, that
+    /// write finds a fence instead; any other failure to check reports
+    /// unhealthy.
     pub fn healthy(&self) -> bool {
-        !self.failed.load(Ordering::Acquire) && !self.writer.is_poisoned()
+        if self.failed.load(Ordering::Acquire) {
+            return false;
+        }
+        let mut writer = match self.writer.try_lock() {
+            Ok(writer) => writer,
+            Err(std::sync::TryLockError::WouldBlock) => return true,
+            Err(std::sync::TryLockError::Poisoned(_)) => return false,
+        };
+        match writer.wal.check_fence() {
+            Ok(()) => true,
+            Err(WalError::Fenced { .. }) => {
+                self.failed.store(true, Ordering::Release);
+                false
+            }
+            Err(_) => false,
+        }
     }
 
     /// Metrics in the Prometheus text format, aggregated over namespaces.

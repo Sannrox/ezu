@@ -358,3 +358,38 @@ fn a_reader_resumes_without_gaps_across_restarts_and_an_expired_point_is_refused
     drop(engine);
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn event_ids_run_on_across_a_promotion() {
+    let dir = scratch("promotion");
+    let engine = open(&dir, true, 10);
+    engine
+        .put_fence(&ns(), circle("depot", 10.0, 50.0, 500.0), 0)
+        .unwrap();
+    engine.upsert(&ns(), truck("t1", 10.0, 1_000), 0).unwrap();
+    let before = engine.events(&ns(), None, &[], None, 100).unwrap();
+    let last_lsn = engine.last_lsn().unwrap();
+    drop(engine);
+
+    ezu::DurableEngine::promote(&dir).unwrap();
+    let engine = open(&dir, true, 10);
+    engine.upsert(&ns(), truck("t1", 12.0, 2_000), 0).unwrap();
+    // A reader resumes where it stopped, and the next event's id follows
+    // directly: the promotion took no LSN.
+    let after = engine
+        .events(&ns(), Some(before.through), &[], None, 100)
+        .unwrap()
+        .events;
+    assert_eq!(after.len(), 1);
+    assert_eq!((after[0].lsn, after[0].index), (last_lsn + 1, 0));
+    let all = engine.events(&ns(), None, &[], None, 100).unwrap().events;
+    drop(engine);
+    // Replay over the promotion raises the same events with the same ids.
+    let engine = open(&dir, true, 10);
+    assert_eq!(
+        engine.events(&ns(), None, &[], None, 100).unwrap().events,
+        all
+    );
+    drop(engine);
+    let _ = fs::remove_dir_all(&dir);
+}
