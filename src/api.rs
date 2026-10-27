@@ -21,7 +21,10 @@
 //! The `Replication` gRPC service ships the committed log to followers. It
 //! carries every namespace, so it takes the replication token
 //! ([`Api::replication_token`]) and is refused without one. On a follower,
-//! every write is refused with `FAILED_PRECONDITION`.
+//! every write is refused with `FAILED_PRECONDITION`. `Replication.Sync`
+//! ships the same and takes acknowledgements back, for a sync standby; on a
+//! leader waiting for one, a write the standby did not acknowledge in time,
+//! and every read and write while its lease is lapsed, fail `UNAVAILABLE`.
 
 use crate::auth::{AuthError, Authenticator, StaticToken, bearer};
 use crate::durable::{DurableEngine, DurableError, ReplicaError};
@@ -96,7 +99,9 @@ impl From<DurableError> for ApiError {
         match error {
             DurableError::Index(error) => error.into(),
             DurableError::TooLarge => Self::invalid(error.to_string()),
-            DurableError::Expired(_) | DurableError::Replica(ReplicaError::Gone(_)) => {
+            DurableError::Expired(_)
+            | DurableError::ResumeAhead { .. }
+            | DurableError::Replica(ReplicaError::Gone(_)) => {
                 Self::new(tonic::Code::OutOfRange, error.to_string())
             }
             DurableError::ReadOnly | DurableError::Replica(ReplicaError::Ahead { .. }) => {
@@ -452,14 +457,18 @@ impl Api {
     }
 
     /// Run engine work off the async workers: writes wait on disk syncs.
+    /// Their wait for a sync standby happens here, after the blocking
+    /// thread is released, so waiting writes never hold the threads the
+    /// shipping that acknowledges them needs.
     pub(crate) async fn blocking<T: Send + 'static>(
         &self,
         work: impl FnOnce(&DurableEngine) -> Result<T, ApiError> + Send + 'static,
     ) -> Result<T, ApiError> {
         let engine = self.engine.clone();
-        tokio::task::spawn_blocking(move || work(&engine))
+        let pending = tokio::task::spawn_blocking(move || engine.deferring(work))
             .await
-            .map_err(|_| ApiError::new(tonic::Code::Internal, "request task failed"))?
+            .map_err(|_| ApiError::new(tonic::Code::Internal, "request task failed"))?;
+        self.engine.acknowledged(pending).await?
     }
 
     pub async fn upsert(
@@ -741,10 +750,48 @@ impl Api {
         &self,
         authorization: Option<&str>,
         request: proto::FollowRequest,
-    ) -> Result<tokio::sync::mpsc::Receiver<Result<proto::FollowBatch, ApiError>>, ApiError> {
-        /// Payload bytes per batch, past the first record.
-        const BUDGET: usize = 1 << 20;
-        const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(1);
+    ) -> Result<Batches, ApiError> {
+        self.may_follow(authorization)?;
+        self.ship(request, false).await
+    }
+
+    /// [`Self::follow`] for a sync standby: the first message of `inbound`
+    /// names the follower and where it resumes, every later one
+    /// acknowledges what it applied ([`DurableEngine::acknowledge`]), and
+    /// heartbeats carry this leader's epoch, so the follower acknowledges
+    /// at it. Acknowledgements are read until the follower closes its side.
+    pub async fn sync(
+        &self,
+        authorization: Option<&str>,
+        mut inbound: tonic::Streaming<proto::SyncRequest>,
+    ) -> Result<Batches, ApiError> {
+        use proto::sync_request::Message;
+        self.may_follow(authorization)?;
+        let start = match inbound.message().await {
+            Ok(Some(proto::SyncRequest {
+                message: Some(Message::Start(start)),
+            })) => start,
+            Ok(_) => return Err(ApiError::invalid("a sync stream begins with its start")),
+            Err(status) => return Err(ApiError::new(status.code(), status.message())),
+        };
+        if start.node_id.is_empty() {
+            return Err(ApiError::invalid("a sync standby needs a node id"));
+        }
+        let batches = self.ship(start.follow.unwrap_or_default(), true).await?;
+        let (engine, node_id) = (self.engine.clone(), start.node_id);
+        tokio::spawn(async move {
+            while let Ok(Some(request)) = inbound.message().await {
+                if let Some(Message::Ack(ack)) = request.message {
+                    engine.acknowledge(&node_id, ack.lsn, ack.epoch);
+                }
+            }
+        });
+        Ok(batches)
+    }
+
+    /// Refuse a caller without the replication token, and a follower asked
+    /// to ship on.
+    fn may_follow(&self, authorization: Option<&str>) -> Result<(), ApiError> {
         let token = self.replication.as_ref().ok_or_else(|| {
             ApiError::new(
                 tonic::Code::PermissionDenied,
@@ -760,6 +807,19 @@ impl Api {
                 "a follower does not ship its log; follow the leader",
             ));
         }
+        Ok(())
+    }
+
+    /// The shipping stream behind [`Self::follow`] and [`Self::sync`]; with
+    /// `epoch_in_heartbeats`, a heartbeat carries this leader's epoch.
+    async fn ship(
+        &self,
+        request: proto::FollowRequest,
+        epoch_in_heartbeats: bool,
+    ) -> Result<Batches, ApiError> {
+        /// Payload bytes per batch, past the first record.
+        const BUDGET: usize = 1 << 20;
+        const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(1);
         let engine = self.engine.clone();
         // Marked seen before each read, so a write after it wakes the wait.
         let mut durable = engine.watch_durable();
@@ -781,9 +841,15 @@ impl Api {
             epoch: last.epoch,
         });
         let start = self.engine.clone();
-        let start = tokio::task::spawn_blocking(move || start.shipping(request.after_lsn, last))
-            .await
-            .map_err(|_| ApiError::new(tonic::Code::Internal, "read task failed"))??;
+        let (start, epoch) = tokio::task::spawn_blocking(move || {
+            let epoch = match epoch_in_heartbeats {
+                true => start.epoch()?,
+                false => 0,
+            };
+            Ok::<_, DurableError>((start.shipping(request.after_lsn, last)?, epoch))
+        })
+        .await
+        .map_err(|_| ApiError::new(tonic::Code::Internal, "read task failed"))??;
         let (mut from, shipped) = read(start).await?;
         let mut shipped = shipped?;
         let (sender, receiver) = tokio::sync::mpsc::channel(4);
@@ -798,7 +864,7 @@ impl Api {
                         }
                         () = tokio::time::sleep(HEARTBEAT) => {
                             let heartbeat = proto::FollowBatch {
-                                epoch: 0,
+                                epoch,
                                 records: Vec::new(),
                                 leader_lsn: shipped.leader_lsn,
                             };
@@ -840,22 +906,42 @@ impl Api {
     }
 }
 
+/// Batches for a follower, ending with an error when shipping cannot go on.
+pub type Batches = tokio::sync::mpsc::Receiver<Result<proto::FollowBatch, ApiError>>;
+
+type BatchStream = std::pin::Pin<
+    Box<dyn tokio_stream::Stream<Item = Result<proto::FollowBatch, tonic::Status>> + Send>,
+>;
+
+fn batch_stream(batches: Batches) -> BatchStream {
+    use tokio_stream::StreamExt;
+    Box::pin(
+        tokio_stream::wrappers::ReceiverStream::new(batches)
+            .map(|batch| batch.map_err(tonic::Status::from)),
+    )
+}
+
 #[tonic::async_trait]
 impl Replication for Api {
-    type FollowStream = std::pin::Pin<
-        Box<dyn tokio_stream::Stream<Item = Result<proto::FollowBatch, tonic::Status>> + Send>,
-    >;
+    type FollowStream = BatchStream;
+    type SyncStream = BatchStream;
 
     async fn follow(
         &self,
         request: tonic::Request<proto::FollowRequest>,
     ) -> Result<tonic::Response<Self::FollowStream>, tonic::Status> {
-        use tokio_stream::StreamExt;
         let auth = metadata_auth(&request);
         let batches = Api::follow(self, auth.as_deref(), request.into_inner()).await?;
-        let stream = tokio_stream::wrappers::ReceiverStream::new(batches)
-            .map(|batch| batch.map_err(tonic::Status::from));
-        Ok(tonic::Response::new(Box::pin(stream)))
+        Ok(tonic::Response::new(batch_stream(batches)))
+    }
+
+    async fn sync(
+        &self,
+        request: tonic::Request<tonic::Streaming<proto::SyncRequest>>,
+    ) -> Result<tonic::Response<Self::SyncStream>, tonic::Status> {
+        let auth = metadata_auth(&request);
+        let batches = Api::sync(self, auth.as_deref(), request.into_inner()).await?;
+        Ok(tonic::Response::new(batch_stream(batches)))
     }
 }
 
@@ -1221,6 +1307,20 @@ fn http_router(api: Api) -> axum::Router {
             get(|State(api): State<Api>| async move {
                 match (api.engine.healthy(), api.engine.replication()) {
                     (true, None) => (StatusCode::OK, "ok".to_string()),
+                    // A failed engine says so, even while its lease lapsed.
+                    (false, None)
+                        if !api.engine.failed()
+                            && api
+                                .engine
+                                .standby()
+                                .is_some_and(|standby| !standby.lease_held) =>
+                    {
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "no acknowledgement from the sync standby; refusing reads and writes"
+                                .to_string(),
+                        )
+                    }
                     (true, Some(follower)) => (
                         StatusCode::OK,
                         format!(

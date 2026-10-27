@@ -19,12 +19,25 @@
 //!   then runs as a read-only follower of it. Over `https`, `EZU_FOLLOW_CA`
 //!   (PEM) verifies the leader, and `EZU_TLS_CERT` and `EZU_TLS_KEY`, when
 //!   set, are the follower's client certificate.
+//! - `EZU_NODE_ID`: a follower's node id. With it, the follower acknowledges
+//!   what it applied (`Replication.Sync`), so it can be a sync standby.
+//! - `EZU_SYNC_STANDBY`: on a leader, the node id of its sync standby. A
+//!   write is then acknowledged only once that standby acknowledged it;
+//!   `EZU_SYNC_TIMEOUT` (milliseconds, default 5000) bounds the wait, past
+//!   which the write fails `UNAVAILABLE` with its outcome unknown. Without
+//!   an acknowledgement for 10 seconds, the leader refuses reads and writes.
 
 use ezu::api::{Api, serve};
 use ezu::auth::{Authenticator, Jwt, StaticToken};
-use ezu::{DurabilityConfig, DurableEngine, Quotas};
+use ezu::{DurabilityConfig, DurableEngine, Quotas, SyncStandby};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
+
+/// Without an acknowledgement from the sync standby this long, a leader
+/// refuses reads and writes: as long as a follower waits before it takes a
+/// silent stream as lost.
+const LEASE: Duration = Duration::from_secs(10);
 
 fn var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
@@ -88,6 +101,22 @@ fn leader() -> Result<Option<tonic::transport::Endpoint>, String> {
         .map_err(|error| format!("EZU_FOLLOW: {error}"))
 }
 
+/// The leader's sync standby, from `EZU_SYNC_STANDBY` and `EZU_SYNC_TIMEOUT`.
+fn sync_standby() -> Result<Option<SyncStandby>, String> {
+    let timeout = match var("EZU_SYNC_TIMEOUT") {
+        Some(ms) => Duration::from_millis(
+            ms.parse()
+                .map_err(|_| format!("EZU_SYNC_TIMEOUT: not milliseconds: {ms}"))?,
+        ),
+        None => Duration::from_secs(5),
+    };
+    Ok(var("EZU_SYNC_STANDBY").map(|node_id| SyncStandby {
+        node_id,
+        timeout,
+        lease: LEASE,
+    }))
+}
+
 async fn run() -> Result<(), String> {
     let dir = var("EZU_DATA_DIR").ok_or("EZU_DATA_DIR is required")?;
     let auth = authenticator()?;
@@ -95,6 +124,16 @@ async fn run() -> Result<(), String> {
     let leader = leader()?;
     let replication_token =
         read("EZU_REPLICATION_TOKEN_FILE")?.map(|token| token.trim().to_string());
+    let standby = sync_standby()?;
+    if standby.is_some() {
+        if leader.is_some() {
+            return Err("EZU_SYNC_STANDBY is a leader's setting; a follower has none".into());
+        }
+        if replication_token.is_none() {
+            return Err("EZU_SYNC_STANDBY needs EZU_REPLICATION_TOKEN_FILE".into());
+        }
+    }
+    let node_id = var("EZU_NODE_ID");
     let now = now_ms();
     let config = DurabilityConfig {
         dir: dir.into(),
@@ -112,9 +151,10 @@ async fn run() -> Result<(), String> {
         max_updates_per_second: 100_000,
         max_fences: 100_000,
     };
-    let engine = match leader {
-        Some(_) => DurableEngine::open_follower(config, quotas, now),
-        None => DurableEngine::open(config, quotas, None, now),
+    let engine = match (&leader, standby) {
+        (Some(_), _) => DurableEngine::open_follower(config, quotas, now),
+        (None, None) => DurableEngine::open(config, quotas, None, now),
+        (None, Some(standby)) => DurableEngine::open_sync(config, quotas, None, now, standby),
     }
     .map_err(|error| error.to_string())?;
     let listen = var("EZU_LISTEN").unwrap_or_else(|| "127.0.0.1:7600".into());
@@ -129,10 +169,13 @@ async fn run() -> Result<(), String> {
             .ok_or("EZU_FOLLOW needs EZU_REPLICATION_TOKEN_FILE")?;
         let follower = engine.clone();
         tokio::spawn(async move {
-            let stopped = ezu::follow::follow(follower, leader, token, |why| {
-                eprintln!("ezu: following the leader: {why}; reconnecting");
-            })
-            .await;
+            let retry = |why: &str| eprintln!("ezu: following the leader: {why}; reconnecting");
+            let stopped = match node_id {
+                Some(node_id) => {
+                    ezu::follow::standby(follower, leader, token, node_id, retry).await
+                }
+                None => ezu::follow::follow(follower, leader, token, retry).await,
+            };
             eprintln!("ezu: following stopped: {stopped}");
         });
     }
@@ -149,12 +192,21 @@ async fn run() -> Result<(), String> {
                 return;
             }
             let engine = sweeper.clone();
+            // The wait for a sync standby happens off the blocking thread.
             let swept = move || {
-                engine.refresh_keys()?;
-                engine.sweep_expired(now_ms())
+                engine.deferring(|engine| {
+                    engine.refresh_keys()?;
+                    engine.sweep_expired(now_ms())
+                })
             };
-            match tokio::task::spawn_blocking(swept).await {
+            let swept = match tokio::task::spawn_blocking(swept).await {
+                Ok(pending) => Ok(sweeper.acknowledged(pending).await.and_then(|swept| swept)),
+                Err(error) => Err(error),
+            };
+            match swept {
                 Ok(Ok(_)) => {}
+                // Waiting for the sync standby is reported by /healthz.
+                Ok(Err(ezu::durable::DurableError::NoStandby)) => {}
                 Ok(Err(error)) => eprintln!("ezu: expiry sweep failed: {error}"),
                 Err(error) => eprintln!("ezu: expiry sweep task failed: {error}"),
             }

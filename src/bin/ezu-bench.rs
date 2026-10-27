@@ -14,14 +14,17 @@
 //! (resident set, Linux only), recovery time (reopen from a snapshot plus
 //! a WAL of one move) and follower convergence (a follower tailing a load
 //! of at most 10^6 entities in process: its lag during the load and the
-//! time it takes to catch up after). Prints the results as JSON. With
+//! time it takes to catch up after) and the sync standby (the same load and
+//! single writes against a leader that waits for a standby's
+//! acknowledgement: throughput and acknowledgement latency). Prints the
+//! results as JSON. With
 //! `--baseline`, compares against an earlier result and exits non-zero when
 //! any measure is more than 10% worse.
 
 use ezu::fence::{Fence, Shape};
 use ezu::{
     DurabilityConfig, DurableEngine, Entity, FieldValue, Geometry, Identity, Namespace, Position,
-    Query, QueryRequest, Quotas, Upsert,
+    Query, QueryRequest, Quotas, SyncStandby, Upsert,
 };
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
@@ -134,7 +137,7 @@ fn replication(dir: &Path, count: u64) -> Result<Value, String> {
             }
         })
     };
-    let load = write_all(&leader, count, 0);
+    let load = write_all(&leader, count, 0, None);
     let finished = Instant::now();
     done.store(true, Ordering::Release);
     let (mut lags, caught_up) = tailing
@@ -151,6 +154,93 @@ fn replication(dir: &Path, count: u64) -> Result<Value, String> {
         "load_updates_per_s": load,
         "lag_records": { "p50": at(0.5), "p99": at(0.99), "max": lags.last() },
         "catchup_s": caught_up.saturating_duration_since(finished).as_secs_f64(),
+    }))
+}
+
+/// A leader with a sync standby, the standby tailing it in process (ship,
+/// apply with its own sync, then acknowledge, as over `Replication.Sync`
+/// without the network). Returns the leader's load rate of `count`
+/// entities in batches of [`BATCH`], the latency until each batch was
+/// acknowledged, and the same for single writes.
+fn sync_standby(dir: &Path, count: u64) -> Result<Value, String> {
+    const NODE: &str = "bench-standby";
+    let leader = DurableEngine::open_sync(
+        config(&dir.join("leader"), true),
+        quotas(),
+        None,
+        0,
+        SyncStandby {
+            node_id: NODE.into(),
+            timeout: Duration::from_secs(60),
+            lease: Duration::from_secs(60),
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    let leader = Arc::new(leader);
+    let standby = DurableEngine::open_follower(config(&dir.join("standby"), true), quotas(), 0)
+        .map_err(|error| error.to_string())?;
+    // The lease starts with the standby's first acknowledgement.
+    leader.acknowledge(NODE, 0, 0);
+    let done = Arc::new(AtomicBool::new(false));
+    let tailing = {
+        let (leader, done) = (leader.clone(), done.clone());
+        std::thread::spawn(move || -> Result<(), String> {
+            let waiting = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .map_err(|error| error.to_string())?;
+            let mut durable = leader.watch_durable();
+            let mut from = leader
+                .shipping(0, None)
+                .map_err(|error| error.to_string())?;
+            loop {
+                // Marked seen before the read, so a write after it wakes us.
+                durable.borrow_and_update();
+                let shipped = leader
+                    .ship(&mut from, 1 << 20)
+                    .map_err(|error| error.to_string())?;
+                if shipped.records.is_empty() {
+                    if done.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    // The timer is made inside the runtime that drives it.
+                    let _ = waiting.block_on(async {
+                        tokio::time::timeout(Duration::from_millis(10), durable.changed()).await
+                    });
+                    continue;
+                }
+                let applied = standby
+                    .apply_shipped(shipped, 0)
+                    .map_err(|error| error.to_string())?;
+                let epoch = standby.epoch().map_err(|error| error.to_string())?;
+                leader.acknowledge(NODE, applied, epoch);
+            }
+        })
+    };
+    let mut batches = Vec::new();
+    let load = write_all(&leader, count, 0, Some(&mut batches));
+    let mut singles = Vec::new();
+    let single = (|| {
+        for i in 0..2_000 {
+            let started = Instant::now();
+            leader
+                .upsert(&ns(), entity(i % count, 1), 0)
+                .map_err(|error| error.to_string())?;
+            singles.push(started.elapsed());
+        }
+        Ok::<_, String>(())
+    })();
+    done.store(true, Ordering::Release);
+    tailing
+        .join()
+        .map_err(|_| "the standby thread panicked".to_string())??;
+    let load = load?;
+    single?;
+    Ok(json!({
+        "entities": count,
+        "load_updates_per_s": load,
+        "batch_ack": percentiles(batches),
+        "write_ack": percentiles(singles),
     }))
 }
 
@@ -177,13 +267,20 @@ fn entity(i: u64, round: i64) -> Entity {
     }
 }
 
-/// Updates per second writing every entity once at `round`.
-fn write_all(engine: &DurableEngine, count: u64, round: i64) -> Result<f64, String> {
+/// Updates per second writing every entity once at `round`; with
+/// `timed`, the time each batch took until it was acknowledged.
+fn write_all(
+    engine: &DurableEngine,
+    count: u64,
+    round: i64,
+    mut timed: Option<&mut Vec<Duration>>,
+) -> Result<f64, String> {
     let started = Instant::now();
     let mut next = 0;
     while next < count {
         let end = (next + BATCH as u64).min(count);
         let batch = (next..end).map(|i| entity(i, round)).collect();
+        let batch_started = Instant::now();
         // Every write must land, or the rest measures a partial dataset.
         for outcome in engine
             .upsert_batch(&ns(), batch, 0)
@@ -193,6 +290,9 @@ fn write_all(engine: &DurableEngine, count: u64, round: i64) -> Result<f64, Stri
                 Ok(Upsert::Inserted | Upsert::Updated) => {}
                 other => return Err(format!("a write did not land: {other:?}")),
             }
+        }
+        if let Some(timed) = timed.as_deref_mut() {
+            timed.push(batch_started.elapsed());
         }
         next = end;
     }
@@ -256,12 +356,12 @@ fn run(options: &Options) -> Result<Value, String> {
 fn measure(options: &Options, dir: &Path) -> Result<Value, String> {
     let engine = open(&dir.join("main"), true)?;
     let before = resident_bytes();
-    let load = write_all(&engine, options.entities, 0)?;
+    let load = write_all(&engine, options.entities, 0, None)?;
     let memory = before
         .zip(resident_bytes())
         .map(|(before, after)| after.saturating_sub(before) as f64 / options.entities as f64);
     engine.snapshot(0).map_err(|error| error.to_string())?;
-    let moved = write_all(&engine, options.entities, 1)?;
+    let moved = write_all(&engine, options.entities, 1, None)?;
     let count = options.entities;
     let bbox = query_latency(&engine, |i| {
         let p = place(i % count);
@@ -317,6 +417,7 @@ fn measure(options: &Options, dir: &Path) -> Result<Value, String> {
     drop(engine);
 
     let follower = replication(&dir.join("replication"), options.entities.min(1_000_000))?;
+    let standby = sync_standby(&dir.join("sync"), options.entities.min(1_000_000))?;
 
     Ok(json!({
         "entities": options.entities,
@@ -330,6 +431,7 @@ fn measure(options: &Options, dir: &Path) -> Result<Value, String> {
         "memory_bytes_per_entity": memory,
         "recovery_s": recovery,
         "follower": follower,
+        "sync_standby": standby,
     }))
 }
 

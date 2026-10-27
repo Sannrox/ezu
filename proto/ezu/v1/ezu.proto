@@ -35,6 +35,12 @@ service Replication {
   // DATA_LOSS when the follower's last record is not this log's record
   // at that LSN (it followed another history).
   rpc Follow(FollowRequest) returns (stream FollowBatch);
+  // Follow, acknowledging what was applied: for a sync standby. The first
+  // message is a SyncStart, every later one a SyncAck. Batches and errors
+  // are those of Follow, except that a heartbeat carries the leader's
+  // epoch. A leader with a sync standby counts only that node's
+  // acknowledgements, and only at its own epoch.
+  rpc Sync(stream SyncRequest) returns (stream FollowBatch);
 }
 
 // Longitude and latitude in WGS 84 degrees.
@@ -323,11 +329,33 @@ message RecordFingerprint {
 }
 
 message FollowBatch {
-  // The epoch the records were logged at; unset in a heartbeat.
+  // The epoch the records were logged at; unset in a Follow heartbeat, the
+  // leader's epoch in a Sync heartbeat.
   uint64 epoch = 1;
   // Record payloads as logged, continuing the previous batch (or
   // after_lsn) without a gap. Empty in a heartbeat.
   repeated bytes records = 2;
   // The leader's last durable LSN when the batch was read.
   uint64 leader_lsn = 3;
+}
+
+message SyncRequest {
+  oneof message {
+    SyncStart start = 1;
+    SyncAck ack = 2;
+  }
+}
+
+message SyncStart {
+  // The follower's node id (EZU_NODE_ID).
+  string node_id = 1;
+  FollowRequest follow = 2;
+}
+
+// The follower holds the leader's log through lsn, appended and synced, and
+// follows epoch. Acknowledgements are cumulative; the follower repeats its
+// last one on every heartbeat, which keeps the leader's lease.
+message SyncAck {
+  uint64 lsn = 1;
+  uint64 epoch = 2;
 }

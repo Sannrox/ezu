@@ -507,15 +507,18 @@ impl Recent {
         self.kept.is_empty() && self.dropped.is_none()
     }
 
-    /// Keep `event`, dropping the oldest past `retained`.
-    pub(crate) fn push(&mut self, event: FenceEvent, retained: usize) {
+    /// Keep `event`, dropping the oldest past `retained`; see [`Self::trim`].
+    pub(crate) fn push(&mut self, event: FenceEvent, retained: usize, horizon: u64) {
         self.kept.push_back(event);
-        self.trim(retained);
+        self.trim(retained, horizon);
     }
 
-    /// Drop the oldest events past `retained`.
-    pub(crate) fn trim(&mut self, retained: usize) {
-        while self.kept.len() > retained {
+    /// Drop the oldest events past `retained`, but none raised past the LSN
+    /// `horizon`: an event no reader could be served yet is kept until it
+    /// could, so the ring may hold more than `retained` meanwhile.
+    pub(crate) fn trim(&mut self, retained: usize, horizon: u64) {
+        while self.kept.len() > retained && self.kept.front().is_some_and(|old| old.lsn <= horizon)
+        {
             if let Some(old) = self.kept.pop_front() {
                 self.dropped = Some((old.lsn, old.index));
             }
@@ -523,14 +526,16 @@ impl Recent {
     }
 
     /// Events after `after` (from the oldest kept when `None`) of the given
-    /// fences (all when empty) that `readable` may see, at most `limit`.
-    /// Refused when events after `after` were already dropped.
+    /// fences (all when empty) that `readable` may see, at most `limit`, none
+    /// raised past the LSN `horizon`. Refused when events after `after` were
+    /// already dropped.
     pub(crate) fn after(
         &self,
         after: Option<EventId>,
         fences: &[String],
         readable: Option<&Labels>,
         limit: usize,
+        horizon: u64,
     ) -> Result<EventPage, Expired> {
         // From the oldest kept: just after the newest dropped.
         let start = match after {
@@ -549,7 +554,7 @@ impl Recent {
             if id <= start {
                 continue;
             }
-            if page.events.len() == limit {
+            if event.lsn > horizon || page.events.len() == limit {
                 break;
             }
             page.through = id;
@@ -1042,7 +1047,7 @@ mod tests {
         let mut recent = Recent::default();
         for (lsn, ts) in [(1, 1_000), (2, 1_100), (3, 1_200)] {
             for event in space.upserted(&at(0.0, ts), lsn) {
-                recent.push(event, 2);
+                recent.push(event, 2, u64::MAX);
             }
         }
         let bytes = encode_state(&space, &recent);
@@ -1051,21 +1056,30 @@ mod tests {
         assert_eq!(restored.list().count(), 2);
         // The ring kept the newest two and remembers what it dropped.
         assert_eq!(kept, recent);
-        assert_eq!(kept.after(None, &[], None, 10).unwrap().events.len(), 2);
         assert_eq!(
-            kept.after(Some((1, 0)), &[], None, 10)
+            kept.after(None, &[], None, 10, u64::MAX)
                 .unwrap()
                 .events
                 .len(),
             2
         );
         assert_eq!(
-            kept.after(Some((0, 0)), &[], None, 10),
+            kept.after(Some((1, 0)), &[], None, 10, u64::MAX)
+                .unwrap()
+                .events
+                .len(),
+            2
+        );
+        assert_eq!(
+            kept.after(Some((0, 0)), &[], None, 10, u64::MAX),
             Err(Expired { dropped: (1, 0) })
         );
         // A filter that matches nothing still moves the reader along.
-        let skipped = kept.after(None, &["p".into()], None, 10).unwrap();
+        let skipped = kept.after(None, &["p".into()], None, 10, u64::MAX).unwrap();
         assert_eq!((skipped.events.len(), skipped.through), (0, (3, 0)));
+        // Nothing past the horizon is read, nor read through.
+        let held = kept.after(None, &[], None, 10, 2).unwrap();
+        assert_eq!((held.events.len(), held.through), (1, (2, 0)));
         // A fences file from before events were kept still reads.
         let (old, none) = decode_state(&restored.encode(), false).unwrap();
         assert_eq!((old.list().count(), none), (2, Recent::default()));

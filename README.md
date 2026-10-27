@@ -43,7 +43,7 @@ mutual TLS. The server needs `EZU_DATA_DIR` and listens on `EZU_LISTEN`
 
 - `GET /healthz` answers 200 while the engine accepts writes and 503 after a
   durability failure (reopen to recover); for a follower, see Follower
-  replicas.
+  replicas, and for a leader with a sync standby, Sync standby.
 - `DurableEngine::promote(dir)` raises the data directory's epoch, kept in
   `wal/EPOCH` and recorded in the log. An engine still holding the directory
   at an older epoch refuses every later write and reports unhealthy, even
@@ -63,7 +63,9 @@ mutual TLS. The server needs `EZU_DATA_DIR` and listens on `EZU_LISTEN`
   - snapshot age, sealed namespaces and an `ezu_up` gauge;
   - on a follower, the leader's last LSN, the applied LSN, the lag
     between them in records, and whether it is connected
-    (`ezu_replication_*`).
+    (`ezu_replication_*`);
+  - on a leader with a sync standby, the LSN it acknowledged and whether
+    its lease is held (`ezu_sync_*`).
 
   Every series is aggregated over namespaces, so neither endpoint takes a
   token or reveals tenant data.
@@ -139,6 +141,60 @@ when the leader's node is lost. Promotion is not part of this yet.
   sealed record, shipped or in a seeded snapshot, stops it.
 - Followers do not ship on: every replica follows the leader directly. A
   refused replication token stops the follower instead of retrying.
+
+## Sync standby
+
+Replication to followers is asynchronous: a leader acknowledges a write once
+its own disk has it. A sync standby makes acknowledged writes outlive the
+leader's node. Promotion and failover are not part of this yet.
+
+- A follower with `EZU_NODE_ID` follows over `Replication.Sync` and
+  acknowledges `{lsn, epoch}` once a batch is appended and synced in its own
+  log, and again on every heartbeat. Acknowledgements are cumulative.
+- A leader with `EZU_SYNC_STANDBY=<node id>` (it needs
+  `EZU_REPLICATION_TOKEN_FILE`) acknowledges a write only once that node
+  acknowledged the write's LSN at the leader's epoch. Acknowledgements from
+  any other node or epoch are not counted. Writes wait after the writer
+  lock is released, so concurrent writes share one round trip. The API
+  waits asynchronously, holding no blocking thread; an embedding host does
+  the same with `DurableEngine::deferring` and `acknowledged`, or calls the
+  engine directly and blocks. Even a write
+  that logs nothing (a stale upsert) waits for the log it answered from.
+- Past `EZU_SYNC_TIMEOUT` (milliseconds, default 5000) a write fails with
+  `UNAVAILABLE`. It is logged on the leader and may still reach the
+  standby, so its outcome is unknown; upserts and deletes are safe to
+  retry.
+- Lease: with no acknowledgement for 10 seconds, the leader refuses reads
+  and writes (`UNAVAILABLE`) and `GET /healthz` answers 503. This bounds
+  stale reads by a leader that lost its standby. A leader that starts
+  serves nothing until its standby's first acknowledgement, and recovers
+  on its own when acknowledgements resume. Leader reads can still show
+  writes not yet acknowledged; fence events cannot.
+- Event gating: `ListEvents` and `Subscribe` serve only events of writes
+  the standby acknowledged. A resume point past the leader's last LSN fails
+  with `OUT_OF_RANGE` (HTTP 410): the reader saw another history. A
+  resume point handed out never passes the acknowledged LSN, and events
+  not yet acknowledged are kept past `events_retained` until they are. A
+  leader does not record what was acknowledged, so after a restart it
+  keeps every event it recovers until the standby acknowledges again and
+  the next snapshot trims them.
+- A snapshot keeps the log the standby has not acknowledged, so it can
+  still be shipped; the next snapshot after the acknowledgement drops it.
+- Fencing across nodes needs no clock. An old leader cannot acknowledge a
+  write without its standby, and the standby follows one leader at one
+  epoch: a heartbeat carries the leader's epoch, which the standby takes;
+  a leader at a lower epoch than the standby's, or its records, are
+  refused, and the standby stops (fail closed, as for a follower; its log
+  is intact, restart it against the right leader).
+- Losing either node pauses writes until an operator acts: continuing
+  without the standby means removing `EZU_SYNC_STANDBY`, which is async
+  mode.
+- Without `EZU_SYNC_STANDBY` nothing changes. To roll out, upgrade the
+  leader first, then the standby with `EZU_NODE_ID`, then set
+  `EZU_SYNC_STANDBY` on the leader. A standby with `EZU_NODE_ID` against an
+  older leader gets `UNIMPLEMENTED` and keeps retrying, logged; a follower
+  without it never acknowledges, so a leader waiting for it refuses reads
+  and writes.
 
 ## Bulk interchange (Arrow Flight)
 
