@@ -29,6 +29,11 @@ ignore = [
     # JWT signatures with public keys from a JWKS and never holds an RSA
     # private key.
     { id = "RUSTSEC-2023-0071", reason = "public-key verification only" },
+    # crypto-bigint 0.5 (via jsonwebtoken's p256/p384) branches on secret
+    # integers. Ezu only verifies JWT signatures with public keys, so no
+    # secret reaches it. Remove once jsonwebtoken moves to elliptic-curve
+    # 0.14 (#50).
+    { id = "RUSTSEC-2026-0387", reason = "public-key verification only (#50)" },
 ]
 
 [bans]
