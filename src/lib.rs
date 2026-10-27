@@ -20,8 +20,8 @@ pub mod tiles;
 mod wal;
 
 pub use durable::{
-    DurabilityConfig, DurableEngine, DurableError, Pending, RebuildSource, ReplicaError,
-    SyncStandby,
+    DurabilityConfig, DurableEngine, DurableError, EpochStart, Pending, RebuildSource,
+    ReplicaError, SyncStandby,
 };
 pub use entity::{Entity, EntityError, FieldValue, Identity, Namespace};
 pub use geometry::{BoundingBox, Geometry, GeometryError, Position};

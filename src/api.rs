@@ -25,9 +25,11 @@
 //! ships the same and takes acknowledgements back, for a sync standby; on a
 //! leader waiting for one, a write the standby did not acknowledge in time,
 //! and every read and write while its lease is lapsed, fail `UNAVAILABLE`.
+//! `Replication.Promote`, with the same token, promotes a follower in place
+//! (see [`DurableEngine::promote_follower`]).
 
 use crate::auth::{AuthError, Authenticator, StaticToken, bearer};
-use crate::durable::{DurableEngine, DurableError, ReplicaError};
+use crate::durable::{DurableEngine, DurableError, EpochStart, ReplicaError};
 use crate::entity::{Entity, FieldValue, Labels, Namespace};
 use crate::fence::{EventKind, Fence, FenceEvent, Shape};
 use crate::geometry::{Geometry, Position};
@@ -104,10 +106,14 @@ impl From<DurableError> for ApiError {
             | DurableError::Replica(ReplicaError::Gone(_)) => {
                 Self::new(tonic::Code::OutOfRange, error.to_string())
             }
-            DurableError::ReadOnly | DurableError::Replica(ReplicaError::Ahead { .. }) => {
+            DurableError::ReadOnly
+            | DurableError::Replica(ReplicaError::Ahead { .. })
+            | DurableError::NotPromotable(_)
+            | DurableError::PromotionPending
+            | DurableError::Promoted => {
                 Self::new(tonic::Code::FailedPrecondition, error.to_string())
             }
-            DurableError::Replica(ReplicaError::Diverged(_)) => {
+            DurableError::Replica(ReplicaError::Diverged(_) | ReplicaError::Lineage(_)) => {
                 Self::new(tonic::Code::DataLoss, error.to_string())
             }
             other => Self::new(tonic::Code::Unavailable, other.to_string()),
@@ -408,6 +414,10 @@ pub struct Api {
     governed: bool,
     /// The token followers present; log shipping is refused without one.
     replication: Option<Arc<StaticToken>>,
+    /// This node's id, which a promotion records.
+    node_id: Option<Arc<str>>,
+    /// The old leader's lease, which a promotion waits out.
+    lease: std::time::Duration,
 }
 
 impl Api {
@@ -417,7 +427,17 @@ impl Api {
             auth,
             governed: false,
             replication: None,
+            node_id: None,
+            lease: crate::durable::LEASE,
         }
+    }
+
+    /// Promote this node as `node_id` (refused without one), waiting out
+    /// `lease`, its old leader's ([`crate::durable::LEASE`] by default).
+    pub fn promotion(mut self, node_id: Option<&str>, lease: std::time::Duration) -> Self {
+        self.node_id = node_id.map(Arc::from);
+        self.lease = lease;
+        self
     }
 
     /// Serve the log to followers presenting `token`, compared in constant
@@ -752,14 +772,16 @@ impl Api {
         request: proto::FollowRequest,
     ) -> Result<Batches, ApiError> {
         self.may_follow(authorization)?;
-        self.ship(request, false).await
+        self.ship(request, None, None).await
     }
 
     /// [`Self::follow`] for a sync standby: the first message of `inbound`
     /// names the follower and where it resumes, every later one
     /// acknowledges what it applied ([`DurableEngine::acknowledge`]), and
     /// heartbeats carry this leader's epoch, so the follower acknowledges
-    /// at it. Acknowledgements are read until the follower closes its side.
+    /// at it. Every batch says whether the follower is this leader's sync
+    /// standby, which alone is shipped what it did not acknowledge yet.
+    /// Acknowledgements are read until the follower closes its side.
     pub async fn sync(
         &self,
         authorization: Option<&str>,
@@ -777,21 +799,61 @@ impl Api {
         if start.node_id.is_empty() {
             return Err(ApiError::invalid("a sync standby needs a node id"));
         }
-        let batches = self.ship(start.follow.unwrap_or_default(), true).await?;
+        let standby = self.engine.is_sync_standby(&start.node_id);
+        // The standby's newest stream supersedes its older ones.
+        let session = self.engine.sync_session(&start.node_id);
+        let batches = self
+            .ship(start.follow.unwrap_or_default(), Some(standby), session)
+            .await?;
         let (engine, node_id) = (self.engine.clone(), start.node_id);
         tokio::spawn(async move {
             while let Ok(Some(request)) = inbound.message().await {
-                if let Some(Message::Ack(ack)) = request.message {
-                    engine.acknowledge(&node_id, ack.lsn, ack.epoch);
+                let Some(Message::Ack(ack)) = request.message else {
+                    continue;
+                };
+                match session {
+                    Some(session) => {
+                        if !engine.session_current(session) {
+                            return;
+                        }
+                        engine.acknowledge_on(session, &node_id, ack.lsn, ack.epoch, ack.stamp);
+                    }
+                    None => {
+                        engine.acknowledge(&node_id, ack.lsn, ack.epoch, ack.stamp);
+                    }
                 }
             }
         });
         Ok(batches)
     }
 
-    /// Refuse a caller without the replication token, and a follower asked
-    /// to ship on.
-    fn may_follow(&self, authorization: Option<&str>) -> Result<(), ApiError> {
+    /// Promote this follower in place and return the epoch it leads at; see
+    /// [`DurableEngine::promote_follower`]. Takes the replication token and
+    /// this node's id ([`Self::promotion`]).
+    pub async fn promote(
+        &self,
+        authorization: Option<&str>,
+        request: proto::PromoteRequest,
+    ) -> Result<proto::PromoteResponse, ApiError> {
+        self.replicator(authorization)?;
+        let node_id = self.node_id.clone().ok_or_else(|| {
+            ApiError::new(
+                tonic::Code::FailedPrecondition,
+                "a promotion needs this node's id (EZU_NODE_ID)",
+            )
+        })?;
+        let (engine, lease) = (self.engine.clone(), self.lease);
+        // Waits out the lease on the blocking thread it holds.
+        let epoch = tokio::task::spawn_blocking(move || {
+            engine.promote_follower(&node_id, request.force, lease)
+        })
+        .await
+        .map_err(|_| ApiError::new(tonic::Code::Internal, "promotion task failed"))??;
+        Ok(proto::PromoteResponse { epoch })
+    }
+
+    /// Refuse a caller without the replication token.
+    fn replicator(&self, authorization: Option<&str>) -> Result<(), ApiError> {
         let token = self.replication.as_ref().ok_or_else(|| {
             ApiError::new(
                 tonic::Code::PermissionDenied,
@@ -799,6 +861,13 @@ impl Api {
             )
         })?;
         token.authenticate(bearer(authorization))?;
+        Ok(())
+    }
+
+    /// Refuse a caller without the replication token, and a follower asked
+    /// to ship on.
+    fn may_follow(&self, authorization: Option<&str>) -> Result<(), ApiError> {
+        self.replicator(authorization)?;
         // Followers do not ship on: a chain would relabel records across an
         // epoch change. Replicas follow the leader directly.
         if self.engine.replication().is_some() {
@@ -810,12 +879,17 @@ impl Api {
         Ok(())
     }
 
-    /// The shipping stream behind [`Self::follow`] and [`Self::sync`]; with
-    /// `epoch_in_heartbeats`, a heartbeat carries this leader's epoch.
+    /// The shipping stream behind [`Self::follow`] and [`Self::sync`]. A
+    /// follower that sent its last record also has its lineage checked. On a
+    /// sync stream (`sync_standby` set, to whether the follower is this
+    /// leader's standby), a heartbeat carries this leader's epoch. Only the
+    /// standby is shipped past what it acknowledged. With the standby's
+    /// `session`, the stream ends (`ABORTED`) once a newer one replaced it.
     async fn ship(
         &self,
         request: proto::FollowRequest,
-        epoch_in_heartbeats: bool,
+        sync_standby: Option<bool>,
+        session: Option<u64>,
     ) -> Result<Batches, ApiError> {
         /// Payload bytes per batch, past the first record.
         const BUDGET: usize = 1 << 20;
@@ -840,21 +914,42 @@ impl Api {
             crc32: last.crc32,
             epoch: last.epoch,
         });
+        let lineage: Vec<EpochStart> = request.lineage.into_iter().map(epoch_start).collect();
         let start = self.engine.clone();
         let (start, epoch) = tokio::task::spawn_blocking(move || {
-            let epoch = match epoch_in_heartbeats {
-                true => start.epoch()?,
-                false => 0,
+            let epoch = match sync_standby {
+                Some(_) => start.epoch()?,
+                None => 0,
             };
-            Ok::<_, DurableError>((start.shipping(request.after_lsn, last)?, epoch))
+            // A follower with a lineage of its own is held to it, with or
+            // without a last record; one with neither (new, or seeded from
+            // a snapshot copy) is trusted as it is and takes this lineage.
+            if last.is_some() || !lineage.is_empty() {
+                start.check_lineage(request.after_lsn, &lineage)?;
+            }
+            let shipping = start.shipping(request.after_lsn, last)?;
+            let shipping = match sync_standby {
+                Some(true) => shipping,
+                _ => shipping.acknowledged_only(),
+            };
+            Ok::<_, DurableError>((shipping, epoch))
         })
         .await
         .map_err(|_| ApiError::new(tonic::Code::Internal, "read task failed"))??;
         let (mut from, shipped) = read(start).await?;
         let mut shipped = shipped?;
         let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        let stamping = self.engine.clone();
         tokio::spawn(async move {
             loop {
+                if session.is_some_and(|session| !stamping.session_current(session)) {
+                    let superseded = ApiError::new(
+                        tonic::Code::Aborted,
+                        "superseded by a newer sync stream of this node",
+                    );
+                    let _ = sender.send(Err(superseded)).await;
+                    return;
+                }
                 if shipped.records.is_empty() {
                     tokio::select! {
                         changed = durable.changed() => {
@@ -867,6 +962,9 @@ impl Api {
                                 epoch,
                                 records: Vec::new(),
                                 leader_lsn: shipped.leader_lsn,
+                                sync_standby: sync_standby.unwrap_or(false),
+                                lineage: shipped.lineage.iter().map(to_epoch_start).collect(),
+                                stamp: stamping.stamp(),
                             };
                             if sender.send(Ok(heartbeat)).await.is_err() {
                                 return;
@@ -879,6 +977,9 @@ impl Api {
                         epoch: shipped.epoch,
                         records: std::mem::take(&mut shipped.records),
                         leader_lsn: shipped.leader_lsn,
+                        sync_standby: sync_standby.unwrap_or(false),
+                        lineage: shipped.lineage.iter().map(to_epoch_start).collect(),
+                        stamp: shipped.stamp,
                     };
                     if sender.send(Ok(batch)).await.is_err() {
                         return;
@@ -903,6 +1004,22 @@ impl Api {
             }
         });
         Ok(receiver)
+    }
+}
+
+pub(crate) fn epoch_start(start: proto::EpochStart) -> EpochStart {
+    EpochStart {
+        epoch: start.epoch,
+        start_lsn: start.start_lsn,
+        node_id: start.node_id,
+    }
+}
+
+pub(crate) fn to_epoch_start(start: &EpochStart) -> proto::EpochStart {
+    proto::EpochStart {
+        epoch: start.epoch,
+        start_lsn: start.start_lsn,
+        node_id: start.node_id.clone(),
     }
 }
 
@@ -942,6 +1059,15 @@ impl Replication for Api {
         let auth = metadata_auth(&request);
         let batches = Api::sync(self, auth.as_deref(), request.into_inner()).await?;
         Ok(tonic::Response::new(batch_stream(batches)))
+    }
+
+    async fn promote(
+        &self,
+        request: tonic::Request<proto::PromoteRequest>,
+    ) -> Result<tonic::Response<proto::PromoteResponse>, tonic::Status> {
+        let auth = metadata_auth(&request);
+        let promoted = Api::promote(self, auth.as_deref(), request.into_inner()).await?;
+        Ok(tonic::Response::new(promoted))
     }
 }
 

@@ -19,8 +19,9 @@
 //!   then runs as a read-only follower of it. Over `https`, `EZU_FOLLOW_CA`
 //!   (PEM) verifies the leader, and `EZU_TLS_CERT` and `EZU_TLS_KEY`, when
 //!   set, are the follower's client certificate.
-//! - `EZU_NODE_ID`: a follower's node id. With it, the follower acknowledges
-//!   what it applied (`Replication.Sync`), so it can be a sync standby.
+//! - `EZU_NODE_ID`: this node's id. With it, a follower acknowledges what it
+//!   applied (`Replication.Sync`), so it can be a sync standby, and can be
+//!   promoted (`Replication.Promote`, with the replication token).
 //! - `EZU_SYNC_STANDBY`: on a leader, the node id of its sync standby. A
 //!   write is then acknowledged only once that standby acknowledged it;
 //!   `EZU_SYNC_TIMEOUT` (milliseconds, default 5000) bounds the wait, past
@@ -29,15 +30,11 @@
 
 use ezu::api::{Api, serve};
 use ezu::auth::{Authenticator, Jwt, StaticToken};
+use ezu::durable::LEASE;
 use ezu::{DurabilityConfig, DurableEngine, Quotas, SyncStandby};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
-
-/// Without an acknowledgement from the sync standby this long, a leader
-/// refuses reads and writes: as long as a follower waits before it takes a
-/// silent stream as lost.
-const LEASE: Duration = Duration::from_secs(10);
 
 fn var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
@@ -161,13 +158,18 @@ async fn run() -> Result<(), String> {
     let listener = tokio::net::TcpListener::bind(&listen)
         .await
         .map_err(|error| format!("{listen}: {error}"))?;
-    eprintln!("ezu {} listening on {listen}", env!("CARGO_PKG_VERSION"));
+    // The bound address, so a port of 0 shows the one taken.
+    let bound = listener
+        .local_addr()
+        .map_or(listen.clone(), |address| address.to_string());
+    eprintln!("ezu {} listening on {bound}", env!("CARGO_PKG_VERSION"));
     let engine = Arc::new(engine);
     if let Some(leader) = leader {
         let token = replication_token
             .clone()
             .ok_or("EZU_FOLLOW needs EZU_REPLICATION_TOKEN_FILE")?;
         let follower = engine.clone();
+        let node_id = node_id.clone();
         tokio::spawn(async move {
             let retry = |why: &str| eprintln!("ezu: following the leader: {why}; reconnecting");
             let stopped = match node_id {
@@ -187,9 +189,10 @@ async fn run() -> Result<(), String> {
         let mut every = tokio::time::interval(std::time::Duration::from_secs(10));
         loop {
             every.tick().await;
-            // A follower's removals come from its leader's log.
+            // A follower's removals come from its leader's log, until it is
+            // promoted.
             if sweeper.replication().is_some() {
-                return;
+                continue;
             }
             let engine = sweeper.clone();
             // The wait for a sync standby happens off the blocking thread.
@@ -219,7 +222,8 @@ async fn run() -> Result<(), String> {
     serve(
         Api::new(engine, auth)
             .governed(governed)
-            .replication_token(replication_token.as_deref()),
+            .replication_token(replication_token.as_deref())
+            .promotion(node_id.as_deref(), LEASE),
         listener,
         tls,
         shutdown,

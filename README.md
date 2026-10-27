@@ -21,8 +21,8 @@ status. One listener serves it over gRPC and as HTTP/JSON:
 `POST /v1/entities`, `GET|DELETE /v1/entities/{collection}/{id}`,
 `POST /v1/query`, `GET /v1/status`, `GET /v1/fences`,
 `PUT|GET|DELETE /v1/fences/{id}` and `GET /v1/events`. Log shipping to
-followers is the separate gRPC service `Replication` (see Follower
-replicas). JSON bodies are the same messages in
+followers and promotion are the separate gRPC service `Replication` (see
+Follower replicas and Promotion). JSON bodies are the same messages in
 snake_case; a oneof is an object naming its variant.
 
 Every request carries `authorization: Bearer <token>`. The namespace comes
@@ -86,7 +86,8 @@ mutual TLS. The server needs `EZU_DATA_DIR` and listens on `EZU_LISTEN`
 ## Follower replicas
 
 A follower serves reads from a copy of its leader's state, so reads go on
-when the leader's node is lost. Promotion is not part of this yet.
+when the leader's node is lost, and can be promoted to a leader (see
+Promotion).
 
 - The leader serves its committed log over the `Replication.Follow` gRPC
   stream on its API listener. The stream carries every namespace, so it
@@ -111,10 +112,8 @@ when the leader's node is lost. Promotion is not part of this yet.
 - A follower marks its data directory with a `FOLLOWER` file, written
   before it applies anything, and the server refuses to open a marked
   directory as a leader: it would write past its leader's log. Promotion
-  (a follow-up) is the way to turn a follower into a leader; until then
-  the only way to clear the mark is to delete the file by hand. Releases
-  from before followers ignore the file and would open the directory as
-  a leader.
+  clears it. Releases from before followers ignore the file and would open
+  the directory as a leader.
 - Every write (API, Flight) is refused with `FAILED_PRECONDITION`. Expiry
   removals come from the leader's log.
 - It records the epoch of the records it applies (`wal/EPOCH`, and a
@@ -130,13 +129,19 @@ when the leader's node is lost. Promotion is not part of this yet.
   leader's newest `snapshots/<lsn>/` set into `snapshots/` there, and
   start it again. It follows from that LSN. Holding no record of its own
   at that LSN, it sends no fingerprint on its first connect: the copy is
-  trusted as it is.
+  trusted as it is, and takes the leader's lineage (below) with its first
+  epoch.
 - On each connect the leader checks the follower's last record (its
-  checksum and epoch) against its own at that LSN and refuses a mismatch.
-  That catches a follower that diverged from this leader, not a different
-  log that happens to hold the same last record: follow one leader per
-  follower directory. Switching a follower to another leader comes with
-  promotion.
+  checksum and epoch) against its own at that LSN, and the follower's
+  lineage, and refuses a mismatch (`DATA_LOSS`). The lineage
+  (`wal/LINEAGE`) lists where each epoch started: its epoch, the LSN its
+  records follow, and the node that started it. A follower takes its
+  leader's starts with its epochs, so its lineage must be a prefix of the
+  leader's holding every start before its applied LSN. Two logs that end
+  in the same record but were promoted differently are refused, so a
+  follower can switch to another leader: see Promotion. Epochs raised by a
+  release without lineage have no start; a directory-local
+  `DurableEngine::promote` records one from the next open.
 - Encrypted namespaces are not replicated: a follower takes no keys, and a
   sealed record, shipped or in a seeded snapshot, stops it.
 - Followers do not ship on: every replica follows the leader directly. A
@@ -146,7 +151,7 @@ when the leader's node is lost. Promotion is not part of this yet.
 
 Replication to followers is asynchronous: a leader acknowledges a write once
 its own disk has it. A sync standby makes acknowledged writes outlive the
-leader's node. Promotion and failover are not part of this yet.
+leader's node; promoting it (see Promotion) is the failover.
 
 - A follower with `EZU_NODE_ID` follows over `Replication.Sync` and
   acknowledges `{lsn, epoch}` once a batch is appended and synced in its own
@@ -169,7 +174,14 @@ leader's node. Promotion and failover are not part of this yet.
   stale reads by a leader that lost its standby. A leader that starts
   serves nothing until its standby's first acknowledgement, and recovers
   on its own when acknowledgements resume. Leader reads can still show
-  writes not yet acknowledged; fence events cannot.
+  writes not yet acknowledged; fence events cannot. The lease runs from
+  the leader's own clock: every batch and heartbeat on the sync stream
+  carries the time the leader read it, the standby echoes the newest in
+  each acknowledgement, and the lease lasts 10 seconds from that time, not
+  from when the acknowledgement arrived. An acknowledgement held up in
+  transit therefore never keeps the leader serving longer than 10 seconds
+  after it sent what that acknowledgement echoes. (An unstamped one, from
+  a standby of an earlier release, renews it from arrival; see below.)
 - Event gating: `ListEvents` and `Subscribe` serve only events of writes
   the standby acknowledged. A resume point past the leader's last LSN fails
   with `OUT_OF_RANGE` (HTTP 410): the reader saw another history. A
@@ -180,6 +192,13 @@ leader's node. Promotion and failover are not part of this yet.
   the next snapshot trims them.
 - A snapshot keeps the log the standby has not acknowledged, so it can
   still be shipped; the next snapshot after the acknowledgement drops it.
+- Every other follower is shipped only what the standby acknowledged, so
+  none holds a write the standby lacks, and each can follow the standby
+  once it is promoted. Their lag includes the standby's round trip. A
+  heartbeat announcing an epoch that starts past what such a follower holds
+  is taken only once its records reach that start.
+- Each batch on the sync stream tells the follower whether it is the
+  leader's sync standby; it keeps that in `FOLLOWER` for a promotion.
 - Fencing across nodes needs no clock. An old leader cannot acknowledge a
   write without its standby, and the standby follows one leader at one
   epoch: a heartbeat carries the leader's epoch, which the standby takes;
@@ -188,13 +207,75 @@ leader's node. Promotion and failover are not part of this yet.
   is intact, restart it against the right leader).
 - Losing either node pauses writes until an operator acts: continuing
   without the standby means removing `EZU_SYNC_STANDBY`, which is async
-  mode.
+  mode; losing the leader means promoting the standby.
 - Without `EZU_SYNC_STANDBY` nothing changes. To roll out, upgrade the
   leader first, then the standby with `EZU_NODE_ID`, then set
   `EZU_SYNC_STANDBY` on the leader. A standby with `EZU_NODE_ID` against an
   older leader gets `UNIMPLEMENTED` and keeps retrying, logged; a follower
   without it never acknowledges, so a leader waiting for it refuses reads
-  and writes.
+  and writes. A standby from before promotion echoes no stamp; its
+  acknowledgements renew the lease from when they arrive, as before, and
+  `ezu_sync_unstamped` reports it. It keeps working until it is upgraded,
+  so the two need not be upgraded together; it cannot be promoted until
+  then. From the first stamped acknowledgement on, the leader refuses
+  unstamped ones for the rest of its life (`ezu_sync_unstamped_refused`
+  counts them) and its lease follows the newest stamp alone. Only the
+  standby's newest sync stream counts: a newer one ends the older
+  (`ABORTED`), and what still arrives on that is ignored.
+- Residual during that upgrade: while the standby is not upgraded, an
+  acknowledgement renews the lease from its arrival, so the bound on stale
+  reads by a leader that lost its standby rests on timing. Writes are
+  always fenced by acknowledgements. Upgrade standbys before relying on
+  promotion.
+
+## Promotion
+
+`Replication.Promote` (gRPC, with the replication token) turns a follower
+into a leader in place. Promotion is manual: nothing promotes on its own.
+
+- It needs `EZU_NODE_ID`, which the lineage records. Without `force`, only
+  the leader's sync standby is promoted (`FAILED_PRECONDITION` otherwise):
+  it holds every acknowledged write.
+- `force` is the operator's assertion that the old leader and its standby
+  are gone. Ezu cannot check it. Writes the standby acknowledged that the
+  forced follower lacks are lost. A forced promotion while the old leader
+  and its standby are alive gives two leaders, both taking writes: the
+  lineage refuses either one rejoining the other, but it does not prevent
+  the split.
+- The follower stops following, so it acknowledges nothing more, and waits
+  10.5 seconds (the lease plus a twentieth) since its last acknowledgement,
+  or since it started when it sent none since: a standby that restarted
+  may have acknowledged just before. The old leader's lease ran from a
+  time before that acknowledgement left, so by then the old leader refuses
+  reads and writes, however late the acknowledgement arrived. This assumes
+  the two clocks run at rates no more than 5% apart; they need not agree on
+  the time. A follower that failed for any reason other than its leader
+  refusing it (durability lost) is not promoted, also when the failure
+  happens during the wait: restart it first. Without `force`, the standby
+  must also have let out a stamped acknowledgement since it started, so
+  its leader counts no unstamped one from an earlier process of it any
+  more; until then the promotion is refused. Then it writes the intent into
+  `FOLLOWER`, raises the epoch past the highest it followed, adds its start
+  to the lineage, begins a segment with the promotion frame, and deletes
+  `FOLLOWER`. It serves writes and ships its log at once. LSNs, and so
+  event ids, continue after the last record it applied: a subscriber
+  resumes on it from its last id without a gap.
+- Asked again (also after a restart), it answers the same epoch. A crash
+  in between is completed by starting the node as a leader (without
+  `EZU_FOLLOW`); started as a follower, it refuses the directory.
+- A promoted node runs without a sync standby, in async mode. To have one
+  again, restart it with `EZU_SYNC_STANDBY` once another follower follows
+  it with `EZU_NODE_ID`.
+- Other followers switch by setting `EZU_FOLLOW` to the new leader and
+  restarting. Their lineage passes, as they never held a write the standby
+  lacked. A node that holds records past the promotion point (the old
+  leader, or a follower of it without a sync standby) is refused
+  (`DATA_LOSS`) and needs a re-seed. So is a node promoted elsewhere at the
+  same point: two promotions never share a lineage.
+- In a partition the old leader acknowledges nothing once its standby
+  stops following, and serves nothing after the lease.
+- Upgrade every node before the first promotion: a follower from before
+  lineage sends none and is refused by a leader that has one.
 
 ## Bulk interchange (Arrow Flight)
 
@@ -251,7 +332,9 @@ last-seen id, then live, optionally for chosen fences; `ListEvents` (also
 event id is the idempotency key: a reader resumes from its last id across
 disconnects and Ezu restarts without gaps. A resume point older than the
 newest dropped event fails with `OUT_OF_RANGE` (HTTP 410) instead of
-silently skipping events.
+silently skipping events. On a leader, a resume point past its last LSN
+fails the same way: it was read from another history. A follower may be
+behind its reader and serves such a resume point once it catches up.
 
 ## Offline map packages
 

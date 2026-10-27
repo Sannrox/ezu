@@ -73,3 +73,49 @@ next, so the leader's and the standby's syncs do not overlap and the rate
 drops to about 43% of the async load; concurrent writers share one
 acknowledgement and overlap them. In exchange, the standby holds every
 acknowledged write: there is no lag to lose.
+
+## Promotion under load
+
+`tests/kill_leader.rs` is the kill-leader evidence for promotion. The
+leader runs as the `ezu` binary with a sync standby and an async follower
+(both in the test process, each applying with its own sync), four
+concurrent writers of 1,000-entity batches moving through a fence, and an
+event subscriber. After 2 seconds of load the leader is SIGKILLed and the
+standby promoted. The test checks that every acknowledged write is on the
+promoted standby, that the subscriber resumes there from its last event id
+and reads every event the standby holds with no gap (a write after the
+promotion raises the next ids), and that the async follower switches to the
+standby through the lineage check and converges. It prints the numbers
+below.
+
+```sh
+cargo test --release --locked --test kill_leader -- --nocapture
+```
+
+Same hardware as above, two runs (promotion time from a third run after the
+wait changed to the lease plus a twentieth):
+
+| Measure | Result |
+| --- | --- |
+| Acknowledged writes before the kill | 56,000 and 57,000 in 2 s (about 28,000/s) |
+| Standby lag during the load | p50 1,000, p99 1,000 records (one batch, about 36 ms) |
+| Async follower lag during the load | p50 1,000, p99 1,000 records |
+| Events read before the kill | every acknowledged one (56,000 and 57,000) |
+| Acknowledged writes missing on the promoted standby | none |
+| Event ids skipped or repeated after resuming | none |
+| Promotion, from the request to taking writes | 10.5 s |
+| Async follower behind the promotion point | 1,000 records |
+| Async follower converged on the new leader | 0.11 s after it switched |
+
+Lag is sampled every 20 ms and counts whole batches, as a follower learns
+the leader's last LSN with each batch. The async follower is shipped only
+what the standby acknowledged, so it never holds a write the standby lacks;
+its lag includes the standby's round trip. For lag at the full benchmark
+load (one writer of 10,000-entity batches, 10^6 entities), see the async
+follower rows above; that run has no sync standby, so it is not capped.
+
+Promotion time is the old leader's lease (10 s) plus a twentieth for clock
+rates, counted from the standby's last acknowledgement: the promoted standby takes writes only once the old leader
+refuses reads and writes. The write rate is below the benchmark's sync
+standby rate because each round trip carries 1,000 entities, not 10,000,
+and the async follower syncs on the same disk.
