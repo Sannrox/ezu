@@ -25,6 +25,13 @@
 //! ([`Fingerprint`]), so a follower of another history is refused. A gap, an epoch going back, or a sealed
 //! record stops it, fail closed: it keeps serving what it applied, reports
 //! unhealthy, and needs a rebuild.
+//!
+//! A leader with a sync standby ([`DurableEngine::open_sync`])
+//! acknowledges a write only once that standby acknowledged its LSN at this
+//! leader's epoch ([`DurableEngine::acknowledge`]), waiting after the writer
+//! lock is released, so concurrent writes share one round trip. Without an
+//! acknowledgement for the lease it refuses reads and writes and reports
+//! unhealthy, and it serves fence events only up to the acknowledged LSN.
 
 use crate::entity::{Entity, Labels, Namespace, visible};
 use crate::fence::{
@@ -37,11 +44,13 @@ use crate::keys::{self, KeyConfig, Keyring};
 use crate::metrics::{Gauges, Metrics};
 use crate::snapshot::{self, DataFile, Found, Part, SealInfo, SnapshotError};
 use crate::wal::{Entry, Op, Record, Tail, TailError, Wal, WalError};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub struct DurabilityConfig {
@@ -109,6 +118,19 @@ pub enum DurableError {
     FollowerDirectory,
     /// Shipping between a leader and a follower cannot go on.
     Replica(ReplicaError),
+    /// The sync standby has not acknowledged anything for the lease: the
+    /// leader refuses reads and writes until it does again.
+    NoStandby,
+    /// The sync standby did not acknowledge the write's LSN in time. The
+    /// write is logged here and may still reach the standby: its outcome is
+    /// unknown. Upserts and deletes are safe to retry.
+    Unacknowledged(u64),
+    /// A reader resumed from an event past this leader's log: it read from
+    /// another history.
+    ResumeAhead {
+        after: u64,
+        last: u64,
+    },
 }
 
 /// Why shipped records cannot be applied, or shipping cannot go on. A
@@ -203,6 +225,20 @@ impl std::fmt::Display for DurableError {
                  follower, or promote it once promotion exists (#42)",
             ),
             Self::Replica(error) => write!(f, "replication: {error}"),
+            Self::NoStandby => f.write_str(
+                "no acknowledgement from the sync standby within the lease; \
+                 refusing reads and writes until it acknowledges again",
+            ),
+            Self::Unacknowledged(lsn) => write!(
+                f,
+                "the sync standby did not acknowledge LSN {lsn} in time; the outcome is \
+                 unknown, retry the write"
+            ),
+            Self::ResumeAhead { after, last } => write!(
+                f,
+                "resume point {after} is past this leader's last LSN {last}; it was read \
+                 from another history"
+            ),
         }
     }
 }
@@ -260,6 +296,8 @@ pub struct DurableEngine {
     durable: tokio::sync::watch::Sender<u64>,
     /// Set on a follower.
     following: Option<Following>,
+    /// Set on a leader with a sync standby.
+    sync: Option<SyncState>,
     quotas: Quotas,
     config: DurabilityConfig,
     keyring: Keyring,
@@ -280,6 +318,63 @@ struct Following {
     connected: AtomicBool,
     /// Why it stopped applying, fail closed.
     stopped: Mutex<Option<String>>,
+}
+
+/// A sync standby, as a leader is configured with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncStandby {
+    /// The standby's node id (its `EZU_NODE_ID`); acknowledgements from any
+    /// other node are not counted.
+    pub node_id: String,
+    /// How long a write waits for the standby's acknowledgement.
+    pub timeout: Duration,
+    /// Without an acknowledgement this long, reads and writes are refused.
+    pub lease: Duration,
+}
+
+/// A leader's sync standby and what it acknowledged.
+struct SyncState {
+    standby: SyncStandby,
+    /// The leader's epoch, fixed while it is open: a raise fences it.
+    epoch: u64,
+    acked: Mutex<Acked>,
+    /// Signalled when the acknowledged LSN grows, for blocking waits.
+    advanced: Condvar,
+    /// The acknowledged LSN, for async waits ([`DurableEngine::acknowledged`]).
+    acked_lsn: tokio::sync::watch::Sender<u64>,
+}
+
+thread_local! {
+    /// Set inside [`DurableEngine::deferring`]: the engine whose writes on
+    /// this thread do not wait for the standby, and the LSN they must be
+    /// acknowledged through.
+    static DEFERRED: Cell<Option<(usize, u64)>> = const { Cell::new(None) };
+}
+
+/// The result of work run by [`DurableEngine::deferring`]: not yet
+/// acknowledged by the sync standby. Only [`DurableEngine::acknowledged`]
+/// gives the value up.
+#[must_use = "a write is acknowledged only once DurableEngine::acknowledged returns its value"]
+pub struct Pending<T> {
+    value: T,
+    /// The LSN the standby must acknowledge first.
+    lsn: u64,
+}
+
+#[derive(Default)]
+struct Acked {
+    /// The highest LSN the standby acknowledged since this engine opened.
+    lsn: u64,
+    /// When the standby last acknowledged anything; `None` before its first.
+    at: Option<Instant>,
+}
+
+/// Where a leader's sync standby stands, read for health and metrics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Standby {
+    pub acked_lsn: u64,
+    /// Whether an acknowledgement arrived within the lease.
+    pub lease_held: bool,
 }
 
 /// Where a follower stands, read for health and metrics.
@@ -335,7 +430,25 @@ impl DurableEngine {
         rebuild: Option<&dyn RebuildSource>,
         now_ms: i64,
     ) -> Result<Self, DurableError> {
-        Self::open_as(config, quotas, rebuild, now_ms, None)
+        Self::open_as(config, quotas, rebuild, now_ms, None, None)
+    }
+
+    /// [`Self::open`] as a leader that waits for `standby`: a write is
+    /// acknowledged only once the standby acknowledged its LSN at this
+    /// leader's epoch, and without an acknowledgement for the lease reads and
+    /// writes are refused. Until the standby's first acknowledgement after
+    /// opening, it is refused too: an old leader that restarts serves nothing
+    /// on its own. Recovery keeps every event it restores beyond the
+    /// retention: this leader does not know which of them the standby
+    /// acknowledged, and none may be dropped before it could be served.
+    pub fn open_sync(
+        config: DurabilityConfig,
+        quotas: Quotas,
+        rebuild: Option<&dyn RebuildSource>,
+        now_ms: i64,
+        standby: SyncStandby,
+    ) -> Result<Self, DurableError> {
+        Self::open_as(config, quotas, rebuild, now_ms, None, Some(standby))
     }
 
     /// Open or recover a follower in `config.dir`, its own directory: it
@@ -354,7 +467,14 @@ impl DurableEngine {
                 "a follower takes no keys: encrypted namespaces are not replicated".into(),
             ));
         }
-        Self::open_as(config, quotas, None, now_ms, Some(Following::default()))
+        Self::open_as(
+            config,
+            quotas,
+            None,
+            now_ms,
+            Some(Following::default()),
+            None,
+        )
     }
 
     fn open_as(
@@ -363,7 +483,15 @@ impl DurableEngine {
         rebuild: Option<&dyn RebuildSource>,
         now_ms: i64,
         following: Option<Following>,
+        standby: Option<SyncStandby>,
     ) -> Result<Self, DurableError> {
+        // Events restored at or below this LSN may be dropped past the
+        // retention: none with a sync standby, which acknowledged nothing yet
+        // to this engine.
+        let recovered = match standby {
+            Some(_) => 0,
+            None => u64::MAX,
+        };
         let (wal_dir, snapshot_dir) = (config.dir.join("wal"), config.dir.join("snapshots"));
         create_dir_durably(&wal_dir).map_err(WalError::Io)?;
         create_dir_durably(&snapshot_dir).map_err(WalError::Io)?;
@@ -507,16 +635,17 @@ impl DurableEngine {
             for (namespace, (space, mut recent)) in loaded.spaces {
                 fences.insert(Namespace::stored(namespace.clone()), space);
                 // The retention may have been lowered since the snapshot.
-                recent.trim(retained);
+                recent.trim(retained, recovered);
                 events.insert(Namespace::stored(namespace), recent);
             }
             for (lsn, entry) in loaded.tail {
                 let raised = apply_entry(&engine, &mut fences, &keyring, lsn, entry)?;
-                keep(&mut events, raised, retained);
+                keep(&mut events, raised, retained, recovered);
             }
             carried = loaded.carried;
         }
         let durable_lsn = wal.last_lsn();
+        let epoch = wal.epoch();
         let mut replayed = 0;
         for record in records {
             if record.lsn <= base_lsn {
@@ -536,7 +665,7 @@ impl DurableEngine {
                 continue;
             }
             let raised = apply_entry(&engine, &mut fences, &keyring, record.lsn, record.entry)?;
-            keep(&mut events, raised, retained);
+            keep(&mut events, raised, retained, recovered);
             replayed += 1;
         }
 
@@ -563,6 +692,13 @@ impl DurableEngine {
             published: tokio::sync::watch::Sender::new(0),
             durable: tokio::sync::watch::Sender::new(durable_lsn),
             following,
+            sync: standby.map(|standby| SyncState {
+                standby,
+                epoch,
+                acked: Mutex::new(Acked::default()),
+                advanced: Condvar::new(),
+                acked_lsn: tokio::sync::watch::Sender::new(0),
+            }),
             events_floor,
             quotas,
             config,
@@ -574,8 +710,9 @@ impl DurableEngine {
         };
         // Entities that expired while the engine was down release their
         // quota now, through the log like any other removal. A follower's
-        // removals come from its leader's log.
-        if durable.following.is_none() {
+        // removals come from its leader's log. One that waits for a standby
+        // has none yet; its periodic sweep catches up once it has.
+        if durable.following.is_none() && durable.sync.is_none() {
             durable.sweep_expired(now_ms)?;
         }
         if rebuilt {
@@ -583,6 +720,148 @@ impl DurableEngine {
             durable.snapshot(now_ms)?;
         }
         Ok(durable)
+    }
+
+    /// Count an acknowledgement from the follower `node_id`: it holds this
+    /// log through `lsn`, synced, and follows `epoch`. Only the sync
+    /// standby's counts, only at this leader's epoch, and never past this
+    /// log's last durable LSN; acknowledgements are cumulative, so an older
+    /// one changes nothing but the lease. Returns whether it counted.
+    pub fn acknowledge(&self, node_id: &str, lsn: u64, epoch: u64) -> bool {
+        let Some(sync) = &self.sync else {
+            return false;
+        };
+        if node_id != sync.standby.node_id || epoch != sync.epoch || lsn > *self.durable.borrow() {
+            return false;
+        }
+        let Ok(mut acked) = sync.acked.lock() else {
+            return false;
+        };
+        acked.at = Some(Instant::now());
+        if lsn <= acked.lsn {
+            return true;
+        }
+        acked.lsn = lsn;
+        drop(acked);
+        sync.advanced.notify_all();
+        // Monotonic: two acknowledgements racing past the mutex must not
+        // publish in reverse and leave async waiters behind the horizon.
+        sync.acked_lsn.send_if_modified(|published| {
+            let advanced = lsn > *published;
+            if advanced {
+                *published = lsn;
+            }
+            advanced
+        });
+        // Events up to the new LSN may now be served.
+        self.published
+            .send_modify(|count| *count = count.wrapping_add(1));
+        true
+    }
+
+    /// Where the sync standby stands; `None` without one.
+    pub fn standby(&self) -> Option<Standby> {
+        let sync = self.sync.as_ref()?;
+        let acked = sync.acked.lock().ok()?;
+        Some(Standby {
+            acked_lsn: acked.lsn,
+            lease_held: lease_held(&acked, sync.standby.lease),
+        })
+    }
+
+    /// The last LSN the sync standby acknowledged; every LSN without one.
+    fn acked_horizon(&self) -> Result<u64, DurableError> {
+        match &self.sync {
+            None => Ok(u64::MAX),
+            Some(sync) => Ok(sync.acked.lock().map_err(|_| DurableError::Failed)?.lsn),
+        }
+    }
+
+    /// Refuse reads and writes while the sync standby's lease is lapsed.
+    fn check_lease(&self) -> Result<(), DurableError> {
+        let Some(sync) = &self.sync else {
+            return Ok(());
+        };
+        let acked = sync.acked.lock().map_err(|_| DurableError::Failed)?;
+        match lease_held(&acked, sync.standby.lease) {
+            true => Ok(()),
+            false => Err(DurableError::NoStandby),
+        }
+    }
+
+    /// Run `work`, its writes to this engine not waiting for the sync
+    /// standby: they log and return, and the [`Pending`] result carries the
+    /// LSN to wait for with [`Self::acknowledged`]. For async hosts, which run
+    /// the work on a blocking thread and wait without holding one, so waits
+    /// never crowd out the shipping that produces the acknowledgements.
+    pub fn deferring<T>(&self, work: impl FnOnce(&Self) -> T) -> Pending<T> {
+        /// Restores the enclosing scope, also when `work` panics.
+        struct Restore(Option<(usize, u64)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                DEFERRED.set(self.0);
+            }
+        }
+        let _restore = Restore(DEFERRED.replace(Some((self.id(), 0))));
+        let value = work(self);
+        let lsn = DEFERRED.get().map_or(0, |(_, lsn)| lsn);
+        Pending { value, lsn }
+    }
+
+    /// The value of `pending` once the sync standby acknowledged its writes,
+    /// waiting at most the standby's timeout: past it,
+    /// [`DurableError::Unacknowledged`] (the outcome is unknown). At once
+    /// without a standby.
+    pub async fn acknowledged<T>(&self, pending: Pending<T>) -> Result<T, DurableError> {
+        let Some(sync) = &self.sync else {
+            return Ok(pending.value);
+        };
+        let mut acked = sync.acked_lsn.subscribe();
+        let lsn = pending.lsn;
+        match tokio::time::timeout(sync.standby.timeout, acked.wait_for(|acked| *acked >= lsn))
+            .await
+        {
+            Ok(Ok(_)) => Ok(pending.value),
+            // The sender lives as long as the engine.
+            Ok(Err(_)) => Err(DurableError::Failed),
+            Err(_) => Err(DurableError::Unacknowledged(lsn)),
+        }
+    }
+
+    /// Identifies this engine to [`Self::deferring`].
+    fn id(&self) -> usize {
+        std::ptr::from_ref(self) as usize
+    }
+
+    /// Record `lsn` for the enclosing [`Self::deferring`] of this engine, if
+    /// any; returns whether one took it.
+    fn defer(&self, lsn: u64) -> bool {
+        match DEFERRED.get() {
+            Some((id, deferred)) if id == self.id() => {
+                DEFERRED.set(Some((id, deferred.max(lsn))));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Wait until the sync standby acknowledged `lsn`, for at most its
+    /// timeout, blocking this thread. Called with the writer lock released,
+    /// so every write waiting is released by the one acknowledgement that
+    /// covers it.
+    fn await_standby(&self, lsn: u64) -> Result<(), DurableError> {
+        let Some(sync) = &self.sync else {
+            return Ok(());
+        };
+        let acked = sync.acked.lock().map_err(|_| DurableError::Failed)?;
+        let (acked, _) = sync
+            .advanced
+            .wait_timeout_while(acked, sync.standby.timeout, |acked| acked.lsn < lsn)
+            .map_err(|_| DurableError::Failed)?;
+        match acked.lsn >= lsn {
+            true => Ok(()),
+            false => Err(DurableError::Unacknowledged(lsn)),
+        }
     }
 
     /// Raise the epoch of the data directory `dir` and return it. An engine
@@ -710,8 +989,10 @@ impl DurableEngine {
         Ok(self.engine.entity_count(ns)?)
     }
 
-    /// Refuse a sealed namespace.
+    /// Refuse a sealed namespace, and every read while the sync standby's
+    /// lease is lapsed.
     fn open_namespace(&self, ns: &Namespace) -> Result<(), DurableError> {
+        self.check_lease()?;
         self.keyring
             .check(ns.as_str())
             .map_err(|sealed| DurableError::Sealed(sealed.0))
@@ -799,7 +1080,11 @@ impl DurableEngine {
     /// applied. A logging failure poisons the engine: the index is ahead of
     /// the log, so further writes are refused until a reopen recovers.
     /// `ns`, the namespace written, must be open and have its key before
-    /// anything changes; sealing state only changes under this lock.
+    /// anything changes; sealing state only changes under this lock. With a
+    /// sync standby, the result waits, outside the lock, until the standby
+    /// acknowledged the log through this write: even one that logged
+    /// nothing answers from state the standby must hold. Inside
+    /// [`Self::deferring`] the wait is left to [`Self::acknowledged`].
     fn write<T>(
         &self,
         ns: Option<&Namespace>,
@@ -809,6 +1094,21 @@ impl DurableEngine {
         if self.following.is_some() {
             return Err(DurableError::ReadOnly);
         }
+        self.check_lease()?;
+        let (result, last) = self.write_locked(ns, now_ms, change)?;
+        if !self.defer(last) {
+            self.await_standby(last)?;
+        }
+        Ok(result)
+    }
+
+    /// [`Self::write`] under the writer lock; also returns the last LSN.
+    fn write_locked<T>(
+        &self,
+        ns: Option<&Namespace>,
+        now_ms: i64,
+        change: impl FnOnce(&Engine, &Fences, &mut Vec<Op>) -> T,
+    ) -> Result<(T, u64), DurableError> {
         let mut writer = self.writer.lock().map_err(|_| DurableError::Failed)?;
         // Under the lock: a writer that waited behind a failed append must
         // not log after the damaged frame.
@@ -830,7 +1130,7 @@ impl DurableEngine {
         }
         let result = applied?;
         self.snapshot_if_due(&mut writer, now_ms)?;
-        Ok(result)
+        Ok((result, writer.wal.last_lsn()))
     }
 
     /// Snapshot when enough records were logged, or enough time passed,
@@ -928,6 +1228,10 @@ impl DurableEngine {
 
     fn snapshot_locked(&self, writer: &mut Writer, now_ms: i64) -> Result<u64, DurableError> {
         let lsn = writer.wal.last_lsn();
+        // With a sync standby, the log it has not acknowledged stays, so it
+        // can still be shipped: a snapshot never drops a record the standby
+        // may lack, whatever triggered it.
+        let retain_after = self.acked_horizon()?;
         let mut by_namespace: HashMap<Namespace, Vec<(Namespace, Entity)>> = HashMap::new();
         for (ns, entity) in self.engine.export()? {
             by_namespace
@@ -938,12 +1242,16 @@ impl DurableEngine {
         let mut parts: Vec<Part> = writer.carried.values().cloned().collect();
         let mut namespaces: Vec<Namespace> = by_namespace.keys().cloned().collect();
         // A copy, so readers are not held up by the snapshot's disk work.
-        // Events only change under the writer lock, which this holds.
-        let events = self
-            .events
-            .lock()
-            .map_err(|_| DurableError::Failed)?
-            .clone();
+        // Events only change under the writer lock, which this holds. Those
+        // kept past the retention until acknowledged (see `publish`) are
+        // dropped here once they are.
+        let events = {
+            let mut events = self.events.lock().map_err(|_| DurableError::Failed)?;
+            for recent in events.values_mut() {
+                recent.trim(self.config.events_retained, retain_after);
+            }
+            events.clone()
+        };
         let mut with_state: Vec<Namespace> = writer
             .fences
             .iter()
@@ -1007,7 +1315,7 @@ impl DurableEngine {
         if let Err(error) = writer
             .wal
             .rotate()
-            .and_then(|()| writer.wal.drop_through(lsn))
+            .and_then(|()| writer.wal.drop_through(lsn.min(retain_after)))
         {
             self.failed.store(true, Ordering::Release);
             return Err(error.into());
@@ -1127,7 +1435,10 @@ impl DurableEngine {
         }
         self.metrics.raised(raised.len());
         let mut events = self.events.lock().map_err(|_| DurableError::Failed)?;
-        keep(&mut events, raised, self.config.events_retained);
+        // Events past the acknowledged LSN are not servable yet, so they are
+        // not dropped yet either.
+        let horizon = self.acked_horizon()?;
+        keep(&mut events, raised, self.config.events_retained, horizon);
         drop(events);
         self.published
             .send_modify(|count| *count = count.wrapping_add(1));
@@ -1138,7 +1449,9 @@ impl DurableEngine {
     /// `None`), of the given fences (all when empty), oldest first, at most
     /// `limit`, and the id read through. A reader whose `after` is older
     /// than the newest dropped event, or than history the store kept, gets
-    /// [`DurableError::Expired`]: it has missed events.
+    /// [`DurableError::Expired`]: it has missed events. With a sync standby,
+    /// only events of writes the standby acknowledged are read, and a
+    /// reader past this log's last LSN gets [`DurableError::ResumeAhead`].
     pub fn events(
         &self,
         ns: &Namespace,
@@ -1154,10 +1467,22 @@ impl DurableEngine {
         {
             return Err(DurableError::Expired(Expired { dropped: floor }));
         }
+        let horizon = match &self.sync {
+            None => u64::MAX,
+            Some(_) => {
+                let last = *self.durable.borrow();
+                if let Some((lsn, _)) = after
+                    && lsn > last
+                {
+                    return Err(DurableError::ResumeAhead { after: lsn, last });
+                }
+                self.acked_horizon()?
+            }
+        };
         let events = self.events.lock().map_err(|_| DurableError::Failed)?;
         let mut page = match events.get(ns) {
             Some(recent) => recent
-                .after(after, fences, readable, limit)
+                .after(after, fences, readable, limit, horizon)
                 .map_err(DurableError::Expired)?,
             None => EventPage {
                 events: Vec::new(),
@@ -1166,6 +1491,13 @@ impl DurableEngine {
         };
         // A reader that started from the oldest kept resumes past the floor.
         page.through = page.through.max(floor);
+        // A resume point handed out never passes the acknowledged LSN (the
+        // floor or the newest dropped event may), unless it is the reader's
+        // own: past it lies history the standby may not hold.
+        if self.sync.is_some() {
+            let cap = (horizon, u32::MAX).max(after.unwrap_or((0, 0)));
+            page.through = page.through.min(cap);
+        }
         Ok(page)
     }
 
@@ -1487,6 +1819,31 @@ impl DurableEngine {
         Ok(last)
     }
 
+    /// Take `epoch`, the leader's, as a sync standby hears it in a heartbeat
+    /// once it holds everything shipped, so it acknowledges at the leader's
+    /// epoch even before a record of it arrives. A leader at an older epoch
+    /// than this follower's is refused, and the follower stops (fail closed):
+    /// an old leader never gets an acknowledgement from it.
+    pub fn follow_leader_epoch(&self, epoch: u64) -> Result<(), DurableError> {
+        let Some(following) = &self.following else {
+            return Err(DurableError::ReadOnly);
+        };
+        let mut writer = self.writer.lock().map_err(|_| DurableError::Failed)?;
+        if self.failed.load(Ordering::Acquire) {
+            return Err(DurableError::Failed);
+        }
+        let seen = writer.wal.epoch();
+        let followed = match epoch < seen {
+            true => Err(ReplicaError::EpochBack {
+                seen,
+                shipped: epoch,
+            }
+            .into()),
+            false => writer.wal.follow_epoch(epoch).map_err(DurableError::from),
+        };
+        followed.map_err(|error| self.stop(following, error))
+    }
+
     /// Record whether a stream from the leader is open.
     pub fn set_connected(&self, connected: bool) {
         if let Some(following) = &self.following {
@@ -1514,14 +1871,20 @@ impl DurableEngine {
         Ok(writer.wal.size()?)
     }
 
+    /// Whether the engine failed for good (durability lost or fenced), as
+    /// opposed to waiting for its sync standby.
+    pub fn failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+
     /// Whether the engine can still take writes: no durability failure
-    /// since it opened, and not fenced, which is found here without waiting
-    /// for a write (and stays failed). While a write is in flight, that
-    /// write finds a fence instead; any other failure to check reports
-    /// unhealthy. A follower is healthy while it can serve reads and go on
-    /// applying: not stopped fail closed.
+    /// since it opened, not fenced, which is found here without waiting
+    /// for a write (and stays failed), and with a sync standby, its lease
+    /// held. While a write is in flight, that write finds a fence instead;
+    /// any other failure to check reports unhealthy. A follower is healthy
+    /// while it can serve reads and go on applying: not stopped fail closed.
     pub fn healthy(&self) -> bool {
-        if self.failed.load(Ordering::Acquire) {
+        if self.failed.load(Ordering::Acquire) || self.check_lease().is_err() {
             return false;
         }
         let mut writer = match self.writer.try_lock() {
@@ -1558,8 +1921,14 @@ impl DurableEngine {
             sealed_namespaces: self.keyring.sealed().len() as u64,
             healthy: self.healthy(),
             replication: self.replication(),
+            standby: self.standby(),
         }))
     }
+}
+
+/// Whether the standby acknowledged anything within `lease`.
+fn lease_held(acked: &Acked, lease: Duration) -> bool {
+    acked.at.is_some_and(|at| at.elapsed() < lease)
 }
 
 /// The fingerprint of the record at `lsn`, read with `tail` positioned
@@ -1590,9 +1959,9 @@ type Raised = Vec<(Namespace, FenceEvent)>;
 
 /// Add `raised` to the kept events, dropping the oldest past `retained` per
 /// namespace.
-fn keep(events: &mut HashMap<Namespace, Recent>, raised: Raised, retained: usize) {
+fn keep(events: &mut HashMap<Namespace, Recent>, raised: Raised, retained: usize, horizon: u64) {
     for (ns, event) in raised {
-        events.entry(ns).or_default().push(event, retained);
+        events.entry(ns).or_default().push(event, retained, horizon);
     }
 }
 

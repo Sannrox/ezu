@@ -30,6 +30,8 @@ pub struct Gauges {
     pub healthy: bool,
     /// Set on a follower.
     pub replication: Option<crate::durable::Replication>,
+    /// Set on a leader with a sync standby.
+    pub standby: Option<crate::durable::Standby>,
 }
 
 impl Metrics {
@@ -109,7 +111,7 @@ impl Metrics {
         series(
             "ezu_up",
             "gauge",
-            "1 while the engine accepts writes (a follower: applies its leader's log), 0 after a durability failure.",
+            "1 while the engine accepts writes (a follower: applies its leader's log), 0 after a durability failure or without its sync standby.",
             u8::from(gauges.healthy).to_string(),
         );
         if let Some(replication) = &gauges.replication {
@@ -136,6 +138,20 @@ impl Metrics {
                 "gauge",
                 "1 while a stream from the leader is open.",
                 u8::from(replication.connected).to_string(),
+            );
+        }
+        if let Some(standby) = &gauges.standby {
+            series(
+                "ezu_sync_acked_lsn",
+                "gauge",
+                "The last LSN the sync standby acknowledged.",
+                standby.acked_lsn.to_string(),
+            );
+            series(
+                "ezu_sync_lease_held",
+                "gauge",
+                "1 while the sync standby acknowledged within the lease.",
+                u8::from(standby.lease_held).to_string(),
             );
         }
         let _ = writeln!(
@@ -182,6 +198,7 @@ mod tests {
             sealed_namespaces: 0,
             healthy: true,
             replication: None,
+            standby: None,
         });
         assert!(text.contains("ezu_query_duration_seconds_bucket{le=\"0.001\"} 1"));
         assert!(text.contains("ezu_query_duration_seconds_bucket{le=\"0.05\"} 2"));

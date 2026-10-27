@@ -19,7 +19,10 @@ mod snapshot;
 pub mod tiles;
 mod wal;
 
-pub use durable::{DurabilityConfig, DurableEngine, DurableError, RebuildSource, ReplicaError};
+pub use durable::{
+    DurabilityConfig, DurableEngine, DurableError, Pending, RebuildSource, ReplicaError,
+    SyncStandby,
+};
 pub use entity::{Entity, EntityError, FieldValue, Identity, Namespace};
 pub use geometry::{BoundingBox, Geometry, GeometryError, Position};
 pub use index::{Engine, IndexError, Quotas, Upsert};
