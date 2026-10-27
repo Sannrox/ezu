@@ -25,6 +25,18 @@ service Ezu {
   rpc Subscribe(SubscribeRequest) returns (stream FenceEvent);
 }
 
+// Log shipping from a leader to its followers. It carries every namespace,
+// so it takes the replication token, not a tenant's credential.
+service Replication {
+  // Committed records after a LSN, then live as they become durable, with
+  // a heartbeat at least every second. Fails with OUT_OF_RANGE when the
+  // records after the LSN are no longer held (the follower needs a
+  // rebuild), FAILED_PRECONDITION when the follower is ahead of this log,
+  // DATA_LOSS when the follower's last record is not this log's record
+  // at that LSN (it followed another history).
+  rpc Follow(FollowRequest) returns (stream FollowBatch);
+}
+
 // Longitude and latitude in WGS 84 degrees.
 message Position {
   double lon = 1;
@@ -292,4 +304,30 @@ message ListEventsResponse {
   // request's resume point.
   optional uint64 through_lsn = 2;
   uint32 through_index = 3;
+}
+
+message FollowRequest {
+  // The last LSN the follower applied.
+  uint64 after_lsn = 1;
+  // The follower's record at after_lsn, checked against the leader's
+  // before anything is shipped. Absent before the first record, or when
+  // the follower was seeded from a snapshot copy and holds no record.
+  RecordFingerprint last = 2;
+}
+
+message RecordFingerprint {
+  // CRC32 of the record's payload as logged.
+  uint32 crc32 = 1;
+  // The epoch it was logged at.
+  uint64 epoch = 2;
+}
+
+message FollowBatch {
+  // The epoch the records were logged at; unset in a heartbeat.
+  uint64 epoch = 1;
+  // Record payloads as logged, continuing the previous batch (or
+  // after_lsn) without a gap. Empty in a heartbeat.
+  repeated bytes records = 2;
+  // The leader's last durable LSN when the batch was read.
+  uint64 leader_lsn = 3;
 }

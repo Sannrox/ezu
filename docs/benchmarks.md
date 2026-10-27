@@ -11,6 +11,11 @@ server runs it:
 - memory per entity: the growth of the resident set during the load (Linux
   only);
 - recovery: reopening from a snapshot plus a WAL holding one full move.
+- follower convergence: a follower tailing the leader in process (as over
+  the API, without the network) while the leader loads at most 10^6
+  entities: the leader's load rate, the follower's lag in records after
+  each batch it applies, and the time it takes to catch up after the
+  leader's last write.
 
 ```sh
 cargo build --release --locked --bin ezu-bench
@@ -42,7 +47,13 @@ NVMe SSD, macOS. Memory per entity is not reported on macOS.
 | Nearest query | p50 38 µs, p99 94 µs |
 | Fence evaluation | p50 7 µs, p99 15 µs |
 | Recovery | 5.8 s |
+| Follower lag during the 10^6 load | p50 115,000, p99 224,000 records |
+| Follower catch-up after the load | 0.8 s |
 
 The update rate is below the 500,000 to 1,000,000 updates/s target. Each
 batch pays for one sync, and the WAL and the index are written under one
 lock, so that lock is where the rate goes next.
+
+The follower applies each batch with its own sync, in the same process as
+the leader, so during a load at the full write rate it trails by well
+under a second of writes and catches up within a second after.
