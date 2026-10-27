@@ -1,6 +1,8 @@
 //! Durability (#5): acknowledged writes survive crashes at random points,
 //! the WAL stays bounded under steady load, a lost snapshot is rebuilt from
-//! the source hook, and one process owns a directory.
+//! the source hook, and one process owns a directory. Epochs (#40): a
+//! promotion fences the old owner, even for writes that log nothing, marks
+//! the log as the epoch format first, and logs from before epochs open.
 
 use ezu::{
     DurabilityConfig, DurableEngine, DurableError, Entity, FieldValue, Geometry, Identity,
@@ -448,5 +450,274 @@ fn a_missing_segment_between_survivors_is_refused() {
         .err()
         .expect("a gap in the log must fail recovery");
     assert!(error.to_string().contains("corrupt"), "{error}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+fn header_version(path: &PathBuf) -> u32 {
+    let bytes = fs::read(path).unwrap();
+    u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]])
+}
+
+#[test]
+fn a_promotion_fences_the_old_owner_and_outlives_restarts_and_snapshots() {
+    let dir = scratch("promote");
+    let stale = DurableEngine::open(config(&dir, u64::MAX), quotas(), None, 0).unwrap();
+    for i in 0..5 {
+        stale
+            .upsert(&ns(), entity(i, i as i64 + 1, i as f64), 0)
+            .unwrap();
+    }
+    assert_eq!(stale.epoch().unwrap(), 0);
+    // The old owner still holds the directory; the promotion fences it.
+    assert_eq!(DurableEngine::promote(&dir).unwrap(), 1);
+    // Promotion alone marks every segment, before any reopen, so a release
+    // without epochs refuses the directory from now on.
+    assert!(segments(&dir).iter().all(|path| header_version(path) >= 3));
+    // Even a write that logs nothing (deleting what is not there) is refused.
+    assert!(matches!(
+        stale.delete(&ns(), "c", "missing", 0),
+        Err(DurableError::Fenced {
+            epoch: 0,
+            directory: 1
+        })
+    ));
+    assert!(!stale.healthy());
+    assert!(stale.upsert(&ns(), entity(98, 1, 0.0), 0).is_err());
+    assert!(stale.snapshot(0).is_err());
+    drop(stale);
+
+    let engine = DurableEngine::open(config(&dir, u64::MAX), quotas(), None, 0).unwrap();
+    assert_eq!(engine.epoch().unwrap(), 1);
+    // Nothing of the refused writes reached the log, and the promotion took
+    // no LSN.
+    let held = contents(&engine);
+    assert_eq!(held.len(), 5);
+    assert!(!held.contains_key("e0098"));
+    assert_eq!(engine.last_lsn().unwrap(), 5);
+    engine.upsert(&ns(), entity(5, 6, 5.0), 0).unwrap();
+    assert_eq!(engine.last_lsn().unwrap(), 6);
+    drop(engine);
+
+    // A restart keeps the epoch, and so does dropping every segment that
+    // recorded the promotion.
+    let engine = DurableEngine::open(config(&dir, u64::MAX), quotas(), None, 0).unwrap();
+    assert_eq!(engine.epoch().unwrap(), 1);
+    engine.snapshot(0).unwrap();
+    drop(engine);
+    let engine = DurableEngine::open(config(&dir, u64::MAX), quotas(), None, 0).unwrap();
+    assert_eq!(engine.epoch().unwrap(), 1);
+    assert_eq!(contents(&engine).len(), 6);
+    drop(engine);
+    // The log itself carries the epoch, should the epoch file go missing.
+    fs::remove_file(dir.join("wal").join("EPOCH")).unwrap();
+    let engine = DurableEngine::open(config(&dir, u64::MAX), quotas(), None, 0).unwrap();
+    assert_eq!(engine.epoch().unwrap(), 1);
+    drop(engine);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn segments_of_earlier_format_versions_open() {
+    for version in [1u32, 2] {
+        let dir = scratch("old-format");
+        let engine = DurableEngine::open(config(&dir, u64::MAX), quotas(), None, 0).unwrap();
+        for i in 0..10 {
+            engine
+                .upsert(&ns(), entity(i, i as i64 + 1, i as f64), 0)
+                .unwrap();
+        }
+        drop(engine);
+        // A directory from before epochs: no epoch file, and every segment
+        // in the older format, whose frames are the same without promotions.
+        fs::remove_file(dir.join("wal").join("EPOCH")).unwrap();
+        for path in segments(&dir) {
+            let mut bytes = fs::read(&path).unwrap();
+            bytes[4..8].copy_from_slice(&version.to_le_bytes());
+            fs::write(&path, bytes).unwrap();
+        }
+        let engine = DurableEngine::open(config(&dir, u64::MAX), quotas(), None, 0).unwrap();
+        assert_eq!(contents(&engine).len(), 10, "version {version}");
+        assert_eq!(engine.epoch().unwrap(), 0);
+        engine.upsert(&ns(), entity(10, 11, 10.0), 0).unwrap();
+        drop(engine);
+        let engine = DurableEngine::open(config(&dir, u64::MAX), quotas(), None, 0).unwrap();
+        assert_eq!(contents(&engine).len(), 11, "version {version}");
+        drop(engine);
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn only_a_promoted_log_writes_the_epoch_format() {
+    let version = header_version;
+    let dir = scratch("rollback-format");
+    let engine = DurableEngine::open(config(&dir, u64::MAX), quotas(), None, 0).unwrap();
+    engine.upsert(&ns(), entity(0, 1, 0.0), 0).unwrap();
+    drop(engine);
+    // Never promoted: every segment stays readable by a release without
+    // epochs, so rolling back is safe.
+    assert!(segments(&dir).iter().all(|path| version(path) == 2));
+
+    DurableEngine::promote(&dir).unwrap();
+    let engine = DurableEngine::open(config(&dir, u64::MAX), quotas(), None, 0).unwrap();
+    engine.upsert(&ns(), entity(1, 2, 1.0), 0).unwrap();
+    drop(engine);
+    assert_eq!(version(segments(&dir).last().unwrap()), 3);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_crash_between_marking_and_raising_the_epoch_opens_at_the_old_epoch() {
+    let dir = scratch("marked");
+    let engine = DurableEngine::open(config(&dir, u64::MAX), quotas(), None, 0).unwrap();
+    for i in 0..5 {
+        engine
+            .upsert(&ns(), entity(i, i as i64 + 1, i as f64), 0)
+            .unwrap();
+    }
+    drop(engine);
+    // The state a promotion leaves when it dies after marking the log: every
+    // header at the epoch format, no promotion frame, the epoch not raised.
+    for path in segments(&dir) {
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[4..8].copy_from_slice(&3u32.to_le_bytes());
+        fs::write(&path, bytes).unwrap();
+    }
+    let engine = DurableEngine::open(config(&dir, u64::MAX), quotas(), None, 0).unwrap();
+    assert_eq!(engine.epoch().unwrap(), 0);
+    assert_eq!(contents(&engine).len(), 5);
+    engine.upsert(&ns(), entity(5, 6, 5.0), 0).unwrap();
+    drop(engine);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_promotion_refuses_an_owner_that_ignores_epochs() {
+    let dir = scratch("legacy-owner");
+    let engine = DurableEngine::open(config(&dir, u64::MAX), quotas(), None, 0).unwrap();
+    engine.upsert(&ns(), entity(0, 1, 0.0), 0).unwrap();
+    drop(engine);
+    // An owner of a release without epochs: it holds the directory lock,
+    // but not the shared lock on `wal/OWNER`.
+    let legacy = fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join("LOCK"))
+        .unwrap();
+    legacy.try_lock().unwrap();
+    let state = |dir: &Path| {
+        let mut files: Vec<(PathBuf, Vec<u8>)> = segments(dir)
+            .into_iter()
+            .map(|path| (path.clone(), fs::read(path).unwrap()))
+            .collect();
+        let epoch = dir.join("wal").join("EPOCH");
+        files.push((epoch.clone(), fs::read(epoch).unwrap()));
+        files
+    };
+    let before = state(&dir);
+    assert!(matches!(
+        DurableEngine::promote(&dir),
+        Err(DurableError::LegacyOwner)
+    ));
+    // An opener that loses the directory lock to that owner leaves no
+    // `OWNER` behind that could pass for it.
+    assert!(matches!(
+        DurableEngine::open(config(&dir, u64::MAX), quotas(), None, 0),
+        Err(DurableError::Locked)
+    ));
+    assert!(matches!(
+        DurableEngine::promote(&dir),
+        Err(DurableError::LegacyOwner)
+    ));
+    assert_eq!(state(&dir), before);
+    // With no owner running, the promotion goes ahead.
+    drop(legacy);
+    assert_eq!(DurableEngine::promote(&dir).unwrap(), 1);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_idle_fenced_engine_reports_unhealthy_without_a_write() {
+    let dir = scratch("idle-fenced");
+    let engine = DurableEngine::open(config(&dir, u64::MAX), quotas(), None, 0).unwrap();
+    assert!(engine.healthy());
+    DurableEngine::promote(&dir).unwrap();
+    assert!(!engine.healthy());
+    assert!(engine.upsert(&ns(), entity(0, 1, 0.0), 0).is_err());
+    drop(engine);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_fenced_engine_rotates_no_key() {
+    let dir = scratch("fenced-rotate");
+    let engine = DurableEngine::open(config(&dir, u64::MAX), quotas(), None, 0).unwrap();
+    engine.upsert(&ns(), entity(0, 1, 0.0), 0).unwrap();
+    let keys = |dir: &Path| {
+        let mut found: Vec<PathBuf> = fs::read_dir(dir.join("keys"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        found.sort();
+        found
+            .into_iter()
+            .map(|path| {
+                fs::read(&path)
+                    .map(|bytes| (path, bytes))
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>()
+    };
+    let before = keys(&dir);
+    DurableEngine::promote(&dir).unwrap();
+    assert!(matches!(
+        engine.rotate_key(&ns()),
+        Err(DurableError::Fenced { .. })
+    ));
+    assert_eq!(keys(&dir), before);
+    assert!(!engine.healthy());
+    drop(engine);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_promotion_raises_past_the_epoch_the_log_records() {
+    let dir = scratch("promote-past-log");
+    for expected in 1..=2 {
+        assert_eq!(DurableEngine::promote(&dir).unwrap(), expected);
+        let engine = DurableEngine::open(config(&dir, u64::MAX), quotas(), None, 0).unwrap();
+        engine
+            .upsert(&ns(), entity(expected, expected as i64, 0.0), 0)
+            .unwrap();
+        drop(engine);
+    }
+    // The epoch file is lost; the log still records epoch 2.
+    fs::remove_file(dir.join("wal").join("EPOCH")).unwrap();
+    assert_eq!(DurableEngine::promote(&dir).unwrap(), 3);
+    let engine = DurableEngine::open(config(&dir, u64::MAX), quotas(), None, 0).unwrap();
+    assert_eq!(engine.epoch().unwrap(), 3);
+    drop(engine);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_rebuild_keeps_the_epoch_the_log_records() {
+    let dir = scratch("rebuild-epoch");
+    DurableEngine::promote(&dir).unwrap();
+    let engine = DurableEngine::open(config(&dir, 10), quotas(), None, 0).unwrap();
+    assert_eq!(engine.epoch().unwrap(), 1);
+    for i in 0..25 {
+        engine
+            .upsert(&ns(), entity(i, i as i64 + 1, i as f64), 0)
+            .unwrap();
+    }
+    drop(engine);
+    // Snapshot and epoch file both lost: recovery rebuilds without
+    // replaying the log, but the log still records the promotion.
+    fs::remove_dir_all(dir.join("snapshots")).unwrap();
+    fs::remove_file(dir.join("wal").join("EPOCH")).unwrap();
+    let source = Source((0..25).map(|i| entity(i, i as i64 + 1, i as f64)).collect());
+    let engine = DurableEngine::open(config(&dir, 10), quotas(), Some(&source), 0).unwrap();
+    assert_eq!(engine.epoch().unwrap(), 1);
+    drop(engine);
     let _ = fs::remove_dir_all(&dir);
 }

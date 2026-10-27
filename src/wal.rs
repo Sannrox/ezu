@@ -10,6 +10,23 @@
 //! frame reads as unfinished, so media damage to exactly that frame loses its
 //! batch. Segments a snapshot fully covers are skipped, and segment names
 //! must continue one another, so a lost segment is a refused gap.
+//!
+//! The log has an epoch, held durably in `wal/EPOCH`. [`Wal::promote`] raises
+//! it, and a writer opened at an older epoch is refused (fenced) from then
+//! on: every append and rotation checks the file first, under a shared lock
+//! a promotion takes exclusively. A write holding the lock (from the check
+//! through its append, see [`Wal::hold_fence`]) finishes before the raise,
+//! and none starts after it. A writer past epoch 0 begins each segment
+//! it starts with a promotion frame `[last lsn u64][0xE0][epoch u64]`, so the
+//! log records the raise from the next open on, and keeps the epoch however
+//! much of it a snapshot drops. The frame takes no LSN, so LSNs, and the
+//! event ids made of them, run on unbroken.
+//!
+//! An owner that honors epochs holds a shared lock on `wal/OWNER` for its
+//! life, next to its lock on the directory, so a promotion can tell it from
+//! an owner of a release without epochs, which it cannot fence and refuses
+//! to promote past. Releases without epochs read only `.seg` files in `wal/`
+//! and ignore `EPOCH` and `OWNER`.
 
 use crate::codec::{
     CodecError, Reader, Writer, decode_entity, decode_labels, encode_entity, encode_labels,
@@ -17,14 +34,20 @@ use crate::codec::{
 use crate::entity::{Entity, Namespace};
 use crate::fence::{Fence, decode_fence, encode_fence};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 4] = b"EZUW";
-/// Version 2 adds sealed records; version 1 segments are still read.
-/// Fence records came without a version change: a binary from before them
-/// refuses a log that holds them, and only then.
-const VERSION: u32 = 2;
+/// Version 2 adds sealed records, version 3 promotion frames; older segments
+/// are still read. Only a segment that begins with a promotion frame (epoch
+/// past 0) is written as version 3, so a log that was never promoted stays
+/// readable by a version 2 binary and rollback keeps working. Once promoted,
+/// a binary from before version 3 refuses the log, as it cannot honor the
+/// epoch. Fence records came without a version change: a binary from before
+/// them refuses a log that holds them, and only then.
+const VERSION: u32 = 3;
+/// Header version of a segment without a promotion frame.
+const UNPROMOTED_VERSION: u32 = 2;
 const HEADER: u64 = 8;
 /// Largest record payload; a frame claiming more is damage, not data.
 const MAX_RECORD: u32 = 64 << 20;
@@ -101,6 +124,14 @@ pub enum WalError {
     Corrupt(String),
     /// A record could not be sealed under its namespace's key.
     Seal(String),
+    /// An owner that ignores epochs holds the directory; a promotion could
+    /// not fence it.
+    LegacyOwner,
+    /// The directory was promoted past this writer's epoch; it may not write.
+    Fenced {
+        epoch: u64,
+        directory: u64,
+    },
 }
 
 impl std::fmt::Display for WalError {
@@ -109,6 +140,13 @@ impl std::fmt::Display for WalError {
             Self::Io(error) => write!(f, "wal io: {error}"),
             Self::Corrupt(what) => write!(f, "wal corrupt: {what}"),
             Self::Seal(why) => write!(f, "wal seal: {why}"),
+            Self::Fenced { epoch, directory } => write!(
+                f,
+                "wal fenced: this writer is at epoch {epoch}, the log at {directory}"
+            ),
+            Self::LegacyOwner => {
+                f.write_str("wal promotion refused: the directory's owner does not honor epochs")
+            }
         }
     }
 }
@@ -157,6 +195,7 @@ fn encode(lsn: u64, op: &Op) -> Vec<u8> {
 }
 
 const COMMIT: u8 = 0xC0;
+const PROMOTE: u8 = 0xE0;
 /// The smallest frame: its 12-byte header and a commit payload (LSN, tag).
 const MIN_FRAME: u64 = 12 + 9;
 const SEALED: u8 = 3;
@@ -167,12 +206,22 @@ enum Frame {
     Record(u64, Box<Entry>),
     /// The batch ending at this LSN is complete and acknowledged.
     Commit(u64),
+    /// The log is at this epoch from here on.
+    Promote(u64),
 }
 
 fn commit_payload(lsn: u64) -> Vec<u8> {
     let mut out = Writer::default();
     out.u64(lsn);
     out.u8(COMMIT);
+    out.0
+}
+
+fn promote_payload(last_lsn: u64, epoch: u64) -> Vec<u8> {
+    let mut out = Writer::default();
+    out.u64(last_lsn);
+    out.u8(PROMOTE);
+    out.u64(epoch);
     out.0
 }
 
@@ -190,6 +239,7 @@ pub fn decode_payload(payload: &[u8]) -> Result<(u64, Entry), CodecError> {
     match decode(payload)? {
         Frame::Record(lsn, entry) => Ok((lsn, *entry)),
         Frame::Commit(_) => Err(CodecError("a commit is not a record")),
+        Frame::Promote(_) => Err(CodecError("a promotion is not a record")),
     }
 }
 
@@ -200,6 +250,11 @@ fn decode(payload: &[u8]) -> Result<Frame, CodecError> {
         COMMIT => {
             input.done()?;
             return Ok(Frame::Commit(lsn));
+        }
+        PROMOTE => {
+            let epoch = input.u64()?;
+            input.done()?;
+            return Ok(Frame::Promote(epoch));
         }
         SEALED => {
             let entry = Entry::Sealed {
@@ -285,6 +340,69 @@ fn segments(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
     Ok(found)
 }
 
+/// `wal/EPOCH`: the log's epoch in two slots `[epoch u64][crc32 u32]`, epoch
+/// `e` in slot `e % 2`, so a torn raise leaves the epoch before it readable.
+/// Written in place and never replaced, so every open handle sees a raise.
+/// Its lock orders writes against promotions: shared to write, exclusive to
+/// open or promote.
+struct EpochFile(File);
+
+const EPOCH_SLOT: usize = 12;
+
+impl EpochFile {
+    /// Open, creating, the epoch file of `dir` and take its exclusive lock.
+    /// Dropping the handle on an error releases the lock.
+    fn lock(dir: &Path) -> Result<Self, WalError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join("EPOCH"))?;
+        file.lock()?;
+        let epochs = Self(file);
+        // Until a first slot is whole, no raise has happened: the epoch is 0,
+        // and slot 0 says so before a raise writes slot 1.
+        if epochs.0.metadata()?.len() < EPOCH_SLOT as u64 {
+            epochs.write(0)?;
+            sync_dir(dir)?;
+        }
+        Ok(epochs)
+    }
+
+    /// The newest epoch a whole slot holds.
+    fn read(&self) -> Result<u64, WalError> {
+        let mut bytes = Vec::new();
+        (&self.0).seek(SeekFrom::Start(0))?;
+        (&self.0).read_to_end(&mut bytes)?;
+        let newest = bytes
+            .as_chunks::<EPOCH_SLOT>()
+            .0
+            .iter()
+            .filter_map(|slot| {
+                let (epoch, crc) = slot.split_first_chunk::<8>()?;
+                (crc32fast::hash(epoch).to_le_bytes() == crc).then(|| u64::from_le_bytes(*epoch))
+            })
+            .max();
+        match newest {
+            Some(epoch) => Ok(epoch),
+            // Only the first write, of epoch 0, can have torn this short.
+            None if bytes.len() <= EPOCH_SLOT => Ok(0),
+            None => Err(WalError::Corrupt("EPOCH: no readable slot".into())),
+        }
+    }
+
+    /// Record `epoch` durably, whatever the log's fsync setting.
+    fn write(&self, epoch: u64) -> Result<(), WalError> {
+        let bytes = epoch.to_le_bytes();
+        let slot = [&bytes[..], &crc32fast::hash(&bytes).to_le_bytes()].concat();
+        (&self.0).seek(SeekFrom::Start(epoch % 2 * EPOCH_SLOT as u64))?;
+        (&self.0).write_all(&slot)?;
+        self.0.sync_data()?;
+        Ok(())
+    }
+}
+
 pub struct Wal {
     dir: PathBuf,
     file: File,
@@ -292,19 +410,24 @@ pub struct Wal {
     written: u64,
     fsync: bool,
     next_lsn: u64,
+    /// The epoch this writer was opened at; it writes only while the log's
+    /// is the same.
+    epoch: u64,
+    epochs: EpochFile,
+    /// Whether this writer holds the epoch file's shared lock, checked.
+    fence_held: bool,
 }
 
 impl Wal {
-    /// Read every intact record, cutting a torn tail off the last segment,
-    /// then open a fresh segment for appends after the last LSN (or after
-    /// `floor`, the LSN a snapshot already covers, if that is later).
     /// Read every committed record (see the module docs for what is cut off
     /// or refused), then open a fresh segment for appends after the last LSN
     /// or after `floor`, the LSN a snapshot covers, if that is later. A
     /// superseded log (`read == false`, after an authoritative rebuild) is
     /// not read: appends start past every LSN the existing segments could
     /// hold (bounded by their sizes), so no discarded LSN is reused, and the
-    /// next snapshot's drop removes the old ones.
+    /// next snapshot's drop removes the old ones. The writer takes the log's
+    /// epoch, or the highest a promotion frame records if the epoch file
+    /// lost it.
     pub fn open(
         dir: &Path,
         floor: u64,
@@ -313,88 +436,118 @@ impl Wal {
         read: bool,
     ) -> Result<(Self, Vec<Record>), WalError> {
         fs::create_dir_all(dir)?;
+        // Held while the log is read and the new segment started, so no
+        // other writer appends or rotates in between.
+        let epochs = EpochFile::lock(dir)?;
         let found = segments(dir)?;
-        if !read {
+        let mut records = Vec::new();
+        // The highest epoch a promotion frame read records.
+        let mut logged = 0;
+        let next_lsn = if read {
+            read_log(&found, floor, &mut records, &mut logged)?;
+            records
+                .last()
+                .map_or(0, |record| record.lsn)
+                .max(floor)
+                .saturating_add(1)
+        } else {
             let mut last = floor;
             for (first, path) in &found {
                 // Every frame takes at least MIN_FRAME bytes, so a segment
                 // holds no LSN past this, however damaged it is.
                 let frames = fs::metadata(path)?.len() / MIN_FRAME;
                 last = last.max(first.saturating_add(frames));
+                // Records are not replayed, but the promotion history still
+                // counts: a rebuilt directory keeps its epoch.
+                logged = logged.max(segment_epoch(path)?);
             }
-            let next_lsn = last.saturating_add(1);
-            let (file, written) = new_segment(dir, next_lsn)?;
-            return Ok((
-                Self {
-                    dir: dir.to_path_buf(),
-                    file,
-                    segment_bytes,
-                    written,
-                    fsync,
-                    next_lsn,
-                },
-                Vec::new(),
-            ));
+            last.saturating_add(1)
+        };
+        let mut epoch = epochs.read()?;
+        if logged > epoch {
+            // The epoch file was lost or replaced; the log still knows.
+            epochs.write(logged)?;
+            epoch = logged;
         }
-        let mut records = Vec::new();
-        let last = found.len().saturating_sub(1);
-        // The LSN the next kept segment must start at: right after the
-        // snapshot, then right after the previous segment's records.
-        let mut expected: Option<u64> = None;
-        for (index, (first, path)) in found.iter().enumerate() {
-            // Wholly covered by the snapshot: the next segment starts at or
-            // before the first LSN after `floor`. Such a segment may be a
-            // leftover of an interrupted drop and is not read.
-            if found
-                .get(index + 1)
-                .is_some_and(|(next_first, _)| *next_first <= floor + 1)
-            {
-                continue;
-            }
-            let fits = match expected {
-                Some(expected) => *first == expected,
-                None => *first <= floor + 1,
-            };
-            if !fits {
-                return Err(WalError::Corrupt(format!(
-                    "{}: segment does not continue the log",
-                    path.display()
-                )));
-            }
-            let before = records.len();
-            read_segment(path, index == last, &mut records)?;
-            if let Some(record) = records.get(before)
-                && record.lsn != *first
-            {
-                return Err(WalError::Corrupt(format!(
-                    "{}: first record is not the segment's",
-                    path.display()
-                )));
-            }
-            expected = Some(
-                records
-                    .last()
-                    .map_or(*first, |record| record.lsn + 1)
-                    .max(*first),
-            );
+        let (file, written) = new_segment(dir, next_lsn, epoch)?;
+        let wal = Self {
+            dir: dir.to_path_buf(),
+            file,
+            segment_bytes,
+            written,
+            fsync,
+            next_lsn,
+            epoch,
+            epochs,
+            fence_held: false,
+        };
+        wal.epochs.0.unlock()?;
+        Ok((wal, records))
+    }
+
+    /// Raise the epoch of the log in `dir` by one and return it. Every
+    /// writer opened before is fenced: its next write is refused. A write in
+    /// flight finishes first. The next open records the raise in the log.
+    ///
+    /// `owner_lock` is the directory lock an owner holds. When that owner
+    /// does not hold `OWNER` (see the module docs), it ignores epochs and the
+    /// promotion is refused, before anything changes if it already runs. One
+    /// that starts before the log is marked is caught by a second check
+    /// after marking: the epoch is then not raised, and the marked log stays
+    /// refused by that release from its next open. One that starts after the
+    /// marking refuses to open the log at all. So no such owner writes past
+    /// a raise.
+    pub fn promote(dir: &Path, owner_lock: &Path) -> Result<u64, WalError> {
+        fs::create_dir_all(dir)?;
+        let epochs = EpochFile::lock(dir)?;
+        // From the highest the log records too, as an open would restore it
+        // should the epoch file have lost it.
+        let mut current = epochs.read()?;
+        for (_, path) in segments(dir)? {
+            current = current.max(segment_epoch(&path)?);
         }
-        let next_lsn = records
-            .last()
-            .map_or(0, |record| record.lsn)
-            .max(floor)
-            .saturating_add(1);
-        let (file, written) = new_segment(dir, next_lsn)?;
-        Ok((
-            Self {
-                dir: dir.to_path_buf(),
-                file,
-                segment_bytes,
-                written,
-                fsync,
-                next_lsn,
-            },
-            records,
-        ))
+        let epoch = current
+            .checked_add(1)
+            .ok_or_else(|| WalError::Corrupt("EPOCH: no epoch after the last".into()))?;
+        refuse_legacy_owner(dir, owner_lock)?;
+        // The log is marked as the epoch format before the epoch rises, so a
+        // binary that ignores the epoch refuses it from the raise on; a crash
+        // in between leaves a marked log at the old epoch.
+        mark_promoted(dir)?;
+        refuse_legacy_owner(dir, owner_lock)?;
+        epochs.write(epoch)?;
+        epochs.0.unlock()?;
+        Ok(epoch)
+    }
+
+    /// Mark the log in `dir` as held, for its life, by an owner that honors
+    /// epochs; the lock is released when the returned file is dropped.
+    pub fn hold_owner(dir: &Path) -> Result<File, WalError> {
+        let owner = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join("OWNER"))?;
+        owner.lock_shared()?;
+        Ok(owner)
+    }
+
+    /// Refuse, as an append would, when the log was promoted past this
+    /// writer's epoch; for writes that log nothing.
+    pub fn check_fence(&mut self) -> Result<(), WalError> {
+        self.fenced(|_| Ok(()))
+    }
+
+    /// Run a durable change kept outside the log (a key rotation) under the
+    /// same fence as an append, so a promotion cannot slip in between the
+    /// check and the change.
+    pub fn under_fence<T>(&mut self, change: impl FnOnce() -> T) -> Result<T, WalError> {
+        self.fenced(|_| Ok(change()))
+    }
+
+    /// The epoch this writer holds.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     /// The LSN the last appended record took.
@@ -402,10 +555,72 @@ impl Wal {
         self.next_lsn - 1
     }
 
+    /// Take the epoch file's shared lock once the log's epoch is checked to
+    /// still be this writer's, and keep it until [`Self::release_fence`]: a
+    /// promotion waits for the release, so everything done in between, in
+    /// memory or on disk, comes before the raise. Appends and rotations
+    /// while held do not lock again.
+    pub fn hold_fence(&mut self) -> Result<(), WalError> {
+        if self.fence_held {
+            return Ok(());
+        }
+        self.epochs.0.lock_shared()?;
+        let checked = match self.epochs.read() {
+            Ok(directory) if directory == self.epoch => Ok(()),
+            Ok(directory) if directory > self.epoch => Err(WalError::Fenced {
+                epoch: self.epoch,
+                directory,
+            }),
+            Ok(directory) => Err(WalError::Corrupt(format!(
+                "EPOCH: went back from {} to {directory}",
+                self.epoch
+            ))),
+            Err(error) => Err(error),
+        };
+        match checked {
+            Ok(()) => {
+                self.fence_held = true;
+                Ok(())
+            }
+            Err(error) => {
+                self.epochs.0.unlock()?;
+                Err(error)
+            }
+        }
+    }
+
+    /// Release what [`Self::hold_fence`] took.
+    pub fn release_fence(&mut self) -> Result<(), WalError> {
+        if self.fence_held {
+            self.fence_held = false;
+            self.epochs.0.unlock()?;
+        }
+        Ok(())
+    }
+
+    /// Run `write` under the fence: within a held one as it is, otherwise
+    /// holding it just for `write`.
+    fn fenced<T>(
+        &mut self,
+        write: impl FnOnce(&mut Self) -> Result<T, WalError>,
+    ) -> Result<T, WalError> {
+        if self.fence_held {
+            return write(self);
+        }
+        self.hold_fence()?;
+        let result = write(self);
+        self.release_fence()?;
+        result
+    }
+
     /// Append a batch and sync it once; returns the batch's last LSN.
     pub fn append(&mut self, ops: &[Op], seal: &mut Sealer<'_>) -> Result<u64, WalError> {
+        self.fenced(|wal| wal.append_unfenced(ops, seal))
+    }
+
+    fn append_unfenced(&mut self, ops: &[Op], seal: &mut Sealer<'_>) -> Result<u64, WalError> {
         if self.written >= self.segment_bytes {
-            self.rotate()?;
+            self.rotate_unfenced()?;
         }
         let mut frames = Vec::new();
         let mut lsn = self.next_lsn;
@@ -443,8 +658,12 @@ impl Wal {
 
     /// Start a new segment, so earlier ones can be dropped whole.
     pub fn rotate(&mut self) -> Result<(), WalError> {
+        self.fenced(Self::rotate_unfenced)
+    }
+
+    fn rotate_unfenced(&mut self) -> Result<(), WalError> {
         self.file.sync_data()?;
-        let (file, written) = new_segment(&self.dir, self.next_lsn)?;
+        let (file, written) = new_segment(&self.dir, self.next_lsn, self.epoch)?;
         self.file = file;
         self.written = written;
         Ok(())
@@ -474,21 +693,170 @@ impl Wal {
     }
 }
 
-fn new_segment(dir: &Path, first_lsn: u64) -> Result<(File, u64), WalError> {
+/// Create the segment for records from `first_lsn`, begun with a promotion
+/// frame and a version 3 header when `epoch` is past 0, otherwise a version 2
+/// header; returns it and its length.
+fn new_segment(dir: &Path, first_lsn: u64, epoch: u64) -> Result<(File, u64), WalError> {
     let path = segment_path(dir, first_lsn);
     let mut file = OpenOptions::new()
         .create(true)
         .truncate(true)
         .write(true)
         .open(&path)?;
-    file.write_all(MAGIC)?;
-    file.write_all(&VERSION.to_le_bytes())?;
+    let version = if epoch > 0 {
+        VERSION
+    } else {
+        UNPROMOTED_VERSION
+    };
+    let mut start = [&MAGIC[..], &version.to_le_bytes()].concat();
+    if epoch > 0 {
+        frame(
+            &promote_payload(first_lsn.saturating_sub(1), epoch),
+            &mut start,
+        );
+    }
+    file.write_all(&start)?;
     file.sync_all()?;
     sync_dir(dir)?;
-    Ok((file, HEADER))
+    Ok((file, start.len() as u64))
 }
 
-fn read_segment(path: &Path, last: bool, records: &mut Vec<Record>) -> Result<(), WalError> {
+/// The epoch the promotion frame starting the segment at `path` records, or
+/// 0 without one; only its first frame is read.
+fn segment_epoch(path: &Path) -> Result<u64, WalError> {
+    let mut start = Vec::new();
+    // The header, then a frame header and a promotion payload.
+    File::open(path)?
+        .take(HEADER + 12 + 17)
+        .read_to_end(&mut start)?;
+    Ok(match parse_frame(&start, HEADER as usize) {
+        Some((Frame::Promote(epoch), _)) => epoch,
+        _ => 0,
+    })
+}
+
+/// Refuse when `owner_lock` is held by an owner without a shared lock on
+/// `OWNER`: one of a release that ignores epochs.
+fn refuse_legacy_owner(dir: &Path, owner_lock: &Path) -> Result<(), WalError> {
+    let try_exclusive = |path: &Path| -> Result<bool, WalError> {
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)?;
+        match file.try_lock() {
+            Ok(()) => {
+                file.unlock()?;
+                Ok(true)
+            }
+            Err(fs::TryLockError::WouldBlock) => Ok(false),
+            Err(fs::TryLockError::Error(error)) => Err(error.into()),
+        }
+    };
+    if !try_exclusive(owner_lock)? && try_exclusive(&dir.join("OWNER"))? {
+        return Err(WalError::LegacyOwner);
+    }
+    Ok(())
+}
+
+/// Set every segment's header to [`VERSION`], creating an empty first
+/// segment when there is none, so no binary from before epochs opens the
+/// log. Only header bytes change: a writer appending through its own handle
+/// writes past them, at its own offset.
+fn mark_promoted(dir: &Path) -> Result<(), WalError> {
+    let found = segments(dir)?;
+    if found.is_empty() {
+        // Read as a segment holding nothing, which a snapshot may cover.
+        let mut file = File::create_new(segment_path(dir, 1))?;
+        file.write_all(&[&MAGIC[..], &VERSION.to_le_bytes()].concat())?;
+        file.sync_all()?;
+    }
+    for (_, path) in &found {
+        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+        let mut header = Vec::new();
+        (&mut file).take(HEADER).read_to_end(&mut header)?;
+        let at = match header.len() as u64 {
+            // A header that never reached the disk: no frames follow it.
+            short if short < HEADER => 0,
+            _ if &header[..4] != MAGIC => {
+                return Err(WalError::Corrupt(format!(
+                    "{}: not a segment",
+                    path.display()
+                )));
+            }
+            _ if u32::from_le_bytes([header[4], header[5], header[6], header[7]]) >= VERSION => {
+                continue;
+            }
+            _ => 4,
+        };
+        let full = [&MAGIC[..], &VERSION.to_le_bytes()].concat();
+        file.seek(SeekFrom::Start(at))?;
+        file.write_all(&full[at as usize..])?;
+        file.sync_all()?;
+    }
+    sync_dir(dir)?;
+    Ok(())
+}
+
+/// Read the committed records of the segments `found` (see [`Wal::open`])
+/// into `records`, and the highest epoch their promotion frames record into
+/// `logged`.
+fn read_log(
+    found: &[(u64, PathBuf)],
+    floor: u64,
+    records: &mut Vec<Record>,
+    logged: &mut u64,
+) -> Result<(), WalError> {
+    let last = found.len().saturating_sub(1);
+    // The LSN the next kept segment must start at: right after the
+    // snapshot, then right after the previous segment's records.
+    let mut expected: Option<u64> = None;
+    for (index, (first, path)) in found.iter().enumerate() {
+        // Wholly covered by the snapshot: the next segment starts at or
+        // before the first LSN after `floor`. Such a segment may be a
+        // leftover of an interrupted drop and is not read.
+        if found
+            .get(index + 1)
+            .is_some_and(|(next_first, _)| *next_first <= floor + 1)
+        {
+            continue;
+        }
+        let fits = match expected {
+            Some(expected) => *first == expected,
+            None => *first <= floor + 1,
+        };
+        if !fits {
+            return Err(WalError::Corrupt(format!(
+                "{}: segment does not continue the log",
+                path.display()
+            )));
+        }
+        let before = records.len();
+        read_segment(path, index == last, records, logged)?;
+        if let Some(record) = records.get(before)
+            && record.lsn != *first
+        {
+            return Err(WalError::Corrupt(format!(
+                "{}: first record is not the segment's",
+                path.display()
+            )));
+        }
+        expected = Some(
+            records
+                .last()
+                .map_or(*first, |record| record.lsn + 1)
+                .max(*first),
+        );
+    }
+    Ok(())
+}
+
+fn read_segment(
+    path: &Path,
+    last: bool,
+    records: &mut Vec<Record>,
+    logged: &mut u64,
+) -> Result<(), WalError> {
     let mut bytes = Vec::new();
     File::open(path)?.read_to_end(&mut bytes)?;
     if bytes.len() < HEADER as usize {
@@ -554,6 +922,17 @@ fn read_segment(path: &Path, last: bool, records: &mut Vec<Record>) -> Result<()
                 records.append(&mut pending);
                 committed_end = next;
             }
+            Frame::Promote(epoch) => {
+                // Written between batches, never inside one.
+                if !pending.is_empty() {
+                    return Err(WalError::Corrupt(format!(
+                        "{}: promotion inside a batch",
+                        path.display()
+                    )));
+                }
+                *logged = (*logged).max(epoch);
+                committed_end = next;
+            }
         }
         offset = next;
     }
@@ -596,8 +975,54 @@ fn parse_frame(bytes: &[u8], offset: usize) -> Option<(Frame, usize)> {
     Some((decode(payload).ok()?, end))
 }
 
-/// Whether a sound commit frame starts anywhere after `offset`.
+/// Whether a sound commit or promotion frame starts anywhere after `offset`.
 fn commit_after(bytes: &[u8], offset: usize) -> bool {
-    (offset + 1..bytes.len())
-        .any(|at| matches!(parse_frame(bytes, at), Some((Frame::Commit(_), _))))
+    (offset + 1..bytes.len()).any(|at| {
+        matches!(
+            parse_frame(bytes, at),
+            Some((Frame::Commit(_) | Frame::Promote(_), _))
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn a_promotion_waits_for_a_held_fence_and_then_fences_its_holder() {
+        let dir = std::env::temp_dir().join(format!(
+            "ezu-wal-fence-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let (mut wal, _) = Wal::open(&dir, 0, 1 << 20, false, true).unwrap();
+        wal.hold_fence().unwrap();
+        let (done, promoted) = mpsc::channel();
+        let promoting = dir.clone();
+        let promoter = std::thread::spawn(move || {
+            let lock = promoting.join("LOCK");
+            done.send(Wal::promote(&promoting, &lock).map_err(|e| e.to_string()))
+                .unwrap();
+        });
+        // Whatever the holder does now comes before the raise.
+        assert!(promoted.recv_timeout(Duration::from_millis(200)).is_err());
+        wal.release_fence().unwrap();
+        assert_eq!(
+            promoted.recv_timeout(Duration::from_secs(30)).unwrap(),
+            Ok(1)
+        );
+        promoter.join().unwrap();
+        assert!(matches!(
+            wal.hold_fence(),
+            Err(WalError::Fenced {
+                epoch: 0,
+                directory: 1
+            })
+        ));
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
