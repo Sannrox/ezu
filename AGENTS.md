@@ -18,8 +18,8 @@ before changing system boundaries.
   `cargo deny`, `make static` plus `scripts/offline-check.sh`, and an
   `ezu-bench` smoke.
 
-GitHub Issues are the planning source of truth. Project-specific Skills live
-under `.agents/skills/`. Never commit hostnames, home paths, secrets or
+GitHub Issues are the planning source of truth. The workflow Skills are the
+shared agent-kit Skills (see [Shared agent skills](#shared-agent-skills)). Never commit hostnames, home paths, secrets or
 private environment details.
 
 ## Agent delivery closeout (required)
@@ -96,7 +96,7 @@ confirmation, unless the lead of the same parallel run owns the stalled lane.
 
 A lane claims before it implements, under Publish or Land authority or with an
 explicit claim authorization under Implement, using
-`bash .agents/skills/deliver-ready-issue/scripts/issue-lane.sh claim <issue>`:
+`bash "${AGENT_KIT_HOME:-$HOME/.agents/agent-kit}"/skills/deliver-ready-issue/scripts/issue-lane.sh claim <issue>`:
 
 - the branch `<type>/<issue>` is created on GitHub from the default branch by
   an atomic ref creation, so when two machines race exactly one claim
@@ -145,8 +145,9 @@ the API listener and proto, auth hook, WAL/snapshot/key files, fences and
 events, packages, and governed label filters. Lanes that would both change
 one of these surfaces run in sequence, not in parallel.
 
-A lane publishes its first Verified commit to the claim branch as a draft Pull
-Request that closes the Issue. Public GitHub lane fields may list only: claim
+A lane publishes its first Verified commit to the claim branch with
+`bash "${AGENT_KIT_HOME:-$HOME/.agents/agent-kit}"/skills/deliver-ready-issue/scripts/issue-lane.sh push <issue>`
+and opens a draft Pull Request that closes the Issue. Public GitHub lane fields may list only: claim
 branch, repo-relative worktree (for example `.worktrees/issue-N` — never an
 absolute path), base SHA, and published SHA. Keep absolute paths and
 machine/host names in the private agent session only. Never put hostnames,
@@ -158,7 +159,10 @@ it refreshes onto `main` only for a conflict, a failing gate, an explicit
 request, or a sibling landing on a shared surface, not merely because `main`
 advanced.
 
-Landing is sequential. After each merge, fetch, recompute the frontier, and let
+A lane lands with
+`bash "${AGENT_KIT_HOME:-$HOME/.agents/agent-kit}"/skills/deliver-ready-issue/scripts/issue-lane.sh land <issue> --pr <pr>`,
+which squash-merges only the reviewed head and confirms the merge and the
+closed Issue. Landing is sequential. After each merge, fetch, recompute the frontier, and let
 the remaining lanes recheck `mergeable` against the new `main`. A failed or
 timed-out merge response may still have merged; reconcile the remote state
 before retrying.
@@ -167,7 +171,8 @@ The lead of a parallel run keeps a ledger per lane: Issue, branch, base SHA,
 owner, state, Pull Request, evidence, blockers, and cleanup. Keep hostnames
 and absolute checkout paths in the session with the maintainer, never on
 GitHub. Report verified outcomes, not launched work. The executable lead
-procedure is `.agents/skills/deliver-ready-issue/references/parallel-delivery.md`.
+procedure is `references/parallel-delivery.md` in the shared
+`deliver-ready-issue` Skill.
 
 ## Coding Style & Naming Conventions
 
@@ -201,23 +206,23 @@ belong in the pull request body; [CHANGELOG.md](CHANGELOG.md) is release-owned.
 
 ### Verified commits on GitHub
 
-Prefer publishing PR branch tips with signed commits so GitHub shows
-**Verified**:
+Lane branch tips are published as GitHub **Verified** commits:
 
-1. Implement and commit locally as usual (`commit.gpgsign` may still apply).
-2. Publish the claim branch with `git push -u origin HEAD` (or `git push` if
-   upstream is already set) unless the user asked for a different publish path.
-   This repository has no `scripts/gh-verified-push.sh`.
-3. Never pass `--no-gpg-sign` for local commits; if GPG fails, stop and fix it.
+1. Implement and commit locally as usual; never pass `--no-gpg-sign`. If GPG
+   fails, stop and fix it.
+2. Publish the claim branch with
+   `bash "${AGENT_KIT_HOME:-$HOME/.agents/agent-kit}"/skills/deliver-ready-issue/scripts/issue-lane.sh push <issue>`.
+   It creates Verified commits on the claim branch and resets the worktree to
+   the published commit, so local `HEAD` is the Pull Request head.
+3. Land with
+   `bash "${AGENT_KIT_HOME:-$HOME/.agents/agent-kit}"/skills/deliver-ready-issue/scripts/issue-lane.sh land <issue> --pr <pr>`.
+   It squash-merges the reviewed head, so the land commit on `main` is also
+   Verified and history stays linear.
 
-When merging PRs, prefer **squash** (`gh pr merge --squash --delete-branch`) so
-the land commit on `main` is also GitHub-signed/Verified and history stays
-linear. Use `gh pr merge --merge` only when multi-commit history must be kept
-(original SHAs preserved). Avoid GitHub **rebase** merges when Verified history
-matters: rebase-merge rewrites commits and drops signatures. Do not rewrite
-protected `main` after merging unless the user explicitly approves; if
-protection is temporarily relaxed, restore force-push and status-check settings
-immediately after the correction.
+Avoid GitHub **rebase** merges: they rewrite commits and drop signatures. Do
+not rewrite protected `main` after merging unless the user explicitly
+approves; if protection is temporarily relaxed, restore force-push and
+status-check settings immediately after the correction.
 
 ## Security & Configuration Tips
 
@@ -227,3 +232,77 @@ directories, absolute worktree paths, LAN or employer network names, or other
 private environment inventory on public Issues, Pull Requests, comments, or
 commit messages. Report suspected bypasses privately (GitHub private
 vulnerability reporting or the maintainer), never in a public Issue.
+
+## Shared agent skills
+
+The workflow Skills (`advance-issue-frontier`, `assess-change-impact`,
+`capture-project-decision`, `deliver-ready-issue`, `prepare-release`,
+`refactor-docs`, `shape-work-item`, `technical-documentation`, `verify-change`)
+are canonical in [Sannrox/agent-kit](https://github.com/Sannrox/agent-kit).
+There is no pin: this repository always uses the latest `main`.
+`.agents/skills/<name>/` holds only a generated stub that points to the shared
+skill; read the installed skill under `~/.agents/agent-kit/` (or
+`$AGENT_KIT_HOME`). Run `bash scripts/validate-workflow-skills.sh` to clone or
+update it.
+
+- Repository-specific facts the shared Skills need come from this file: the
+  structure, testing, parallel-lane and security sections, plus
+  `## Agent skill profile` below for anything they do not already say. Edit
+  this file, not the stubs.
+- Never edit the stubs or the vendored `scripts/validate-workflow-skills.sh`
+  here; change them upstream in agent-kit, then run
+  `bash scripts/validate-workflow-skills.sh --render` here when CI reports
+  drift.
+- Repository-only Skills live next to the stubs as full folders and stay local.
+
+## Agent skill profile
+
+Facts the shared agent-kit skills read that the sections above do not already
+state.
+
+Feature: a new observable operator or integration outcome.
+
+- Read `VISION.md` with `README.md` when scoping or shaping work.
+- There is no `docs/decisions/` tree. If a durable boundary, trust model, or
+  public contract needs an ADR, propose adding that tree in the same change.
+  Durable docs are `README.md`, `VISION.md`, and `docs/benchmarks.md`.
+- Affected areas for Issues: api, auth, index, query, fence, durable, keys,
+  flight, tiles.
+
+### Compatibility and failure obligations
+
+Old clients and configuration, the on-disk WAL and snapshot format, the
+`proto/ezu/v1` contract, error semantics, and fail-closed paths (missing auth,
+sealed namespaces, out-of-range event resume).
+
+### Additional impact boundaries
+
+- WAL and snapshots versus the live index;
+- JWT/JWKS-file auth versus a static token;
+- plaintext versus sealed namespaces;
+- label filters versus governed mode;
+- gRPC, HTTP/JSON, and Arrow Flight versus `proto/ezu/v1`;
+- configuration, CLI, metrics, diagnostics, and the static image.
+
+### Verification matrix
+
+Rows beyond `## Testing Guidelines`:
+
+| Surface | Required evidence |
+| --- | --- |
+| Rust source | focused tests, then `make update`, `make validate`, `make test`, `make test-integration` |
+| gRPC / HTTP API | the affected integration test under `tests/` plus the normal suite |
+| configuration | parsing/default tests, README |
+| dependencies or licenses | `cargo deny check`, plus `cargo deny check licenses --all-features` |
+| static binary or image | `make static` and `scripts/offline-check.sh` on the musl binary |
+| index or query performance | `ezu-bench` smoke; `docs/benchmarks.md` when numbers change |
+
+### Release audit
+
+- `Cargo.toml` version and `Cargo.lock` consistency;
+- proto, gRPC/HTTP/Flight, and WAL/snapshot format compatibility;
+- configuration additions, removals, defaults, and README;
+- security, rollback, and operator actions;
+- static image packaging (`Dockerfile`, `make static`);
+- release notes drafted from the pull request bodies since the last tag with
+  `scripts/changelog-draft.sh`; `CHANGELOG.md` changes only in the release.
