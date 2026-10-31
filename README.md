@@ -74,9 +74,11 @@ mutual TLS. The server needs `EZU_DATA_DIR` and listens on `EZU_LISTEN`
   (not values) of the `EZU_*` settings present. It never includes secrets or
   namespace names, and it runs next to a live server.
 - `make static` builds a fully static Linux binary. The `Dockerfile` copies
-  it into an otherwise empty image, so there is no base image to pin. Ezu
-  makes no network calls of its own; CI starts the static binary with no
-  network but loopback and checks it serves.
+  it into an otherwise empty image, so there is no base image to pin. Deploy
+  the image by digest, never by a `latest` tag. Signed `v*` tags and GitHub
+  Releases are described in [RELEASING.md](RELEASING.md). Ezu makes no
+  network calls of its own; CI starts the static binary with no network but
+  loopback and checks it serves.
 - `cargo deny` in CI refuses copyleft licenses in the default build (see
   `deny.toml`).
 - `ezu-bench` measures throughput, query and fence latency, memory and

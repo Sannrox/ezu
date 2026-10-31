@@ -14,9 +14,12 @@ before changing system boundaries.
 - `make validate`, `make test` and `make test-integration` are the local gates.
   They match the build, test, fmt and clippy jobs in `.github/workflows/ci.yml`:
   `cargo build --all-targets --locked`, `cargo test --locked`, `cargo fmt --check`,
-  and `cargo clippy --all-targets --locked -- -D warnings`. CI also runs
-  `cargo deny`, `make static` plus `scripts/offline-check.sh`, and an
-  `ezu-bench` smoke.
+  `cargo clippy --all-targets --locked -- -D warnings`, and
+  `bash scripts/validate-release.sh`. CI also runs `cargo deny`,
+  `make static` plus `scripts/offline-check.sh`, and an `ezu-bench` smoke.
+- `scripts/validate-release.sh` checks the tag-triggered release path: signed
+  annotated tags, CHANGELOG notes, SBOM, and the family release manifest.
+  Pull requests and dry runs must not publish or attest.
 
 GitHub Issues are the planning source of truth. The workflow Skills are the
 shared agent-kit Skills (see [Shared agent skills](#shared-agent-skills)). Never commit hostnames, home paths, secrets or
@@ -265,7 +268,8 @@ Feature: a new observable operator or integration outcome.
 - Read `VISION.md` with `README.md` when scoping or shaping work.
 - There is no `docs/decisions/` tree. If a durable boundary, trust model, or
   public contract needs an ADR, propose adding that tree in the same change.
-  Durable docs are `README.md`, `VISION.md`, and `docs/benchmarks.md`.
+  Durable docs are `README.md`, `VISION.md`, `RELEASING.md`, and
+  `docs/benchmarks.md`.
 - Affected areas for Issues: api, auth, index, query, fence, durable, keys,
   flight, tiles.
 
@@ -303,6 +307,6 @@ Rows beyond `## Testing Guidelines`:
 - proto, gRPC/HTTP/Flight, and WAL/snapshot format compatibility;
 - configuration additions, removals, defaults, and README;
 - security, rollback, and operator actions;
-- static image packaging (`Dockerfile`, `make static`);
+- static image packaging (`Dockerfile`, `make static`; deploy by digest, never a `latest` tag);
 - release notes drafted from the pull request bodies since the last tag with
   `scripts/changelog-draft.sh`; `CHANGELOG.md` changes only in the release.
