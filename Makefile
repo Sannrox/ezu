@@ -10,6 +10,7 @@ update:
 validate:
 	cargo fmt --check
 	cargo clippy --all-targets --locked -- -D warnings
+	bash scripts/validate-release.sh
 # A fully static Linux binary (musl), the only content of the image.
 static:
 	cargo build --release --locked --target x86_64-unknown-linux-musl
