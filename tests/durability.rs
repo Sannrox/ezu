@@ -556,6 +556,28 @@ fn segments_of_earlier_format_versions_open() {
 }
 
 #[test]
+fn a_segment_of_a_newer_format_version_fails_closed() {
+    let dir = scratch("new-format");
+    let engine = DurableEngine::open(config(&dir, u64::MAX), quotas(), None, 0).unwrap();
+    engine.upsert(&ns(), entity(0, 1, 0.0), 0).unwrap();
+    drop(engine);
+    // A later release's segment: this binary must refuse it rather than
+    // read frames it does not understand. The writer's own version is
+    // private here, so use one no release reaches.
+    let newer: u32 = 1_000;
+    for path in segments(&dir) {
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[4..8].copy_from_slice(&newer.to_le_bytes());
+        fs::write(&path, bytes).unwrap();
+    }
+    let error = DurableEngine::open(config(&dir, u64::MAX), quotas(), None, 0)
+        .err()
+        .expect("a newer segment format must not open");
+    assert!(error.to_string().contains("format version"), "{error}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn only_a_promoted_log_writes_the_epoch_format() {
     let version = header_version;
     let dir = scratch("rollback-format");
