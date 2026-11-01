@@ -1,0 +1,7 @@
+# buf configuration for ezu's proto surface. CI runs `buf breaking` against
+# the last final v* tag (see the Proto breaking job). FILE is the strictest
+# category: renames and moves break the generated Rust code, not only the wire.
+version: v2
+breaking:
+  use:
+    - FILE
