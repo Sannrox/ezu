@@ -6,6 +6,20 @@ Family versioning, tagging, and release policy:
 This page is ezu-local: how a maintainer prepares and tags **this**
 repository.
 
+## Compatibility of configuration, CLI and JSON output
+
+- **Configuration.** ezu reads no config file; it is configured by `EZU_*`
+  environment variables. A variable is renamed or removed only after one
+  minor release that still honours it and logs a deprecation warning naming
+  its replacement. A setting's meaning never changes under the same name.
+  Should ezu gain a config file, it carries a `version` and refuses unknown
+  versions.
+- **CLI.** The `diagnostics` subcommand, and any added later, follow the
+  same rule: one minor of deprecation warning before removal.
+- **JSON output.** The `diagnostics` bundle is an API: fields are only added
+  in a minor; removing or renaming one is a breaking change listed under
+  Breaking in `CHANGELOG.md`.
+
 ## Who cuts a tag
 
 Agents never push `v*` tags. After the version-bump pull request merges, the
