@@ -546,3 +546,66 @@ pub fn plain_entities(file: &DataFile) -> Result<Vec<(Namespace, Entity)>, Snaps
 pub fn current_entities(bytes: Vec<u8>) -> Result<Vec<(Namespace, Entity)>, SnapshotError> {
     decode_arrow(bytes, &[VERSION, LABELED]).map(|(_, entities)| entities)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entity::Identity;
+    use crate::geometry::{Geometry, Position};
+    use std::collections::BTreeMap;
+
+    fn entity(id: &str, labels: &[&str]) -> (Namespace, Entity) {
+        let namespace = Namespace::of(&Identity::authenticated("svc", "t"));
+        let entity = Entity {
+            collection: "c".into(),
+            id: id.into(),
+            geometry: Geometry::Point(Position::new(1.0, 2.0)),
+            ts_ms: 1,
+            speed: None,
+            heading: None,
+            ttl_ms: None,
+            fields: BTreeMap::new(),
+            labels: labels.iter().map(|label| label.to_string()).collect(),
+        };
+        (namespace, entity)
+    }
+
+    /// Arrow bytes stamped with `version`, for formats this binary does not
+    /// write.
+    fn stamped(version: &str) -> Vec<u8> {
+        let schema = Arc::new(
+            Schema::new(schema(7, false).fields().clone()).with_metadata(HashMap::from([
+                ("ezu.snapshot.version".to_string(), version.to_string()),
+                ("ezu.snapshot.lsn".to_string(), "7".to_string()),
+            ])),
+        );
+        let mut writer = FileWriter::try_new(Vec::new(), &schema).unwrap();
+        writer.finish().unwrap();
+        writer.into_inner().unwrap()
+    }
+
+    #[test]
+    fn both_current_formats_open() {
+        // "2" is the format before labels; "3" adds the labels column.
+        for (labels, expected) in [(&[][..], VERSION), (&["pii"][..], LABELED)] {
+            let entities = vec![entity("e1", labels)];
+            let bytes = encode_arrow(7, &entities).unwrap();
+            let (lsn, decoded) = decode_arrow(bytes, &[VERSION, LABELED]).unwrap();
+            assert_eq!(lsn, 7, "format {expected}");
+            assert_eq!(decoded, entities, "format {expected}");
+        }
+    }
+
+    #[test]
+    fn unknown_snapshot_versions_fail_closed() {
+        for version in ["4", "1", "", "two"] {
+            let error = current_entities(stamped(version)).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("unknown snapshot format version"),
+                "{version:?}: {error}"
+            );
+        }
+    }
+}
