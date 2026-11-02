@@ -32,6 +32,33 @@ fn token(tenant: &str) -> String {
     encode(&header, &claims, &EncodingKey::from_secret(SECRET)).unwrap()
 }
 
+#[test]
+fn a_configured_issuer_requires_a_matching_claim() {
+    let configured = Jwt::new(&jwks(), "ezu", Some("trusted".into()), "tenant").unwrap();
+    let optional = Jwt::new(&jwks(), "ezu", None, "tenant").unwrap();
+    assert!(optional.authenticate(Some(&token("tenant-a"))).is_ok());
+    for (issuer, accepted) in [
+        (None, false),
+        (Some("other"), false),
+        (Some("trusted"), true),
+    ] {
+        let mut claims = serde_json::json!({
+            "aud": "ezu", "tenant": "tenant-a", "exp": 4_102_444_800u64,
+        });
+        if let Some(issuer) = issuer {
+            claims["iss"] = issuer.into();
+        }
+        let mut header = Header::new(jsonwebtoken::Algorithm::HS256);
+        header.kid = Some("k1".into());
+        let bearer = encode(&header, &claims, &EncodingKey::from_secret(SECRET)).unwrap();
+        assert_eq!(
+            configured.authenticate(Some(&bearer)).is_ok(),
+            accepted,
+            "issuer {issuer:?}"
+        );
+    }
+}
+
 async fn server() -> (String, tokio::sync::oneshot::Sender<()>) {
     server_with(None).await
 }

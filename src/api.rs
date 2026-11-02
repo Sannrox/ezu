@@ -1562,13 +1562,23 @@ pub async fn serve(
     };
     let acceptor = tokio_rustls::TlsAcceptor::from(config);
     let (sender, receiver) = tokio::sync::mpsc::channel(64);
+    let handshakes = Arc::new(tokio::sync::Semaphore::new(64));
     let accepting = tokio::spawn(async move {
         loop {
-            let Ok((tcp, _)) = listener.accept().await else {
-                continue;
+            let Ok(permit) = handshakes.clone().acquire_owned().await else {
+                return;
+            };
+            let tcp = match listener.accept().await {
+                Ok((tcp, _)) => tcp,
+                Err(_) => {
+                    // Persistent resource exhaustion must not spin the accept loop.
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
             };
             let (acceptor, sender) = (acceptor.clone(), sender.clone());
             tokio::spawn(async move {
+                let _permit = permit;
                 let handshake = acceptor.accept(tcp);
                 if let Ok(Ok(stream)) =
                     tokio::time::timeout(std::time::Duration::from_secs(10), handshake).await

@@ -124,10 +124,13 @@ impl Authenticator for Jwt {
         }
         let mut validation = Validation::new(algorithm);
         validation.set_audience(&[&self.audience]);
-        if let Some(issuer) = &self.issuer {
-            validation.set_issuer(&[issuer]);
+        match &self.issuer {
+            Some(issuer) => {
+                validation.set_issuer(&[issuer]);
+                validation.set_required_spec_claims(&["exp", "aud", "iss"]);
+            }
+            None => validation.set_required_spec_claims(&["exp", "aud"]),
         }
-        validation.set_required_spec_claims(&["exp", "aud"]);
         // A token is not good before its `nbf`, when it carries one.
         validation.validate_nbf = true;
         let claims = decode::<serde_json::Value>(token, &key, &validation)
