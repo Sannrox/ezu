@@ -767,7 +767,7 @@ dependencies = [
 
 [[package]]
 name = "ezu"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "arrow-array",
