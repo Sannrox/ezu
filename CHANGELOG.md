@@ -10,8 +10,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-02
+
+First tagged release, prepared for signature and immutable release verification.
+The release includes a binary, an image archive, an SBOM and provenance.
+Verify the published release with `git verify-tag v0.1.0` and
+`gh release verify v0.1.0` before using it.
+
+### Fixed
+
+- Release SBOMs carry a valid document identity and license expressions.
+
+### Added
+
+- Spatial indexing, geofences, recent tracks and bulk data interfaces.
+- Durable write logging, encrypted snapshots and fenced replica promotion.
+- Versioned diagnostics and documented configuration compatibility.
+
 ## [0.0.0]
 
-Development crate version. No git tag yet. The crate is not on crates.io
+Initial development crate version before the first tag. The crate is not on crates.io
 (`publish = false`). `Dockerfile` builds the release image from the static
 binary; deploy by digest, never by a `latest` tag.
