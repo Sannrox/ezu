@@ -17,9 +17,11 @@ before changing system boundaries.
   `cargo clippy --all-targets --locked -- -D warnings`, and
   `bash scripts/validate-release.sh`. CI also runs `cargo deny`,
   `make static` plus `scripts/offline-check.sh`, and an `ezu-bench` smoke.
-- `scripts/validate-release.sh` checks the tag-triggered release path: signed
-  annotated tags, CHANGELOG notes, SBOM, and the family release manifest.
-  Pull requests and dry runs must not publish or attest.
+- `scripts/validate-release.sh` checks the release path: a `v*` tag push only
+  dispatches `release.yml` on `main`, which verifies the signed annotated tag
+  and builds the tagged commit; CHANGELOG notes, SBOM, pre-releases, and the
+  family release manifest. Pull requests and dry runs must not publish or
+  attest. See `RELEASING.md`.
 
 GitHub Issues are the planning source of truth. The workflow Skills are the
 shared agent-kit Skills (see [Shared agent skills](#shared-agent-skills)). Never commit hostnames, home paths, secrets or
@@ -313,5 +315,5 @@ Rows beyond `## Testing Guidelines`:
 - configuration additions, removals, defaults, and README;
 - security, rollback, and operator actions;
 - static image packaging (`Dockerfile`, `make static`; deploy by digest, never a `latest` tag);
-- release notes drafted from the pull request bodies since the last tag with
+- release notes drafted from the pull request bodies since the last final tag with
   `scripts/changelog-draft.sh`; `CHANGELOG.md` changes only in the release.
