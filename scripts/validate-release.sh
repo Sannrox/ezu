@@ -97,6 +97,16 @@ if grep -E '(:latest|tag: latest|tags: latest)' "$workflow" >/dev/null; then
   fail "${workflow} must not produce a latest image tag"
 fi
 
+# Gate flags come only from pull requests merged into the release commit since
+# the nearest final tag before it, so an rc never starts the range and a retry
+# never counts pull requests merged after the tagged commit.
+grep -F -- "--exclude '*-*' \"\${GIT_SHA}^\"" scripts/release-package.sh >/dev/null \
+  || fail "scripts/release-package.sh must start gate flags at the nearest final tag before the release commit"
+grep -F 'in_range[$1] { print $2 }' scripts/release-package.sh >/dev/null \
+  || fail "scripts/release-package.sh must keep only gate flags of pull requests in the release range"
+grep -F -- "--exclude '*-*' origin/main" scripts/changelog-draft.sh >/dev/null \
+  || fail "scripts/changelog-draft.sh must start at the last final tag, not a release candidate"
+
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/ezu-release-package.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "${tmp}/dist"
