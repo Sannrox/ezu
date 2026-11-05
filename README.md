@@ -1,17 +1,116 @@
-# Ezu
+# Ezu (絵図)
 
-Ezu is a live spatial engine written in Rust.
+**A live spatial engine in Rust: one binary that indexes moving entities, answers spatial queries, and raises geofence events.**
 
-- Indexes moving entities.
-- Answers radius, bbox, polygon and k-nearest queries.
-- Emits geofence enter, exit and dwell events on a resumable stream.
-- Keeps recent tracks.
+[![CI](https://img.shields.io/github/actions/workflow/status/Sannrox/ezu/ci.yml?branch=main&label=ci)](https://github.com/Sannrox/ezu/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Sannrox/ezu)](https://github.com/Sannrox/ezu/releases)
+[![License](https://img.shields.io/github/license/Sannrox/ezu)](LICENSE)
 
-Ezu doesn't make governance decisions: a caller in front of it enforces policy. It persists through a WAL plus snapshots, exchanges bulk data as GeoArrow over Arrow Flight, and runs as a single binary with no runtime network calls.
+[Try it](#try-it) · [How it works](#how-it-works) · [Benchmarks](docs/benchmarks.md) · [Vision](VISION.md) · [Changelog](CHANGELOG.md)
 
-Status: early. See [VISION.md](VISION.md) for the roadmap and GitHub Issues for planned work.
+> Status: early. See [VISION.md](VISION.md) for the roadmap and GitHub Issues
+> for planned work.
 
-License: Apache-2.0.
+Ezu (絵図, map) keeps a live picture of things that move. Clients upsert
+entities — points, lines, polygons with a timestamp and fields — and Ezu
+indexes the current state per namespace, answers radius, bbox, polygon and
+k-nearest queries over it, and tests every write against geofences, raising
+enter, exit and dwell events on a stream a reader can resume without gaps.
+Batch analytics and long history belong to other systems; Ezu exports
+GeoArrow and GeoParquet for them.
+
+- **Live index.** Upserts land in an in-memory R-tree per namespace; an
+  update older than the stored entity changes nothing, and expired entities
+  leave on their TTL.
+- **Spatial queries.** Radius, bbox, polygon contains/intersects and
+  k-nearest, with field filters, label filters and cursor paging.
+- **Geofencing.** Circle and polygon fences with selectors raise enter, exit,
+  dwell and rate-capped inside events; delivery is at least once and the
+  event id is the idempotency key, so a reader resumes across disconnects
+  and restarts.
+- **Durable.** Every write is logged to a WAL and snapshotted; recovery
+  replays to the same state and raises the same events with the same ids.
+- **Replicated.** Follower read replicas, an optional sync standby behind a
+  fenced lease, and manual in-place promotion with epoch and lineage checks.
+- **Built for closed networks.** A single binary with no runtime network
+  calls of its own; bulk data moves as GeoArrow over Arrow Flight, and
+  offline map packages render a region as vector tiles in a PMTiles archive.
+
+Ezu makes no governance decisions: a caller in front of it enforces policy,
+and the namespace always comes from the authenticated identity. Recent track
+windows and roaming fences are next on the [roadmap](VISION.md).
+
+## Try it
+
+Build and start a server with a static development token (the release build
+takes a few minutes):
+
+```sh
+git clone https://github.com/Sannrox/ezu && cd ezu
+cargo build --release --locked --bin ezu
+printf dev-token > token
+EZU_DATA_DIR=data EZU_STATIC_TOKEN_FILE=token EZU_STATIC_NAMESPACE=dev \
+  ./target/release/ezu &
+```
+
+```text
+ezu 0.1.0 listening on 127.0.0.1:7600
+```
+
+Put a fence around a harbour, report a ship inside it, and query within
+2 km:
+
+```sh
+auth='authorization: Bearer dev-token'
+json='content-type: application/json'
+curl -s -H "$auth" -H "$json" -X PUT localhost:7600/v1/fences/harbour -d \
+  '{"shape":{"circle":{"center":{"lon":9.97,"lat":53.54},"meters":500}},"collections":["ships"]}'
+curl -s -H "$auth" -H "$json" -X POST localhost:7600/v1/entities -d \
+  '{"entities":[{"collection":"ships","id":"elbe-1","geometry":{"shape":{"point":{"lon":9.97,"lat":53.54}}},"ts_ms":1}]}'
+curl -s -H "$auth" -H "$json" -X POST localhost:7600/v1/query -d \
+  '{"collection":"ships","query":{"radius":{"center":{"lon":9.975,"lat":53.542},"meters":2000}},"limit":10}'
+```
+
+```text
+{"entities":[{"collection":"ships","id":"elbe-1","geometry":{"shape":{"point":{"lon":9.97,"lat":53.54}}},"ts_ms":1,"speed":null,"heading":null,"ttl_ms":null,"fields":{},"labels":[]}],"next_cursor":""}
+```
+
+The write raised an enter event, resumable from its id:
+
+```sh
+curl -s -H "$auth" 'localhost:7600/v1/events?limit=10'
+```
+
+```text
+{"events":[{"lsn":2,"index":0,"fence":"harbour","collection":"ships","entity":"elbe-1","kind":1,"ts_ms":1,"position":{"lon":9.97,"lat":53.54},"entity_labels":[],"fence_labels":[]}],"through_lsn":2,"through_index":0}
+```
+
+The same listener serves gRPC (`proto/ezu/v1/ezu.proto`) and Arrow Flight;
+kill the server and start it again and the state, the events and their ids
+are still there.
+
+## How it works
+
+```mermaid
+flowchart LR
+  C[upsert / delete] --> W[WAL]
+  W --> I[live R-tree index]
+  W --> G[fence evaluation]
+  I --> Q[radius, bbox, polygon, k-nearest]
+  G --> E[event stream, resumable by id]
+  W --> S[snapshots]
+  W -. log shipping .-> F[followers]
+```
+
+An **entity** lives in a **collection** inside a **namespace**; an upsert
+older than the stored entity is reported stale and changes nothing, so
+retries are safe. Every write is logged to the WAL before it is
+acknowledged, updates the live index, and is tested against the **fences**
+whose bounds it touches. A fence event's id is the LSN of the write that
+raised it plus its index within that write, so ids only grow and replay
+after a crash raises the same events with the same ids. Snapshots bound
+recovery and let the WAL be dropped; followers are shipped the committed
+log and apply it byte for byte at the leader's LSNs.
 
 ## API
 
@@ -397,3 +496,22 @@ snapshots. It opens again on the next restart that can unwrap its key.
 `rotate_key` starts a new key at once; the next snapshot after a write
 re-seals older data under it and retires the old key. Granting a key to a
 namespace with plaintext data seals that data the same way.
+
+## Development
+
+```sh
+make validate            # cargo fmt --check, clippy -D warnings, release-path checks
+make test                # cargo test --locked
+make test-integration    # cargo test --locked --tests
+```
+
+`make static` builds the fully static Linux binary that the `Dockerfile`
+packages; deploy the image by digest, never by a `latest` tag. `ezu-bench`
+and the committed results are in [docs/benchmarks.md](docs/benchmarks.md).
+Contributor and agent policy is [AGENTS.md](AGENTS.md); tagging and release
+policy is [RELEASING.md](RELEASING.md), with user-visible changes recorded
+in [CHANGELOG.md](CHANGELOG.md).
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).
