@@ -11,7 +11,7 @@ jobs:
     name: Benchmark 10^6 against the last nightly
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - run: cargo build --release --locked --bin ezu-bench
       # The baseline is the result of the last successful nightly on main;
@@ -31,7 +31,7 @@ jobs:
           if [ -f baseline/bench.json ]; then args=(--baseline baseline/bench.json); fi
           ./target/release/ezu-bench --entities 1000000 "${args[@]}" > bench.json
           cat bench.json
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: bench
           path: bench.json
