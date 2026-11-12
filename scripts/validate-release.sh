@@ -13,6 +13,8 @@ fail() {
 python3 scripts/changelog-notes.py --self-test
 python3 scripts/release-manifest.py --self-test
 python3 scripts/release-sbom.py --self-test
+python3 scripts/tenkai-profile.py --self-test
+python3 scripts/tenkai-profile.py --check
 bash scripts/verify-release-tag.sh self-test
 
 workflow=".github/workflows/release.yml"
@@ -53,6 +55,13 @@ if grep -E 'github\.sha|github\.ref_name|GITHUB_SHA|GITHUB_REF|github\.event_nam
 fi
 grep -F "changelog-notes.py" "$workflow" >/dev/null || fail "${workflow} must take GitHub Release notes from CHANGELOG"
 grep -F "if: needs.verify-tag.outputs.tag != ''" "$workflow" >/dev/null || fail "${workflow} must gate publish/attest on a verified tag"
+grep -F "scripts/tenkai-profile.py" "$workflow" >/dev/null || fail "${workflow} must watch the Tenkai profile generator"
+grep -F "deploy/tenkai.toml" "$workflow" >/dev/null || fail "${workflow} must watch the Tenkai product"
+grep -F "ghcr.io/sannrox/ezu:" "$workflow" >/dev/null || fail "${workflow} must push ghcr.io/sannrox/ezu:<version>"
+for job in push-image attest publish; do
+  sed -n "/^  ${job}:/,/^  [a-z-]*:\$/p" "$workflow" | grep -F "if: needs.verify-tag.outputs.tag != ''" >/dev/null ||
+    fail "${workflow} job ${job} must run only for a verified tag"
+done
 grep -F -- "--verify-tag" "$workflow" >/dev/null || fail "${workflow} must create the release for the existing tag"
 grep -F '[[ "$TAG" == *-* ]]' "$workflow" >/dev/null || fail "${workflow} must treat a tag with - as a pre-release"
 grep -F -- "kind=(--prerelease --latest=false)" "$workflow" >/dev/null || fail "${workflow} must draft a pre-release as never latest"
@@ -85,7 +94,7 @@ fi
   || fail "${workflow} every published-release guard must accept only a draft or release not found"
 grep -F 'gh release delete-asset "$TAG" "$name" --yes' "$workflow" >/dev/null \
   || fail "${workflow} must drop an earlier run's assets when it resumes a draft"
-grep -F "needs: [verify-tag, package, attest]" "$workflow" >/dev/null \
+grep -F "needs: [verify-tag, package, attest, push-image]" "$workflow" >/dev/null \
   || fail "${workflow} must publish only after every asset job, so a re-run can resume the draft"
 grep -F "id-token: write" "$workflow" >/dev/null || fail "${workflow} must request id-token for provenance"
 grep -F "attestations: write" "$workflow" >/dev/null || fail "${workflow} must request attestations permission"

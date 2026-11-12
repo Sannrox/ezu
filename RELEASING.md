@@ -32,8 +32,8 @@ the tagged commit. The workflow refuses unsigned or lightweight tags.
 1. Choose the target version. Do not invent one in a feature pull request.
 2. Draft notes with `scripts/changelog-draft.sh`. Pull requests never edit
    `CHANGELOG.md`; the release step writes the section from merged work.
-3. Land the version-bump pull request. The crate version and CHANGELOG
-   heading move together.
+3. Land the version-bump pull request. The crate version,
+   `deploy/tenkai.toml` product version, and CHANGELOG heading move together.
 
 ## Tag
 
@@ -78,13 +78,18 @@ runs **main's** `release.yml`, never the copy at the tagged commit.
 - runs the release scripts, tests, packaging, the static image and the
   manifest `git_sha` from that commit, and creates the release with
   `gh release create <tag> --verify-tag`;
-- writes an SBOM, attests provenance, drafts the GitHub Release from the
-  matching CHANGELOG section with a signed family release manifest
-  (component, version, git SHA, binary and image digests, attestation URLs,
-  gate flags), and publishes it last.
+- writes an SBOM, attests provenance, pushes the image to
+  `ghcr.io/sannrox/ezu:<version>` (version tag only), drafts the GitHub
+  Release from the matching CHANGELOG section with a signed family release
+  manifest (component, version, git SHA, binary and image digests,
+  attestation URLs, gate flags), and publishes it last.
 
 The release image is tagged with the version only. There is no `latest` tag.
-Deploy the image by digest.
+Deploy the image by digest. `deploy/tenkai.toml` is the Tenkai product for
+that image. Its compatibility profile provides `ezu.query` and `ezu.events`
+at the versions derived from the proto surfaces this tree ships.
+`bash scripts/validate-release.sh` refuses a product whose profile does not
+match.
 
 To retry a failed release, fix the workflow on `main` and run it again for the
 same tag:
