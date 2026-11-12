@@ -8,7 +8,8 @@ publish = false
 
 [dependencies]
 axum = "0.8"
-jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
+jsonwebtoken = { version = "11", default-features = false }
+ring = "0.17"
 prost = "0.14"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
