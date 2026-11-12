@@ -7,6 +7,8 @@
 //! at startup (no network calls at runtime) with an audience and a tenant
 //! claim mapped to the namespace.
 
+mod jwt_crypto;
+
 use crate::entity::Identity;
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{DecodingKey, Validation, decode, decode_header};
@@ -92,6 +94,7 @@ impl Jwt {
         if keys.keys.is_empty() {
             return Err("the JWKS holds no keys".into());
         }
+        jwt_crypto::install();
         Ok(Self {
             keys,
             audience: audience.into(),
