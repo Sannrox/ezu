@@ -175,7 +175,10 @@ mutual TLS. The server needs `EZU_DATA_DIR` and listens on `EZU_LISTEN`
 - `make static` builds a fully static Linux binary. The `Dockerfile` copies
   it into an otherwise empty image, so there is no base image to pin. Deploy
   the image by digest, never by a `latest` tag. Signed `v*` tags and GitHub
-  Releases are described in [RELEASING.md](RELEASING.md). Ezu makes no
+  Releases are described in [RELEASING.md](RELEASING.md).
+  [`deploy/tenkai.toml`](deploy/tenkai.toml) is the Tenkai product for that
+  image: it provides `ezu.query` and `ezu.events` at the versions derived
+  from the proto surfaces this tree ships. Ezu makes no
   network calls of its own; CI starts the static binary with no network but
   loopback and checks it serves.
 - `cargo deny` in CI refuses copyleft licenses in the default build (see

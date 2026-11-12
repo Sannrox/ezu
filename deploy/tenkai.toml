@@ -1,0 +1,57 @@
+# tenkai product manifest for ezu.
+#
+# Deploys the spatial engine from the tagged image. Commands are
+# self-contained (no repo checkout). The tagged release publishes
+# ghcr.io/sannrox/ezu:<version> (version tag only). Put ezu.env and the
+# files it names (token or JWKS, data directory) in the workdir before
+# install. The product ships none of those. docker --env-file is read on
+# the host; values that name files inside the container use /work/...
+# because that is the mounted workdir.
+
+[product]
+name = "ezu"
+version = "0.1.0"
+description = "Live spatial engine (index, queries, geofence events)"
+
+[deploy]
+workdir = "."
+install = """
+set -e
+IMG=ghcr.io/sannrox/ezu:0.1.0
+test -f ezu.env
+docker pull "$IMG"
+DIGEST=$(docker image inspect --format '{{.Id}}' "$IMG")
+case "$DIGEST" in sha256:*) ;; *) echo "image has no sha256 id" >&2; exit 1 ;; esac
+docker rm -f ezu >/dev/null 2>&1 || true
+# Host uid so WAL and snapshots under /work are writable.
+docker run -d --name ezu --user "$(id -u):$(id -g)" -v "$PWD:/work" --env-file ezu.env -e EZU_LISTEN=0.0.0.0:7600 -p 127.0.0.1:7600:7600 "$DIGEST"
+"""
+uninstall = "docker rm -f ezu"
+health = """
+for i in $(seq 1 30); do
+  curl -fsS http://127.0.0.1:7600/healthz >/dev/null && exit 0
+  sleep 1
+done
+exit 1
+"""
+
+[delivery]
+has_migration = false
+changes_identity_config = false
+
+# Contracts this release provides to dependents (Tenkai profile v2). The pin
+# is a digest of ezu@<product.version>. Contract versions are derived from
+# the shipped query and event proto surfaces; `python3 scripts/tenkai-profile.py
+# --check` refuses a stale block.
+[compatibility]
+version = 2
+# Evidence binds one release digest; one day is Tenkai's maximum.
+max_evidence_age_ms = 86400000
+
+[compatibility.components.ezu.pin]
+kind = "digest"
+value = "sha256:ed4dfb2522da96d3d638f1619d21e49b9bc0ab97c14f6108bc1ca49ac220330b"
+
+[compatibility.components.ezu.provides]
+"ezu.query" = "0.1.0"
+"ezu.events" = "0.1.0"
