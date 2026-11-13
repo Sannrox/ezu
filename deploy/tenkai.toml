@@ -10,14 +10,14 @@
 
 [product]
 name = "ezu"
-version = "0.1.0"
+version = "0.1.1-rc.1"
 description = "Live spatial engine (index, queries, geofence events)"
 
 [deploy]
 workdir = "."
 install = """
 set -e
-IMG=ghcr.io/sannrox/ezu:0.1.0
+IMG=ghcr.io/sannrox/ezu:0.1.1-rc.1
 test -f ezu.env
 docker pull "$IMG"
 DIGEST=$(docker image inspect --format '{{.Id}}' "$IMG")
@@ -50,7 +50,7 @@ max_evidence_age_ms = 86400000
 
 [compatibility.components.ezu.pin]
 kind = "digest"
-value = "sha256:ed4dfb2522da96d3d638f1619d21e49b9bc0ab97c14f6108bc1ca49ac220330b"
+value = "sha256:2b3a4a4a389469343ce3d1f7a42a2b23610e55df9de4ac471bb0961fc8542df2"
 
 [compatibility.components.ezu.provides]
 "ezu.query" = "0.1.0"

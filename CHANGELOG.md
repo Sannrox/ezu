@@ -10,6 +10,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1-rc.1] - 2026-11-13
+
+Patch release candidate after 0.1.0. Proto, WAL, snapshots, and `EZU_*`
+settings are unchanged. JWT callers keep the same JWKS file. The release
+image is also published at `ghcr.io/sannrox/ezu:<version>` (version tag
+only; deploy by digest). Query and event contracts stay `0.1.0`.
+
+### Added
+
+- A Tenkai product that installs the digest-pinned release image and
+  declares `ezu.query` 0.1.0 and `ezu.events` 0.1.0 for dependents.
+  Operators supply `ezu.env` and the files it names in the workdir.
+
+### Changed
+
+- Tagged releases run from `main`. A `vX.Y.Z-rc.N` or `vX.Y.Z-beta.N` tag
+  publishes as a GitHub pre-release and is never marked latest.
+- JWT signatures are verified with `ring`, already used for TLS, instead
+  of jsonwebtoken's `rust_crypto` backend.
+
+### Fixed
+
+- Family-release gate flags count only pull requests whose merge is in
+  the tagged range.
+
+### Security
+
+- `deny.toml` no longer ignores RUSTSEC-2026-0387 or RUSTSEC-2023-0071.
+  JWT verification no longer depends on `crypto-bigint` 0.5 or the `rsa`
+  crate.
+
 ## [0.1.0] - 2026-11-02
 
 First tagged release, prepared for signature and immutable release verification.
