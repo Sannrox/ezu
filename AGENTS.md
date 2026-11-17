@@ -14,14 +14,21 @@ before changing system boundaries.
 - `make validate`, `make test` and `make test-integration` are the local gates.
   They match the build, test, fmt and clippy jobs in `.github/workflows/ci.yml`:
   `cargo build --all-targets --locked`, `cargo test --locked`, `cargo fmt --check`,
-  `cargo clippy --all-targets --locked -- -D warnings`, and
-  `bash scripts/validate-release.sh`. CI also runs `cargo deny`,
-  `make static` plus `scripts/offline-check.sh`, and an `ezu-bench` smoke.
-- `scripts/validate-release.sh` checks the release path: a `v*` tag push only
-  dispatches `release.yml` on `main`, which verifies the signed annotated tag
-  and builds the tagged commit; CHANGELOG notes, SBOM, pre-releases, and the
-  family release manifest. Pull requests and dry runs must not publish or
-  attest. See `RELEASING.md`.
+  `cargo clippy --all-targets --locked -- -D warnings`,
+  `bash scripts/check-workflows.sh`, and
+  `python3 -m unittest discover -s scripts/tests -t .`. CI also runs
+  `cargo deny`, `make static` plus `scripts/offline-check.sh`, and an
+  `ezu-bench` smoke.
+- `bash scripts/check-workflows.sh` lints `.github/workflows/` with the
+  pinned workflow linter and workflow security auditor, the same in CI and
+  locally.
+- `python3 -m unittest discover -s scripts/tests -t .` runs the release
+  tests: `scripts/release/` behavior (signed tags, packaging dry runs, the
+  GitHub Release script against a fake `gh`) and the release workflow
+  invariants, asserted on parsed YAML. `scripts/tests/release/test_workflows.py`
+  needs PyYAML
+  (`python3 -m pip install --require-hashes -r scripts/tests/requirements.txt`).
+  The release path is documented in `RELEASING.md`.
 
 GitHub Issues are the planning source of truth. The workflow Skills are the
 shared agent-kit Skills (see [Shared agent skills](#shared-agent-skills)). Never commit hostnames, home paths, secrets or
@@ -147,8 +154,10 @@ planned work with neither is not a running lane.
 
 Parallel lanes must not collide. Collision surfaces in this repository are
 the API listener and proto, auth hook, WAL/snapshot/key files, fences and
-events, packages, and governed label filters. Lanes that would both change
-one of these surfaces run in sequence, not in parallel.
+events, packages, governed label filters, `.github/workflows/`,
+`scripts/release/`, `scripts/tests/`, and `scripts/check-workflows.sh`.
+Lanes that would both change one of these surfaces run in sequence, not in
+parallel.
 
 A lane publishes its first Verified commit to the claim branch with
 `bash "${AGENT_KIT_HOME:-$HOME/.agents/agent-kit}"/skills/deliver-ready-issue/scripts/issue-lane.sh push <issue>`
@@ -195,6 +204,12 @@ Add focused tests for changes touching the index, queries, fences, WAL and
 snapshots, keys, API, Flight, or packages. Prefer deterministic tests that do
 not require an issuer. Offline `cargo test` must stay green without those
 services.
+
+A change to the release path adds a test under `scripts/tests/release/`
+(the root `tests/` holds Cargo integration tests): script behavior through
+the script, and a workflow invariant no linter expresses as an assertion on
+the parsed YAML, never a grep of workflow text or step names. Release logic
+longer than a few lines goes in `scripts/release/`, not in a `run:` block.
 
 ## Commit & Pull Request Guidelines
 
@@ -309,6 +324,8 @@ Rows beyond `## Testing Guidelines`:
 | dependencies or licenses | `cargo deny check`, plus `cargo deny check licenses --all-features` |
 | static binary or image | `make static` and `scripts/offline-check.sh` on the musl binary |
 | index or query performance | `ezu-bench` smoke; `docs/benchmarks.md` when numbers change |
+| workflows | `bash scripts/check-workflows.sh` |
+| release path | `python3 -m unittest discover -s scripts/tests -t .`; `shellcheck -S warning scripts/release/*.sh` |
 
 ### Release audit
 
