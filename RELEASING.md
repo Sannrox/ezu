@@ -72,24 +72,24 @@ runs **main's** `release.yml`, never the copy at the tagged commit.
 `release.yml` refuses a tagged run that does not start from `main`. It then:
 
 - checks out the tag and fetches the annotated tag object;
-- verifies the signed tag with main's `scripts/verify-release-tag.sh` and
+- verifies the signed tag with main's `scripts/release/verify-tag.sh` and
   main's allowed keys against the tagged commit's `Cargo.toml`;
 - requires the tagged commit to be on `main`;
-- runs the release scripts, tests, packaging, the static image and the
-  manifest `git_sha` from that commit, and creates the release with
-  `gh release create <tag> --verify-tag`;
+- runs the release tests, `cargo test`, packaging, the static image and the
+  manifest `git_sha` from that commit;
 - writes an SBOM, attests provenance, pushes the image to
   `ghcr.io/sannrox/ezu:<version>` (version tag only), drafts the GitHub
-  Release from the matching CHANGELOG section with a signed family release
-  manifest (component, version, git SHA, binary and image digests,
-  attestation URLs, gate flags), and publishes it last.
+  Release through `scripts/release/github-release.sh` (the only script that
+  changes it, with `--verify-tag`) from the matching CHANGELOG section with
+  a signed family release manifest (component, version, git SHA, binary and
+  image digests, attestation URLs, gate flags), and publishes it last.
 
 The release image is tagged with the version only. There is no `latest` tag.
 Deploy the image by digest. `deploy/tenkai.toml` is the Tenkai product for
 that image. Its compatibility profile provides `ezu.query` and `ezu.events`
 at the versions derived from the proto surfaces this tree ships.
-`bash scripts/validate-release.sh` refuses a product whose profile does not
-match.
+`cargo test` (`tests/tenkai_profile.rs`) refuses a product whose profile
+does not match.
 
 To retry a failed release, fix the workflow on `main` and run it again for the
 same tag:
